@@ -48,4 +48,4 @@ $ scripts/roundtrip.sh <emela-lang/emela checkout> # M1 on the corpus, on js and
 
 ## Status
 
-M1: done. 303 of 303 files round-trip on js and native (wasm has no `Std.FileSystem` yet).
+M1: done. All 297 files of the corpus at v0.28.2 round-trip on js and native (wasm has no `Std.FileSystem` yet).
