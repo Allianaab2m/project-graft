@@ -1,0 +1,168 @@
+## The providers listed in `with` (spec 8.3, 8.5). Follows `layer.rs` of the reference type
+## checker.
+##
+## - A layer is a bundle of handlers, flattened in source order.
+## - For providers of the same effect the later one wins; earlier ones are never initialized.
+##   An item bound to a name (`x = H`) that a later item overrides is still initialized for its
+##   name, but no longer provides its effect.
+import Hir.{Program, Span, WithItem, ResDef, MemberKind, EffectKind, IHandler, ILayer, IEffect}
+import Ty.{Tag}
+import Signature.{Signatures, base_of, effects_of_handler, label_base}
+import Tylower.{def_of}
+import Groups.{flatten_layer, item_args}
+
+## What provides an effect listed in `with`: a handler, or the provider of an effect already in
+## scope (a label `L`, or the right of `by` in `L by P`).
+pub enum Supplier {
+  SHandler(def: Int)
+  SEffect(tag: Tag)
+} derive Eq
+
+## One provider listed in a `with`.
+pub type Entry(
+  supplier: Supplier,
+  ## The effect provided.
+  provided: Tag,
+  span: Span,
+  ## The index of the item in the `with` it came from.
+  origin: Int,
+  ## Whether that item is a layer.
+  from_layer: Bool,
+  ## Whether it provides its effect by name.
+  named: Bool,
+  ## The effects whose requirements the supplier leaves to the outside: every effect a handler
+  ## implements, or `effect` alone.
+  own: List[Tag],
+)
+
+pub fn entry_handler(e: Entry) -> Option[Int] {
+  e.supplier match {
+    SHandler(h) -> Some(h)
+    SEffect(_)  -> None
+  }
+}
+
+## Expands the items listed in `with` into providers. Items that do not fit are skipped (they are
+## reported elsewhere).
+pub fn with_entries(program: Program, sigs: Signatures, items: List[WithItem]) -> List[Entry] {
+  all = items.enumerate().flat_map(|(origin, item)| {
+    item.res match {
+      ResDef(def) -> item_entries(program, sigs, item, def, origin)
+      _           -> []
+    }
+  })
+  keep_last(all, |origin| items.get(origin).map(|i| i.bind.is_some()).or(False))
+}
+
+fn item_entries(
+  program: Program,
+  sigs: Signatures,
+  item: WithItem,
+  def: Int,
+  origin: Int,
+) -> List[Entry] {
+  span = item.span
+  item.by match {
+    Some((by, _)) -> label_base(sigs, def) match {
+      Some(base) -> by_supplier(program, sigs, by) match {
+        Some((supplier, provided)) if provided.any(|t| t.def == base.def) -> [
+          Entry(supplier, Tag(def, []), span, origin, False, True, [Tag(def, [])]),
+        ]
+        _ -> []
+      }
+      None -> []
+    }
+    None -> program.items.get(def) match {
+      Some(IHandler(_)) -> handler_entries(sigs, def, span, origin, False)
+      Some(ILayer(_)) -> flatten_layer(program, def).flat_map(
+        |h| handler_entries(sigs, h, span, origin, True),
+      )
+      Some(IEffect(_)) -> label_base(sigs, def).map(|base| {
+        [Entry(SEffect(Tag(def, [])), base, span, origin, False, True, [base])]
+      }).or([])
+      _ -> []
+    }
+  }
+}
+
+## A handler of several effects provides each of them.
+fn handler_entries(
+  sigs: Signatures,
+  h: Int,
+  span: Span,
+  origin: Int,
+  from_layer: Bool,
+) -> List[Entry] {
+  own = effects_of_handler(sigs, h)
+  own.map(|t| Entry(SHandler(h), t, span, origin, from_layer, True, own))
+}
+
+## The right of `by` as a supplier, with the effects it provides: a handler provides every effect
+## it implements; an effect provides itself, or its base if it is a label.
+fn by_supplier(program: Program, sigs: Signatures, by: Hir.Res) -> Option[(Supplier, List[Tag])] {
+  by match {
+    ResDef(d) -> {
+      effects = effects_of_handler(sigs, d)
+      if !effects.is_empty() {
+        Some((SHandler(d), effects))
+      } else if def_of(program, d).kind == EffectKind {
+        tag = Tag(d, [])
+        Some((SEffect(tag), [base_of(sigs, tag)]))
+      } else {
+        None
+      }
+    }
+    _ -> None
+  }
+}
+
+## For providers of the same effect, only the later one is kept. An item bound to a name is kept
+## for its name, but no longer provides its effect.
+fn keep_last(entries: List[Entry], bound: fn(Int) -> Bool) -> List[Entry] {
+  entries.enumerate().filter_map(|(i, e)| {
+    overridden = entries.drop(i + 1).any(|later| later.provided == e.provided)
+    if !overridden {
+      Some(e)
+    } else if !e.from_layer && bound(e.origin) {
+      Some(Entry(named: False, ..e))
+    } else {
+      None
+    }
+  })
+}
+
+## Whether the `origin`-th item of a `with` initializes a handler: it names one, and no later item
+## overrides it.
+pub fn item_initialized(entries: List[Entry], origin: Int) -> Bool {
+  entries.any(|e| e.origin == origin && !e.from_layer && entry_handler(e).is_some())
+}
+
+## Whether an item of `with` opens a handler member (`x = Files.Open(p)`, `x = fs.Open(p)`).
+pub fn is_member_item(program: Program, item: WithItem) -> Bool {
+  member = item.res match {
+    ResDef(d) -> def_of(program, d).kind == MemberKind
+    _         -> False
+  }
+  item.cap.is_some() || member
+}
+
+## Whether the arguments of the `origin`-th item of a `with` are evaluated.
+pub fn item_evaluated(
+  program: Program,
+  entries: List[Entry],
+  items: List[WithItem],
+  origin: Int,
+) -> Bool {
+  (
+    item_initialized(entries, origin)
+      || items.get(origin).map(|i| is_member_item(program, i)).or(False)
+  )
+}
+
+## The arguments written on the items of a `with` that are evaluated, in source order.
+pub fn evaluated_args(program: Program, sigs: Signatures, items: List[WithItem]) -> List[Int] {
+  entries = with_entries(program, sigs, items)
+  items.enumerate().flat_map(|(i, item)| {
+    if item_evaluated(program, entries, items, i) { item_args(item) } else { [] }
+  })
+}

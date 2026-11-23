@@ -1,0 +1,216 @@
+## The state of inferring one group of definitions (`Body`), shared with the computation of
+## their error and effect sets (`Errors`).
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{Program, DefModule, Span, Arm, Param, IFn, ITraitFn}
+import Groups.{impl_fn}
+import Ty.{Ty, Row, RowElem, TyParam, ParamKind, FnTy, SetKind}
+import Tylower.{TyTable}
+import Signature.{Signatures}
+import Traits.{Traits}
+
+## A definition without a declared type: its monomorphic type within the group and its type
+## parameters (written and invisible set ones).
+pub type Pending(def: Int, ty: Ty, params: List[TyParam])
+
+## A reference within the group to a pending definition with written type parameters, checked
+## against the definition's final type once the group is inferred.
+pub type DeferredRef(def: Int, args: List[Ty], rows: List[Row], instance: Ty, span: Span)
+
+## Integer literals need Int or Int64 (`integer`); arithmetic operands a number.
+pub type NumConstraint(ty: Ty, span: Span, integer: Bool, literal: Option[String])
+
+## The state while inferring one group.
+pub type BodyState(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  current: Option[Int],
+  ## The module of the definition being inferred, for whether opaque fields are accessible.
+  module: DefModule,
+  ## Type parameters of the fn being inferred and their kinds.
+  type_params: List[Int],
+  param_kinds: List[ParamKind],
+  ## What `Self` stands for.
+  self_ty: Option[Ty],
+  pending: List[Pending],
+  ## Newest first.
+  deferred: List[DeferredRef],
+  locals: Map[Int, Ty],
+  ## Local fns → the labels of their named arguments.
+  local_labels: Map[Int, List[Option[String]]],
+  ## Newest first.
+  numbers: List[NumConstraint],
+  ## The handler whose init is being inferred.
+  in_init: Option[Int],
+  ## References to capability operations → the effect operation.
+  ops: Map[Int, Int],
+  ## Callees of calls, where a handler member may be opened inside an init.
+  member_callees: Map[Int, Bool],
+  traits: Traits,
+  ## Derived impls that something required (W0303).
+  used: Map[(Int, Int), Bool],
+  ## Newest first.
+  trait_obligations: List[TraitObligation],
+  ## Newest first.
+  self_obligations: List[SelfObligation],
+  ## Matches and bindings to check for coverage once types are settled. Newest first.
+  coverage: List[CoverageSite],
+  ## Inferred definitions, in inference order.
+  defs: List[Int],
+  ## The type of each expression inferred.
+  expr_tys: Map[Int, Ty],
+  ## Lambda expressions → the set variables of their type's E and R, which contain the body's.
+  lambda_rows: Map[Int, (Int, Int)],
+  ## Local fns, by the local that names them.
+  local_fns: Map[Int, LocalFnInfo],
+  ## Set variables for the dependencies and the init E of the group's handlers:
+  ## (handler, uses, fails).
+  pending_handlers: List[(Int, Int, Int)],
+  ## The dependencies and init E of handlers of earlier groups.
+  facts: HandlerFacts,
+  handler_bodies: List[HandlerBody],
+  handler_parts: List[HandlerPart],
+  ## The inferred E and R of pending definitions, placed at references from other definitions of
+  ## the group once solved.
+  instance_sets: List[InstanceSet],
+  ## `with` expressions → the items that open handler members, with the types of opening them.
+  with_members: Map[Int, List[(Int, FnTy)]],
+  ## Each expression's E, computed after the body is inferred.
+  expr_rows: Map[Int, Row],
+  ## Set variables whose solution is another's minus the listed elements: (δ, v, elems).
+  row_diffs: List[(Int, Int, List[RowElem])],
+  ## Set variables whose solution is another's with the listed capabilities replaced by their
+  ## effects.
+  row_widens: List[(Int, Int, List[RowElem])],
+  ## Newest first.
+  escapes: List[EscapeInfo],
+)
+
+## A fresh state for a group.
+pub fn new_state(
+  program: Program,
+  table: TyTable,
+  traits: Traits,
+  sigs: Signatures,
+  facts: HandlerFacts,
+) -> BodyState {
+  BodyState(
+    program:,
+    table:,
+    sigs:,
+    current: None,
+    module: Hir.BuiltinPrelude,
+    type_params: [],
+    param_kinds: [],
+    self_ty: None,
+    pending: [],
+    deferred: [],
+    locals: Map.empty(),
+    local_labels: Map.empty(),
+    numbers: [],
+    in_init: None,
+    ops: Map.empty(),
+    member_callees: Map.empty(),
+    traits:,
+    used: Map.empty(),
+    trait_obligations: [],
+    self_obligations: [],
+    coverage: [],
+    defs: [],
+    expr_tys: Map.empty(),
+    lambda_rows: Map.empty(),
+    local_fns: Map.empty(),
+    pending_handlers: [],
+    facts:,
+    handler_bodies: [],
+    handler_parts: [],
+    instance_sets: [],
+    with_members: Map.empty(),
+    expr_rows: Map.empty(),
+    row_diffs: [],
+    row_widens: [],
+    escapes: [],
+  )
+}
+
+## A local fn of a body (`[fn.local]`), for computing its E and R once types are settled.
+pub type LocalFnInfo(
+  ## The definition it is in.
+  owner: Option[Int],
+  body: Int,
+  ## The E and R of its type, which contain those of the body.
+  fails: Row,
+  uses: Row,
+  ## Whether its E is declared (`-> T` is written); then the body's E is checked against it.
+  fails_declared: Bool,
+  ## Whether `uses` is written; then the body's R is checked against it.
+  uses_written: Bool,
+)
+
+## The body of a handler's `index`-th operation.
+pub type HandlerBody(
+  owner: Int,
+  index: Int,
+  body: Int,
+  ## The E of the operation's declaration.
+  fails: Row,
+  ## A suspend fn implementation that uses `resume` other than by calling it (spec 8.7).
+  resume_later: Bool,
+  is_suspend: Bool,
+)
+
+## A handler's init or release body.
+pub type HandlerPart(owner: Int, body: Int, release: Bool)
+
+## The dependencies (R) and the init E of handlers inferred in earlier groups.
+pub type HandlerFacts(uses: Map[Int, Row], fails: Map[Int, Row])
+
+## A reference from another definition of the group to a pending one whose E or R is inferred:
+## the solved set, placed with the reference's arguments, is contained in `instance`.
+pub type InstanceSet(inferred: Row, instance: Int, kind: SetKind, args: List[Ty], rows: List[Row])
+
+## An `escape`, for the W0302 check once the error sets are solved: the inner expression, the
+## arms above the first `_` that catch an error (pattern, error), and the pattern of that `_`.
+pub type EscapeInfo(inner: Int, caught: List[(Int, Int)], wildcard: Option[Int])
+
+## Places where coverage is checked.
+pub enum CoverageSite {
+  MatchSite(scrutinee: Int, ty: Ty, arms: List[Arm])
+  ## A binding `pat = value`, whose pattern must always succeed (spec 6.3).
+  BindingSite(pat: Int, ty: Ty)
+  ## `escape` arms grouped by the caught error type; only redundant arms are checked.
+  EscapeSite(groups: List[(Ty, List[Arm])])
+}
+
+## A type that must satisfy a trait: the instantiation of a constrained type parameter at a
+## reference, or an operand of `==`, `<` or interpolation. `owner` is the definition whose type
+## parameters `TyBound(i)` in `ty` are. A Float passes `float_ok` (the built-in comparison).
+pub type TraitObligation(ty: Ty, trait_def: Int, span: Span, owner: Option[Int], float_ok: Bool)
+
+## The `Self` of a trait function determined only by its result type (E0333).
+pub type SelfObligation(ty: Ty, trait_def: Int, span: Span)
+
+pub fn bs() -> BodyState uses { State[BodyState] } {
+  (use State[BodyState]).get()
+}
+
+pub fn bupd(f: fn(BodyState) -> BodyState) -> () uses { State[BodyState] } {
+  s = use State[BodyState]
+  s.set(f(s.get()))
+}
+
+pub fn prog() -> Program uses { State[BodyState] } {
+  bs().program
+}
+
+## The parameters and body of a function definition: a top-level fn, a trait's function or an
+## impl's function.
+pub fn fn_parts(program: Program, def: Int) -> Option[(List[Param], Option[Int])] {
+  program.items.get(def) match {
+    Some(IFn(f))      -> Some((f.sig.params, f.body))
+    Some(ITraitFn(f)) -> Some((f.sig.params, f.body))
+    Some(_)           -> None
+    None              -> impl_fn(program, def).map(|(_, f)| (f.params, f.body))
+  }
+}

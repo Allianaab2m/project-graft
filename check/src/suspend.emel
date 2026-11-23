@@ -1,0 +1,116 @@
+## Whether a suspend fn implementation may call `resume` later (spec 8.7). Follows
+## `body/suspend.rs` of the reference type checker.
+import Hir.{
+  Program,
+  ResLocal,
+  OpPipe,
+  SInterp,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  SLet,
+  SLocalFn,
+  SExpr,
+}
+import Signature.{Signatures}
+import Layer
+
+## Whether the body of a suspend fn implementation uses `resume` (the local `resume`) other than
+## by calling it directly (`resume(v)` or `v |> resume` outside any lambda).
+pub fn resume_escapes(program: Program, sigs: Signatures, body: Int, resume: Int) -> Bool {
+  walk(program, sigs, resume, body, False)
+}
+
+fn is_resume(program: Program, resume: Int, expr: Int) -> Bool {
+  program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EPath(ResLocal(l))) -> l == resume
+    _                        -> False
+  }
+}
+
+## An expression in callee position: resume called directly outside a lambda is fine.
+fn callee(program: Program, sigs: Signatures, resume: Int, expr: Int, in_lambda: Bool) -> Bool {
+  if is_resume(program, resume, expr) {
+    in_lambda
+  } else {
+    walk(program, sigs, resume, expr, in_lambda)
+  }
+}
+
+fn walk(program: Program, sigs: Signatures, resume: Int, expr: Int, in_lambda: Bool) -> Bool {
+  go = |e: Int| walk(program, sigs, resume, e, in_lambda)
+  all = |es: List[Int]| es.any(go)
+  program.exprs.get(expr).map(|e| e.kind) match {
+    None -> False
+    Some(kind) -> kind match {
+      EPath(ResLocal(l)) -> l == resume
+      EMissing         -> False
+      ELit(_)          -> False
+      EPath(_)         -> False
+      EUnit            -> False
+      EUse(_, _)       -> False
+      EInterpolated(parts) -> parts.any(|p| {
+        p match {
+          SInterp(x) -> go(x)
+          _          -> False
+        }
+      })
+      EField(base, _)  -> go(base)
+      ECall(f, args)   -> callee(program, sigs, resume, f, in_lambda) || all(args.map(|a| a.value))
+      EUnary(_, operand) -> go(operand)
+      EBinary(OpPipe, lhs, rhs) -> {
+        right = program.exprs.get(rhs).map(|r| r.kind) match {
+          Some(ECall(f, args)) -> (
+            callee(program, sigs, resume, f, in_lambda) || all(args.map(|a| a.value))
+          )
+          _ -> callee(program, sigs, resume, rhs, in_lambda)
+        }
+        go(lhs) || right
+      }
+      EBinary(_, lhs, rhs) -> go(lhs) || go(rhs)
+      ETuple(elems)    -> all(elems)
+      EList(elems, rest) -> all(elems) || rest.map(go).or(False)
+      EBlock(block) -> {
+        stmts = block.stmts.any(|stmt| {
+          stmt match {
+            SLet(_, _, value) -> go(value)
+            # The body of a local fn runs where it is called, as a lambda's does.
+            SLocalFn(f)       -> walk(program, sigs, resume, f.body, True)
+            SExpr(x)          -> go(x)
+          }
+        })
+        stmts || block.tail.map(go).or(False)
+      }
+      EIf(c, t, el)    -> go(c) || go(t) || el.map(go).or(False)
+      EMatch(inner, arms) -> (
+        go(inner) || arms.any(|arm| arm.guard.map(go).or(False) || go(arm.body))
+      )
+      EEscape(inner, arms) -> (
+        go(inner) || arms.any(|arm| arm.guard.map(go).or(False) || go(arm.body))
+      )
+      EFail(x)         -> go(x)
+      EAssert(x)       -> go(x)
+      EUpdate(ctor, fields, base) -> go(ctor) || all(fields.map(|f| f.value)) || go(base)
+      EWith(items, body) -> all(Layer.evaluated_args(program, sigs, items)) || go(body)
+      ELambda(_, body) -> walk(program, sigs, resume, body, True)
+    }
+  }
+}

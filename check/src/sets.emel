@@ -1,0 +1,742 @@
+## Computing and solving the error sets E of the bodies of a group (spec 7, 9.4). Follows
+## `body/errors.rs` of the reference type checker.
+##
+## After the types of a group are inferred, each expression's E is computed bottom-up: a call adds
+## the callee function type's E, `fail e` the tag of e's type, `escape` removes the errors its arms
+## fully catch. A body's E is contained in the declared E. Together with the inclusion constraints
+## that unification collected, these are solved for the least solution, and every constraint is
+## then checked.
+##
+## - If `sup` of a constraint `sub ⊆ sup` has a set variable, the elements of `sub` not in `sup`
+##   become lower bounds of its first set variable, minus the effect tags of `sup`.
+## - `escape` replaces a set variable with a fresh one whose solution excludes the caught tags.
+## - A set variable in a negative position of a pending definition's type (the E of a function
+##   parameter) with no bounds stays a variable, to be generalized; others take the least solution.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  Span,
+  Arm,
+  ResDef,
+  ErrorKind,
+  OpPipe,
+  SInterp,
+  PWild,
+  PCtor,
+  PMissing,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  SLet,
+  SLocalFn,
+  SExpr,
+  IConst,
+  IHandler,
+  ILayer,
+  IOp,
+  IMember,
+}
+import Infer.{
+  Infer,
+  Origin,
+  Subset,
+  add_subset,
+  add_subset_of,
+  clear_row_solution,
+  error_tag,
+  new_row_var,
+  resolve,
+  resolve_row,
+  row_has_tag,
+  same_tag,
+  set_row_solution,
+  set_solving,
+  shallow_resolve,
+  subsets,
+  substitute_row,
+}
+import Ty.{
+  Ty,
+  TyFn,
+  TyNamed,
+  TyBound,
+  TyVar,
+  TyNever,
+  TyError,
+  TyList,
+  TyTuple,
+  TySet,
+  Row,
+  RowElem,
+  RTag,
+  RVar,
+  RCap,
+  ROf,
+  Tag,
+  Errors,
+  Effects,
+  EMPTY_ROW,
+  effect_tag,
+  insert,
+  row_of,
+  row_vars,
+  union,
+  var_row,
+}
+import Tylower.{TyLower, def_of, report, self_ty}
+import Signature
+import Bodystate.{BodyState, EscapeInfo, bs, bupd, prog, fn_parts}
+import Layer
+import Groups.{item_args}
+import Coverage
+
+fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] } {
+  report(Some(span), code, message)
+}
+
+fn expr_span(expr: Int) -> Span {
+  prog().exprs.get(expr).map(|e| e.span).or(Span(0, 0, 0))
+}
+
+fn pat_span(pat: Int) -> Span {
+  prog().pats.get(pat).map(|p| p.span).or(Span(0, 0, 0))
+}
+
+fn when_some[A](o: Option[A], f: fn(A) -> ()) -> () {
+  o match {
+    Some(x) -> f(x)
+    None    -> ()
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Computing E
+
+## Computes the E of the group's bodies and adds that they are contained in the declared E.
+pub fn infer_errors() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  program = prog()
+  bs().defs.each(|def| {
+    bupd(|b| BodyState(current: Some(def), ..b))
+    program.items.get(def) match {
+      # A const's value cannot fail (spec 5.6).
+      Some(IConst(c)) -> add_subset(expr_row(c.value), EMPTY_ROW, Infer.Body(def))
+      # A handler operation body's E is contained in the operation's E (spec 8.1); init's E goes
+      # into the E of `with` (spec 9.4); release's E is empty (spec 8.4).
+      Some(IHandler(_)) -> {
+        bs().handler_bodies.filter(|hb| hb.owner == def).each(|hb| {
+          add_subset(expr_row(hb.body), hb.fails, Infer.HandlerOp(def, hb.index))
+        })
+        bs().handler_parts.filter(|p| p.owner == def).each(|p| {
+          row = expr_row(p.body)
+          if p.release {
+            add_subset(row, EMPTY_ROW, Infer.Release(def))
+          } else {
+            add_subset(row, handler_init_fails(def), Infer.HandlerPart)
+          }
+        })
+      }
+      # The arguments of a layer's items cannot fail (`[effect.layer]`).
+      Some(ILayer(item)) -> item.members.enumerate().each(|(member, m)| {
+        m.args.map(|a| a.args).or([]).each(|arg| {
+          add_subset(expr_row(arg.value), EMPTY_ROW, Infer.LayerArg(def, member, arg.value))
+        })
+      })
+      _ -> fn_parts(program, def).and_then(|(_, body)| body) match {
+        Some(body) -> def_ty(def).map(shallow_resolve) match {
+          Some(TyFn(f)) -> add_subset(expr_row(body), f.fails, Infer.Body(def))
+          _             -> ()
+        }
+        None -> ()
+      }
+    }
+  })
+}
+
+## The declared type, or the monomorphic type within the group.
+fn def_ty(def: Int) -> Option[Ty] {
+  b = bs()
+  Signature.get(b.sigs, def).map(|s| s.scheme.ty) match {
+    Some(t) -> Some(t)
+    None    -> b.pending.find(|p| p.def == def).map(|p| p.ty)
+  }
+}
+
+## A handler's init E: computed in an earlier group, or a set variable within this group.
+fn handler_init_fails(hdl: Int) -> Row {
+  b = bs()
+  b.facts.fails.get(hdl) match {
+    Some(row) -> row
+    None -> b.pending_handlers.find(|(h, _, _)| h == hdl).map(|(_, _, v)| var_row(v)).or(EMPTY_ROW)
+  }
+}
+
+fn rows_of(exprs: List[Int]) -> Row {
+  exprs.fold(EMPTY_ROW, |row, e| union(row, expr_row(e)))
+}
+
+## Sub-expressions' E flows into the parent (spec 9.4). Records each expression's E.
+fn expr_row(expr: Int) -> Row {
+  program = prog()
+  row = program.exprs.get(expr) match {
+    None -> EMPTY_ROW
+    Some(e) -> e.kind match {
+      EMissing             -> EMPTY_ROW
+      ELit(_)              -> EMPTY_ROW
+      EPath(_)             -> EMPTY_ROW
+      EUnit                -> EMPTY_ROW
+      EUse(_, _)           -> EMPTY_ROW
+      EInterpolated(parts) -> rows_of(
+        parts.filter_map(|p| {
+          p match {
+            SInterp(x) -> Some(x)
+            _          -> None
+          }
+        }),
+      )
+      EField(base, _)      -> expr_row(base)
+      ECall(callee, args) -> {
+        row = union(expr_row(callee), rows_of(args.map(|a| a.value)))
+        union(row, callee_fails(callee, e.span))
+      }
+      EUnary(_, operand)   -> expr_row(operand)
+      # `x |> f(a)` is `f(x, a)`. The right side's call records E without the left side's.
+      EBinary(OpPipe, lhs, rhs) -> {
+        left = expr_row(lhs)
+        right = program.exprs.get(rhs).map(|r| r.kind) match {
+          Some(ECall(callee, args)) -> {
+            r = union(
+              union(expr_row(callee), rows_of(args.map(|a| a.value))),
+              callee_fails(callee, e.span),
+            )
+            bupd(|b| BodyState(expr_rows: b.expr_rows.insert(rhs, r), ..b))
+            r
+          }
+          _ -> union(expr_row(rhs), callee_fails(rhs, e.span))
+        }
+        union(left, right)
+      }
+      EBinary(_, lhs, rhs) -> union(expr_row(lhs), expr_row(rhs))
+      ETuple(elems)        -> rows_of(elems)
+      EList(elems, rest)   -> union(rows_of(elems), rest.map(expr_row).or(EMPTY_ROW))
+      EBlock(block) -> {
+        row = block.stmts.fold(EMPTY_ROW, |acc, stmt| {
+          stmt match {
+            SLet(_, _, value) -> union(acc, expr_row(value))
+            SLocalFn(f) -> {
+              local_fn_errors(f.local)
+              acc
+            }
+            SExpr(x)          -> union(acc, expr_row(x))
+          }
+        })
+        union(row, block.tail.map(expr_row).or(EMPTY_ROW))
+      }
+      EIf(c, t, el)        -> union(union(expr_row(c), expr_row(t)), el.map(expr_row).or(EMPTY_ROW))
+      EMatch(scrutinee, arms) -> union(expr_row(scrutinee), arms_row(arms))
+      EEscape(inner, arms) -> escape_row(inner, arms)
+      EFail(inner) -> {
+        row = expr_row(inner)
+        ty = resolve(bs().expr_tys.get(inner).or(TyError))
+        if is_error_ty(ty) {
+          insert(row, ROf(ty))
+        } else {
+          diag(expr_span(inner), "E0319", "expected an error value")
+          row
+        }
+      }
+      EAssert(x)           -> expr_row(x)
+      EUpdate(ctor, fields, base) -> union(
+        union(expr_row(ctor), rows_of(fields.map(|f| f.value))),
+        expr_row(base),
+      )
+      # The body's E plus the init E of the listed handlers and the E of the arguments of their
+      # inits (spec 9.4). The arguments of a handler a later item overrides are not evaluated.
+      EWith(items, body) -> {
+        b = bs()
+        entries = Layer.with_entries(program, b.sigs, items)
+        args_row = items.enumerate().fold(EMPTY_ROW, |acc, (i, item)| {
+          initialized = Layer.item_evaluated(program, entries, items, i)
+          item_args(item).fold(acc, |a, arg| {
+            r = expr_row(arg)
+            if initialized { union(a, r) } else { a }
+          })
+        })
+        with_body = union(args_row, expr_row(body))
+        inits = entries.fold(with_body, |acc, entry| {
+          Layer.entry_handler(entry).map(|h| union(acc, handler_init_fails(h))).or(acc)
+        })
+        # Opening a handler member fails as its init may.
+        bs().with_members.get(expr).or([]).fold(inits, |acc, (_, f)| union(acc, f.fails))
+      }
+      # The body's E is enclosed in the lambda type's E; it surfaces when the lambda is called.
+      ELambda(_, body) -> {
+        body_row = expr_row(body)
+        when_some(
+          bs().lambda_rows.get(expr),
+          |(v, _)| add_subset(body_row, var_row(v), Infer.Lambda),
+        )
+        EMPTY_ROW
+      }
+    }
+  }
+  bupd(|b| BodyState(expr_rows: b.expr_rows.insert(expr, row), ..b))
+  row
+}
+
+fn arms_row(arms: List[Arm]) -> Row {
+  arms.fold(EMPTY_ROW, |acc, arm| {
+    union(union(acc, arm.guard.map(expr_row).or(EMPTY_ROW)), expr_row(arm.body))
+  })
+}
+
+## `escape` removes from the inner expression's E the errors whose values the arms fully catch
+## (spec 7.3). The first arm `_` without a guard catches everything that reaches it.
+fn escape_row(inner: Int, arms: List[Arm]) -> Row {
+  program = prog()
+  inner_row = expr_row(inner)
+  pat_kind = |arm: Arm| program.pats.get(arm.pat).map(|p| p.kind)
+  wildcard = arms.enumerate().find(|(_, arm)| {
+    wild = pat_kind(arm) match {
+      Some(PWild) -> True
+      _           -> False
+    }
+    arm.guard.is_none() && wild
+  }).map(|(i, _)| i)
+  reachable = wildcard.map(|i| arms.take(i)).or(arms)
+  caught = reachable.filter_map(|arm| {
+    pat_kind(arm) match {
+      Some(PCtor(ResDef(def), _, _)) if def_of(program, def).kind == ErrorKind -> Some(
+        (arm.pat, def),
+      )
+      _ -> None
+    }
+  })
+  tags = escaped_tags(reachable, caught)
+  # An arm that is a variable or a guarded `_` (E0320) counts as catching everything, so errors
+  # do not cascade.
+  broken = arms.any(|arm| {
+    pat_kind(arm) match {
+      Some(PCtor(_, _, _)) -> False
+      Some(PMissing)       -> False
+      Some(PWild)          -> arm.guard.is_some()
+      _                    -> True
+    }
+  })
+  kept = if broken || wildcard.is_some() { EMPTY_ROW } else { inner_row }
+  minus = tags.map(|t| RTag(Tag(t, [])))
+  row = resolve_row(kept).elems.fold(EMPTY_ROW, |acc, e| {
+    e match {
+      RTag(t) if tags.any(|d| d == t.def) -> acc
+      # A set variable is replaced with one whose solution excludes the caught tags.
+      RVar(v) if !tags.is_empty() -> {
+        d = new_row_var()
+        bupd(|b| BodyState(row_diffs: b.row_diffs.append([(d, v, minus)]), ..b))
+        insert(acc, RVar(d))
+      }
+      _                                   -> insert(acc, e)
+    }
+  })
+  info = EscapeInfo(inner, caught, wildcard.and_then(|i| arms.get(i)).map(|arm| arm.pat))
+  bupd(|b| BodyState(escapes: [info, ..b.escapes], ..b))
+  union(row, arms_row(arms))
+}
+
+## The errors whose values the arms fully catch: per error, the arms catching it leave no value
+## missing.
+fn escaped_tags(arms: List[Arm], caught: List[(Int, Int)]) -> List[Int] {
+  b = bs()
+  shapes = Coverage.Shapes(b.program, b.table, b.sigs)
+  caught.fold([], |tags, (_, def)| {
+    if tags.any(|t| t == def) {
+      tags
+    } else {
+      self_ty(b.table, def) match {
+        Some(ty) -> {
+          group = arms.filter(|arm| caught.any(|(p, d)| p == arm.pat && d == def))
+          if Coverage.check_arms(shapes, ty, group).missing { tags } else { tags.append([def]) }
+        }
+        None -> tags
+      }
+    }
+  })
+}
+
+## The E of a local fn's body is enclosed in its type's E (`[fn.local]`).
+fn local_fn_errors(local: Int) -> () {
+  when_some(bs().local_fns.get(local), |info| {
+    add_subset(expr_row(info.body), info.fails, Infer.LocalFnBody(local))
+  })
+}
+
+## The callee function type's E. An error type parameter instantiated with a type that is not an
+## error is E0319, at the call.
+fn callee_fails(callee: Int, span: Span) -> Row {
+  ty = bs().expr_tys.get(callee).or(TyError)
+  shallow_resolve(ty) match {
+    TyFn(f) -> f.fails.elems.fold(EMPTY_ROW, |row, e| {
+      e match {
+        ROf(t) -> {
+          resolved = resolve(t)
+          if is_error_ty(resolved) {
+            insert(row, e)
+          } else {
+            diag(span, "E0319", "expected an error value")
+            row
+          }
+        }
+        _ -> insert(row, e)
+      }
+    })
+    _ -> EMPTY_ROW
+  }
+}
+
+## Whether the type can be an error type: a named error type, a type parameter or an undetermined
+## type variable. Never and broken types add nothing, so errors do not cascade.
+fn is_error_ty(ty: Ty) -> Bool {
+  ty match {
+    TyNamed(con, _) -> error_tag(con).is_some()
+    TyBound(_)      -> True
+    TyVar(_)        -> True
+    TyNever         -> True
+    TyError         -> True
+    _               -> False
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Solving
+
+## A lower bound of a set variable: the elements of `elem` minus those in `minus`. `widen`: a tag
+## in `minus` also removes the capabilities of its effect. `to_effect`: a capability `minus`
+## removes is replaced with its effect instead.
+type Lower(elem: RowElem, minus: List[RowElem], widen: Bool, to_effect: Bool)
+
+## Solves the inclusion constraints and reports those the solution does not satisfy. Later
+## `resolve` calls use the solution.
+pub fn solve() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  set_solving(True)
+  solve_rounds()
+  set_solving(False)
+  check_subsets(subsets())
+}
+
+## Placing the solved sets of the group's definitions at their references adds constraints, so
+## solving repeats until no new constraint appears.
+fn solve_rounds() -> () {
+  count = subsets().length()
+  solve_round()
+  place_instance_sets()
+  if subsets().length() != count {
+    solve_rounds()
+  }
+}
+
+fn place_instance_sets() -> () {
+  bs().instance_sets.each(|set| {
+    placed = substitute_row(resolve_row(set.inferred), set.args, set.rows)
+    add_subset_of(set.kind, placed, var_row(set.instance), Infer.Instance)
+  })
+}
+
+fn push_lower(lowers: Map[Int, List[Lower]], v: Int, lower: Lower) -> Map[Int, List[Lower]] {
+  lowers.insert(v, lowers.get(v).or([]).append([lower]))
+}
+
+## Computes the least solution of the constraints collected so far.
+fn solve_round() -> () {
+  clear_row_solution()
+  b = bs()
+  from_diffs = b.row_diffs.fold(Map.empty(), |acc, (d, v, minus)| {
+    push_lower(acc, d, Lower(RVar(v), minus, False, False))
+  })
+  from_widens = b.row_widens.fold(from_diffs, |acc, (d, v, minus)| {
+    push_lower(acc, d, Lower(RVar(v), minus, False, True))
+  })
+  (lowers, upper) = subsets().fold((from_widens, []), |(acc, up), c| {
+    sub = resolve_row(c.sub)
+    sup = resolve_row(c.sup)
+    row_vars(sup).head() match {
+      Some(v) -> {
+        minus = sup.elems.filter(|e| effect_tag(e).is_some())
+        next = sub.elems.fold(acc, |a, e| {
+          if contains_elem(sup, e) { a } else { push_lower(a, v, Lower(e, minus, True, False)) }
+        })
+        (next, up)
+      }
+      None -> (acc, up.append(row_vars(sub)))
+    }
+  })
+  # Set variables in negative positions without bounds are generalized.
+  negative = b.pending.fold([], |acc, p| negative_row_vars(p.ty, True, acc))
+  start = negative.fold(Map.empty(), |acc, v| {
+    if lowers.contains(v) || upper.any(|w| w == v) { acc } else { acc.insert(v, var_row(v)) }
+  })
+  set_row_solution(widen_lowers(lowers, start))
+}
+
+## Widens the union of lower bounds until nothing changes.
+fn widen_lowers(lowers: Map[Int, List[Lower]], solution: Map[Int, Row]) -> Map[Int, Row] {
+  (next, changed) = lowers.fold((solution, False), |(sol, changed), v, entries| {
+    entries.fold((sol, changed), |(s, ch), lower| {
+      atoms = lower.elem match {
+        RVar(w) -> s.get(w).or(EMPTY_ROW)
+        e       -> resolve_row(row_of([e]))
+      }
+      atoms.elems.fold((s, ch), |(s2, ch2), a| {
+        added = if removed(a, lower.minus, lower.widen) {
+          a match {
+            RCap(c) if lower.to_effect -> Some(RTag(c.tag))
+            _                          -> None
+          }
+        } else {
+          Some(a)
+        }
+        added match {
+          Some(x) -> {
+            target = s2.get(v).or(EMPTY_ROW)
+            if target.elems.any(|y| y == x) {
+              (s2, ch2)
+            } else {
+              (s2.insert(v, insert(target, x)), True)
+            }
+          }
+          None -> (s2, ch2)
+        }
+      })
+    })
+  })
+  if changed { widen_lowers(lowers, next) } else { next }
+}
+
+## Tags are matched with their type arguments, unifying undetermined ones. A capability is
+## contained in a set that has it or its effect.
+fn contains_elem(row: Row, e: RowElem) -> Bool {
+  e match {
+    RTag(t) -> row_has_tag(row, t)
+    RCap(c) -> row.elems.any(|x| x == e) || row_has_tag(row, c.tag)
+    _       -> row.elems.any(|x| x == e)
+  }
+}
+
+## Whether `minus` removes the element `a` of a lower bound.
+fn removed(a: RowElem, minus: List[RowElem], widen: Bool) -> Bool {
+  a match {
+    RTag(t) -> minus.any(|m| {
+      m match {
+        RTag(x) -> same_tag(x, t)
+        _       -> False
+      }
+    })
+    RCap(c) -> minus.any(|m| {
+      m match {
+        RCap(x) -> x.local == c.local
+        RTag(x) -> widen && same_tag(x, c.tag)
+        _       -> False
+      }
+    })
+    _ -> False
+  }
+}
+
+## Set variables in negative positions (the E and R of function-typed parameters). Inside type
+## arguments of named types, both positions count.
+fn negative_row_vars(ty: Ty, positive: Bool, out: List[Int]) -> List[Int] {
+  add = |acc: List[Int], vs: List[Int]| {
+    vs.fold(acc, |a, v| if a.any(|w| w == v) { a } else { a.append([v]) })
+  }
+  shallow_resolve(ty) match {
+    TyFn(f) -> {
+      here = if positive { out } else { add(out, row_vars(f.fails).append(row_vars(f.uses))) }
+      params = f.params.fold(here, |acc, p| negative_row_vars(p, !positive, acc))
+      negative_row_vars(f.ret, positive, params)
+    }
+    TyNamed(_, args) -> args.fold(out, |acc, a| {
+      negative_row_vars(a, True, negative_row_vars(a, False, acc))
+    })
+    TySet(_, row) if !positive -> add(out, row_vars(row))
+    TyList(elem)               -> negative_row_vars(elem, positive, out)
+    TyTuple(elems)             -> elems.fold(out, |acc, e| negative_row_vars(e, positive, acc))
+    _                          -> out
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Checking
+
+## Reports the constraints the solution does not satisfy.
+fn check_subsets(all: List[Subset]) -> () {
+  all.each(|c| {
+    sub = resolve_row(c.sub)
+    sup = resolve_row(c.sup)
+    missing = sub.elems.filter(|e| !contains_elem(sup, e))
+    if !missing.is_empty() && c.kind == Errors {
+      c.origin match {
+        Infer.Body(def)           -> report_unhandled(def, missing)
+        Infer.HandlerOp(h, index) -> report_unhandled_op(h, index, missing)
+        Infer.Release(h)          -> report_release_fails(h, missing)
+        Infer.MemberInit(h)       -> report_unhandled_member_init(h, missing)
+        Infer.LayerArg(_, _, arg) -> push_unhandled(arg, missing, "E0318")
+        Infer.Coerce(span, _)     -> when_some(span, |s| diag(s, "E0321", "error set mismatch"))
+        Infer.LocalFnBody(local)  -> report_local_fn_errors(local, missing)
+        _                         -> ()
+      }
+    }
+  })
+  check_unraised()
+}
+
+fn report_unhandled(def: Int, missing: List[RowElem]) -> () {
+  program = prog()
+  body = program.items.get(def) match {
+    Some(IConst(c)) -> Some(c.value)
+    _               -> fn_parts(program, def).and_then(|(_, b)| b)
+  }
+  when_some(body, |b| push_unhandled(b, missing, "E0318"))
+}
+
+fn report_unhandled_op(hdl: Int, index: Int, missing: List[RowElem]) -> () {
+  prog().items.get(hdl) match {
+    Some(IHandler(item)) -> when_some(
+      item.ops.get(index).and_then(|op| op.body),
+      |b| push_unhandled(b, missing, "E0318"),
+    )
+    _ -> ()
+  }
+}
+
+fn report_unhandled_member_init(hdl: Int, missing: List[RowElem]) -> () {
+  prog().items.get(hdl) match {
+    Some(IHandler(item)) -> when_some(item.init, |b| push_unhandled(b, missing, "E0318"))
+    _                    -> ()
+  }
+}
+
+## E0420 (spec 8.4).
+fn report_release_fails(hdl: Int, missing: List[RowElem]) -> () {
+  prog().items.get(hdl) match {
+    Some(IHandler(item)) -> when_some(item.release, |(_, b)| push_unhandled(b, missing, "E0420"))
+    _                    -> ()
+  }
+}
+
+fn report_local_fn_errors(local: Int, missing: List[RowElem]) -> () {
+  when_some(bs().local_fns.get(local), |info| {
+    if info.fails_declared {
+      push_unhandled(info.body, missing, "E0318")
+    }
+  })
+}
+
+## Reports `missing` of `body`, one diagnostic per expression that raised some of them.
+fn push_unhandled(body: Int, missing: List[RowElem], code: String) -> () {
+  rows = resolved_rows()
+  origins = missing.fold([], |acc, e| {
+    o = origin_of(rows, body, e)
+    if acc.any(|x| x == o) { acc } else { acc.append([o]) }
+  })
+  origins.each(|o| diag(expr_span(o), code, "unhandled errors"))
+}
+
+fn resolved_rows() -> Map[Int, Row] {
+  bs().expr_rows.fold(Map.empty(), |acc, expr, row| acc.insert(expr, resolve_row(row)))
+}
+
+## The expression that raised `elem`: follows the first sub-expression in source order whose E
+## contains it, down to one that cannot be followed (`fail` or a call).
+fn origin_of(rows: Map[Int, Row], expr: Int, elem: RowElem) -> Int {
+  next = sub_exprs(expr).find(|e| rows.get(e).map(|r| r.elems.any(|x| x == elem)).or(False))
+  next match {
+    Some(n) -> origin_of(rows, n, elem)
+    None    -> expr
+  }
+}
+
+## Sub-expressions whose E flows into this one, in source order. Lambda and local fn bodies are
+## excluded.
+fn sub_exprs(expr: Int) -> List[Int] {
+  program = prog()
+  program.exprs.get(expr).map(|e| e.kind) match {
+    None -> []
+    Some(kind) -> kind match {
+      EInterpolated(parts) -> parts.filter_map(|p| {
+        p match {
+          SInterp(x) -> Some(x)
+          _          -> None
+        }
+      })
+      EField(base, _)             -> [base]
+      ECall(callee, args)         -> [callee, ..args.map(|a| a.value)]
+      EUnary(_, operand)          -> [operand]
+      EBinary(_, lhs, rhs)        -> [lhs, rhs]
+      ETuple(elems)               -> elems
+      EList(elems, rest)          -> elems.append(rest.map(|r| [r]).or([]))
+      EBlock(block) -> block.stmts.filter_map(|stmt| {
+        stmt match {
+          SLet(_, _, value) -> Some(value)
+          SLocalFn(_)       -> None
+          SExpr(x)          -> Some(x)
+        }
+      }).append(block.tail.map(|t| [t]).or([]))
+      EIf(c, t, el)               -> [c, t].append(el.map(|x| [x]).or([]))
+      EMatch(inner, arms)         -> [inner].append(arm_exprs(arms))
+      EEscape(inner, arms)        -> [inner].append(arm_exprs(arms))
+      EFail(x)                    -> [x]
+      EAssert(x)                  -> [x]
+      EUpdate(ctor, fields, base) -> [ctor].append(fields.map(|f| f.value)).append([base])
+      EWith(items, body)          -> Layer.evaluated_args(program, bs().sigs, items).append([body])
+      _                           -> []
+    }
+  }
+}
+
+fn arm_exprs(arms: List[Arm]) -> List[Int] {
+  arms.flat_map(|arm| arm.guard.map(|g| [g]).or([]).append([arm.body]))
+}
+
+## W0302: an `escape` arm catches an error the inner expression cannot raise, or an arm `_` is on
+## an inner expression whose E is empty. Not when the inner E has a set of unknown contents.
+fn check_unraised() -> () {
+  bs().escapes.reverse().each(|esc| {
+    when_some(bs().expr_rows.get(esc.inner), |row0| {
+      row = resolve_row(row0)
+      known = row.elems.all(|e| {
+        e match {
+          RTag(_) -> True
+          _       -> False
+        }
+      })
+      if known {
+        when_some(esc.wildcard, |pat| {
+          if row.elems.is_empty() {
+            Tylower.report_warning(Some(pat_span(pat)), "W0302", "no error is raised here")
+          }
+        })
+        esc.caught.each(|(pat, tag)| {
+          if !row.elems.any(|e| e == RTag(Tag(tag, []))) {
+            Tylower.report_warning(Some(pat_span(pat)), "W0302", "this error is never raised here")
+          }
+        })
+      }
+    })
+  })
+}

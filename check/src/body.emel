@@ -6,10 +6,9 @@
 ## Definitions without a declared type (fns without a return type or `uses` clause, consts without
 ## a type) are monomorphic within the group and generalized once it is inferred.
 ##
-## Not ported yet: handler bodies and `with` items, the error and effect sets of bodies (their
-## constraints are collected but not solved), match coverage, and trait constraints. Where those
-## would decide a type, the type is `TyError`, which unifies with anything, so no diagnostic is
-## made up.
+## Once the group is inferred, the error sets of its bodies are computed and solved (`Sets`).
+## Not ported yet: effect sets. Where something unported would decide a type, the type is
+## `TyError`, which unifies with anything, so no diagnostic is made up.
 import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{
@@ -135,6 +134,7 @@ import Infer.{
   new_row_var,
   new_var,
   resolve,
+  resolve_row,
   set_error_tags,
   set_origin,
   shallow_resolve,
@@ -169,6 +169,8 @@ import Ty.{
   Tag,
   CapElem,
   Effects,
+  Errors,
+  SetKind,
   ParamKind,
   TyParam,
   Scheme,
@@ -230,84 +232,29 @@ import Groups.{defining_module, impl_fn}
 import Traits.{Traits}
 import Numbers
 import Coverage
-
-## A definition without a declared type: its monomorphic type within the group and its type
-## parameters (written and invisible set ones).
-pub type Pending(def: Int, ty: Ty, params: List[TyParam])
-
-## A reference within the group to a pending definition with written type parameters, checked
-## against the definition's final type once the group is inferred.
-type DeferredRef(def: Int, args: List[Ty], rows: List[Row], instance: Ty, span: Span)
-
-## Integer literals need Int or Int64 (`integer`); arithmetic operands a number.
-type NumConstraint(ty: Ty, span: Span, integer: Bool, literal: Option[String])
-
-## The state while inferring one group.
-pub type BodyState(
-  program: Program,
-  table: TyTable,
-  sigs: Signatures,
-  current: Option[Int],
-  ## The module of the definition being inferred, for whether opaque fields are accessible.
-  module: DefModule,
-  ## Type parameters of the fn being inferred and their kinds.
-  type_params: List[Int],
-  param_kinds: List[ParamKind],
-  ## What `Self` stands for.
-  self_ty: Option[Ty],
-  pending: List[Pending],
-  ## Newest first.
-  deferred: List[DeferredRef],
-  locals: Map[Int, Ty],
-  ## Local fns → the labels of their named arguments.
-  local_labels: Map[Int, List[Option[String]]],
-  ## Newest first.
-  numbers: List[NumConstraint],
-  ## The handler whose init is being inferred.
-  in_init: Option[Int],
-  ## References to capability operations → the effect operation.
-  ops: Map[Int, Int],
-  ## Callees of calls, where a handler member may be opened inside an init.
-  member_callees: Map[Int, Bool],
-  traits: Traits,
-  ## Derived impls that something required (W0303).
-  used: Map[(Int, Int), Bool],
-  ## Newest first.
-  trait_obligations: List[TraitObligation],
-  ## Newest first.
-  self_obligations: List[SelfObligation],
-  ## Matches and bindings to check for coverage once types are settled. Newest first.
-  coverage: List[CoverageSite],
-)
-
-## Places where coverage is checked.
-enum CoverageSite {
-  MatchSite(scrutinee: Int, ty: Ty, arms: List[Arm])
-  ## A binding `pat = value`, whose pattern must always succeed (spec 6.3).
-  BindingSite(pat: Int, ty: Ty)
-  ## `escape` arms grouped by the caught error type; only redundant arms are checked.
-  EscapeSite(groups: List[(Ty, List[Arm])])
-}
-
-## A type that must satisfy a trait: the instantiation of a constrained type parameter at a
-## reference, or an operand of `==`, `<` or interpolation. `owner` is the definition whose type
-## parameters `TyBound(i)` in `ty` are. A Float passes `float_ok` (the built-in comparison).
-type TraitObligation(ty: Ty, trait_def: Int, span: Span, owner: Option[Int], float_ok: Bool)
-
-## The `Self` of a trait function determined only by its result type (E0333).
-type SelfObligation(ty: Ty, trait_def: Int, span: Span)
-
-fn bs() -> BodyState uses { State[BodyState] } {
-  (use State[BodyState]).get()
-}
-
-fn bupd(f: fn(BodyState) -> BodyState) -> () uses { State[BodyState] } {
-  s = use State[BodyState]
-  s.set(f(s.get()))
-}
-
-fn prog() -> Program uses { State[BodyState] } {
-  bs().program
+import Sets
+import Suspend
+import Bodystate.{
+  BodyState,
+  Pending,
+  DeferredRef,
+  NumConstraint,
+  CoverageSite,
+  MatchSite,
+  BindingSite,
+  EscapeSite,
+  TraitObligation,
+  SelfObligation,
+  LocalFnInfo,
+  HandlerBody,
+  HandlerPart,
+  HandlerFacts,
+  InstanceSet,
+  bs,
+  bupd,
+  prog,
+  new_state,
+  fn_parts,
 }
 
 fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] } {
@@ -324,32 +271,11 @@ pub fn infer_group(
   table: TyTable,
   traits: Traits,
   sigs: Signatures,
+  facts: HandlerFacts,
   group: List[Int],
-) -> (List[(Int, Signature)], Map[(Int, Int), Bool]) uses { State[TyLower] } {
-  start = BodyState(
-    program,
-    table,
-    sigs,
-    None,
-    Hir.BuiltinPrelude,
-    [],
-    [],
-    None,
-    [],
-    [],
-    Map.empty(),
-    Map.empty(),
-    [],
-    None,
-    Map.empty(),
-    Map.empty(),
-    traits,
-    Map.empty(),
-    [],
-    [],
-    [],
-  )
-  ((inferred, state), _) = State.run(new_infer(), || {
+) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts) uses { State[TyLower] } {
+  start = new_state(program, table, traits, sigs, facts)
+  (((inferred, solved), state), _) = State.run(new_infer(), || {
     set_error_tags(Tylower.error_tags(table))
     State.run(start, || {
       group.each(|def| if Signature.get(sigs, def).is_none() { declare(def) })
@@ -357,7 +283,7 @@ pub fn infer_group(
       finish()
     })
   })
-  (inferred, state.used)
+  (inferred, state.used, solved)
 }
 
 ## Switches to the definition about to be inferred, taking its module and type parameters.
@@ -405,10 +331,14 @@ fn declare(def: Int) -> () {
   enter(def)
   program = prog()
   program.items.get(def) match {
-    Some(ILayer(_))   -> ()
-    Some(IHandler(_)) -> ()
-    Some(IFn(f))      -> declare_fn(def, f)
-    _                 -> push_pending(def, new_var(), [])
+    Some(ILayer(_)) -> ()
+    Some(IHandler(_)) -> {
+      uses = new_row_var()
+      fails = new_row_var()
+      bupd(|b| BodyState(pending_handlers: b.pending_handlers.append([(def, uses, fails)]), ..b))
+    }
+    Some(IFn(f))    -> declare_fn(def, f)
+    _               -> push_pending(def, new_var(), [])
   }
 }
 
@@ -447,20 +377,10 @@ fn pending_of(def: Int) -> Option[Pending] {
   bs().pending.find(|p| p.def == def)
 }
 
-## The parameters and body of a function definition: a top-level fn, a trait's function or an
-## impl's function.
-fn fn_parts(program: Program, def: Int) -> Option[(List[Param], Option[Int])] {
-  program.items.get(def) match {
-    Some(IFn(f))      -> Some((f.sig.params, f.body))
-    Some(ITraitFn(f)) -> Some((f.sig.params, f.body))
-    Some(_)           -> None
-    None              -> impl_fn(program, def).map(|(_, f)| (f.params, f.body))
-  }
-}
-
 ## Places the body at the declared type (or the type given by `declare`).
 fn infer_def(def: Int) -> () {
   enter(def)
+  bupd(|b| BodyState(defs: b.defs.append([def]), ..b))
   program = prog()
   item = program.items.get(def)
   item match {
@@ -522,7 +442,7 @@ fn set_local(local: Int, ty: Ty) -> () {
 
 ## Finishes the group: checks deferred references and numeric types, then generalizes the
 ## definitions without declared types.
-fn finish() -> List[(Int, Signature)] {
+fn finish() -> (List[(Int, Signature)], HandlerFacts) {
   bs().deferred.reverse().each(|r| {
     pending_of(r.def) match {
       Some(p) -> {
@@ -536,9 +456,12 @@ fn finish() -> List[(Int, Signature)] {
   check_numbers()
   check_known_selves()
   check_traits()
+  # Compute and solve the error sets.
+  Sets.infer_errors()
+  Sets.solve()
   check_coverage()
   program = prog()
-  bs().pending.map(|p| {
+  inferred = bs().pending.map(|p| {
     labels = program.items.get(p.def) match {
       Some(IFn(f)) -> param_labels(program, f.sig.params)
       _            -> []
@@ -547,6 +470,13 @@ fn finish() -> List[(Int, Signature)] {
     params = fn_parts(program, p.def).map(|(ps, _)| ps.map(|q| q.local)).or([])
     (p.def, Signature(Scheme(scheme.params, widened_keeping_params(scheme.ty, params)), labels))
   })
+  facts = bs().pending_handlers.fold(bs().facts, |acc, (h, uses, fails)| {
+    HandlerFacts(
+      uses: acc.uses.insert(h, resolve_row(var_row(uses))),
+      fails: acc.fails.insert(h, resolve_row(var_row(fails))),
+    )
+  })
+  (inferred, facts)
 }
 
 ## `ty` with capability elements replaced by their effects, except the parameters in its R.
@@ -642,7 +572,14 @@ fn expr_span(expr: Int) -> Span {
 }
 
 fn infer_expr(expr: Int) -> Ty {
-  infer_expr_kind(expr, None)
+  ty = infer_expr_kind(expr, None)
+  record(expr, ty)
+  ty
+}
+
+## Records the type of an expression, for computing E and R.
+fn record(expr: Int, ty: Ty) -> () {
+  bupd(|b| BodyState(expr_tys: b.expr_tys.insert(expr, ty), ..b))
 }
 
 ## Infers the expression and places it at the expected type. Blocks, if, match, with, lambdas
@@ -650,12 +587,12 @@ fn infer_expr(expr: Int) -> Ty {
 fn check_expr(expr: Int, expected: Ty) -> () {
   prog().exprs.get(expr) match {
     Some(e) -> e.kind match {
-      EBlock(_)     -> infer_expr_kind(expr, Some(expected))
-      EIf(_, _, _)  -> infer_expr_kind(expr, Some(expected))
-      EMatch(_, _)  -> infer_expr_kind(expr, Some(expected))
-      ELambda(_, _) -> infer_expr_kind(expr, Some(expected))
-      EList(_, _)   -> infer_expr_kind(expr, Some(expected))
-      EWith(_, _)   -> infer_expr_kind(expr, Some(expected))
+      EBlock(_)     -> checked(expr, expected)
+      EIf(_, _, _)  -> checked(expr, expected)
+      EMatch(_, _)  -> checked(expr, expected)
+      ELambda(_, _) -> checked(expr, expected)
+      EList(_, _)   -> checked(expr, expected)
+      EWith(_, _)   -> checked(expr, expected)
       _ -> {
         actual = infer_expr(expr)
         coerce_at(e.span, expected, actual)
@@ -665,6 +602,12 @@ fn check_expr(expr: Int, expected: Ty) -> () {
     None -> TyError
   }
   ()
+}
+
+fn checked(expr: Int, expected: Ty) -> Ty {
+  ty = infer_expr_kind(expr, Some(expected))
+  record(expr, ty)
+  ty
 }
 
 fn infer_expr_kind(expr: Int, expected: Option[Ty]) -> Ty {
@@ -719,7 +662,7 @@ fn infer_expr_kind(expr: Int, expected: Option[Ty]) -> Ty {
       EEscape(inner, arms)        -> infer_escape(inner, arms)
       EUse(target, args)          -> infer_use(target, args, e.span)
       EWith(items, body) -> {
-        infer_with_args(items)
+        infer_with_args(expr, items)
         expected match {
           Some(t) -> {
             check_expr(body, t)
@@ -872,7 +815,7 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
         ty = resolve(p.ty)
         (args, rows) = fresh_args(p.params)
         require_traits(p.params, args, span)
-        instance = freshen(substitute(ty, args, rows))
+        instance = instance_sets(ty, freshen(substitute(ty, args, rows)), args, rows)
         bupd(
           |s| BodyState(
             deferred: [DeferredRef(def, args, rows, instance, span), ..s.deferred],
@@ -886,6 +829,34 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
         (TyError, [], [])
       }
     }
+  }
+}
+
+## Gives the reference's function type `instance` its own E and R where the referenced
+## definition's are inferred (contain set variables). Their solutions can name that definition's
+## type parameters, so they are placed with the reference's arguments once solved.
+fn instance_sets(ty: Ty, instance: Ty, args: List[Ty], rows: List[Row]) -> Ty {
+  (ty, instance) match {
+    (TyFn(def_fn), TyFn(f)) -> {
+      place = |inferred: Row, kind: SetKind| {
+        if row_vars(inferred).is_empty() {
+          None
+        } else {
+          v = new_row_var()
+          set = InstanceSet(inferred, v, kind, args, rows)
+          bupd(|b| BodyState(instance_sets: b.instance_sets.append([set]), ..b))
+          Some(var_row(v))
+        }
+      }
+      fails = place(def_fn.fails, Errors)
+      uses = place(def_fn.uses, Effects)
+      if fails.is_none() && uses.is_none() {
+        instance
+      } else {
+        func(f.params, f.ret, fails.or(f.fails), uses.or(f.uses))
+      }
+    }
+    _ -> instance
   }
 }
 
@@ -978,9 +949,18 @@ fn infer_local_fn(f: LocalFn) -> () {
     None      -> var_row(new_row_var())
   }
   set_local(f.local, func(params, ret, fails, uses))
+  info = LocalFnInfo(
+    owner: b.current,
+    body: f.body,
+    fails:,
+    uses:,
+    fails_declared: f.sig.ret.is_some(),
+    uses_written: f.sig.uses.is_some(),
+  )
   bupd(
     |s| BodyState(
       local_labels: s.local_labels.insert(f.local, param_labels(program, f.sig.params)),
+      local_fns: s.local_fns.insert(f.local, info),
       ..s,
     ),
   )
@@ -1016,7 +996,10 @@ fn infer_call(expr: Int, callee: Int, args: List[Arg], span: Span) -> Ty {
         DotMethod(def) -> Some(
           Right(infer_method_call(expr, callee, base, base_ty, def, name, args, span)),
         )
-        DotValue(t) -> Some(Left(t))
+        DotValue(t) -> {
+          record(callee, t)
+          Some(Left(t))
+        }
       }
     }
     _ -> Some(Left(infer_expr(callee)))
@@ -1242,8 +1225,13 @@ fn logical(lhs: Int, rhs: Int) -> Ty {
 fn infer_pipe(expr: Int, lhs: Int, rhs: Int, span: Span) -> Ty {
   piped = Arg(None, lhs, False)
   prog().exprs.get(rhs).map(|e| e.kind) match {
-    Some(ECall(callee, args)) -> infer_call(expr, callee, [piped, ..args], span)
-    _                         -> infer_call(expr, rhs, [piped], span)
+    Some(ECall(callee, args)) -> {
+      ty = infer_call(expr, callee, [piped, ..args], span)
+      # Also record the rewritten call's type on the right side's call expression.
+      record(rhs, ty)
+      ty
+    }
+    _ -> infer_call(expr, rhs, [piped], span)
   }
 }
 
@@ -1281,6 +1269,7 @@ fn infer_lambda(expr: Int, params: List[Param], body: Int, span: Span, expected:
   }
   row = new_row_var()
   uses = new_row_var()
+  bupd(|b| BodyState(lambda_rows: b.lambda_rows.insert(expr, (row, uses)), ..b))
   ty = func(param_tys, ret_ty, var_row(row), var_row(uses))
   origin = Coerce(Some(span), bs().current)
   (expected, expected_fn) match {
@@ -1393,6 +1382,7 @@ fn infer_method_call(
   check_external(def, name.span)
   (ty0, _, _) = instantiate_def(def, name.span)
   ty = open_fails(ty0)
+  record(callee, ty)
   shallow_resolve(ty) match {
     TyFn(f) if !f.params.is_empty() -> {
       coerce_at(expr_span(base), f.params.get(0).or(TyError), base_ty)
@@ -2035,6 +2025,7 @@ fn infer_handler_parts(def: Int, item: HandlerItem, effs: List[Int], span: Span)
       bupd(|b| BodyState(in_init: Some(def), ..b))
       check_expr(init, handler_ty)
       bupd(|b| BodyState(in_init: None, ..b))
+      add_part(HandlerPart(def, init, False))
     }
     None -> if !item.fields.is_empty() {
       diag(span, "E0419", "handler `#{def_of(program, def).name}` has fields but no init")
@@ -2043,7 +2034,7 @@ fn infer_handler_parts(def: Int, item: HandlerItem, effs: List[Int], span: Span)
   when_some(item.release, |(self_local, body)| {
     set_local(self_local, handler_ty)
     infer_expr(body)
-    ()
+    add_part(HandlerPart(def, body, True))
   })
   inner_member = |inner: Int| {
     program.items.get(inner) match {
@@ -2081,6 +2072,10 @@ fn infer_handler_parts(def: Int, item: HandlerItem, effs: List[Int], span: Span)
     diag(span, "E0404", "handler `#{name_of(def)}` does not implement every operation")
   }
   item.ops.enumerate().each(|(index, hop)| infer_handler_op(def, item, index, hop, handler_ty))
+}
+
+fn add_part(part: HandlerPart) -> () {
+  bupd(|b| BodyState(handler_parts: b.handler_parts.append([part]), ..b))
 }
 
 fn infer_handler_op(def: Int, item: HandlerItem, index: Int, hop: HandlerOp, handler_ty: Ty) -> () {
@@ -2137,7 +2132,16 @@ fn infer_handler_op(def: Int, item: HandlerItem, index: Int, hop: HandlerOp, han
         )
       }
       hop.params.enumerate().each(|(i, p)| set_local(p.local, params.get(i).or(TyError)))
-      when_some(hop.body, |body| check_expr(body, if hop.is_suspend { UNIT } else { g.ret }))
+      when_some(hop.body, |body| {
+        check_expr(body, if hop.is_suspend { UNIT } else { g.ret })
+        resume_later = hop.is_suspend
+          && hop.params.length() == params.length()
+          && hop.params.last().map(
+            |resume| Suspend.resume_escapes(prog(), bs().sigs, body, resume.local),
+          ).or(False)
+        hb = HandlerBody(def, index, body, g.fails, resume_later, hop.is_suspend)
+        bupd(|b| BodyState(handler_bodies: b.handler_bodies.append([hb]), ..b))
+      })
     }
   }
 }
@@ -2148,12 +2152,16 @@ fn infer_handler_op(def: Int, item: HandlerItem, index: Int, hop: HandlerOp, han
 ## The arguments of init written on the items of a `with` (`[effect.with]`). An item that opens
 ## a handler member binds its name to the capability of the member's effect; another bound item
 ## to the capability of the effects it provides.
-fn infer_with_args(items: List[WithItem]) -> () {
+fn infer_with_args(expr: Int, items: List[WithItem]) -> () {
   program = prog()
   sigs = bs().sigs
-  items.each(|item| {
+  items.enumerate().each(|(index, item)| {
     infer_member_item(item) match {
       Some((f, member)) -> {
+        bupd(|b| {
+          opened = b.with_members.get(expr).or([]).append([(index, f)])
+          BodyState(with_members: b.with_members.insert(expr, opened), ..b)
+        })
         labels = Signature.get(sigs, member).map(|s| s.labels)
         item.args match {
           Some(args) -> check_args(

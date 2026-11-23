@@ -18,9 +18,11 @@ core="$emela_repo/crates/emela-core/lib"
 # (E0301, E0302, E0304 to E0316, E0320, E0323, E0324), match coverage (E0303, E0317, W0301), traits
 # and impls (E0326, E0329 to E0333, E0335, E0336, E0339, W0303), const cycles (E0231), the value of
 # `main` (W0304), and the parts of handlers and `with` items checked with them (E0401, E0404 to
-# E0407, E0413 to E0415, E0418, E0419, E0434, E0435, E0447, E0448, E0452). E0423 waits for the
-# check of `with` items (`Hits by Box`).
-implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452)\]'
+# E0407, E0413 to E0415, E0418, E0419, E0434, E0435, E0447, E0448, E0452). Of error sets, the
+# errors not handled (E0318, E0420), not errors (E0319) and set mismatches (E0321). E0423 waits for
+# the check of `with` items (`Hits by Box`); W0302 for effect sets, through which the errors of
+# forked fibers reach `Fiber.scope`.
+implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452|E031[89]|E0321|E0420)\]'
 # `IMPLEMENTED` replaces the list, to try codes before adding them.
 implemented=${IMPLEMENTED:-$implemented}
 # Paths are printed as given (Graft) or relative to the current directory (the oracle), so the

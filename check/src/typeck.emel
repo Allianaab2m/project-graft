@@ -5,6 +5,7 @@ import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program}
 import Body
+import Bodystate.{HandlerFacts}
 import Cycles
 import Groups
 import Signature.{Signatures, insert_sig}
@@ -23,15 +24,26 @@ pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
   groups = Groups.groups(program, sigs)
   (inferred, lowered) = State.run(new_lower(program, table, []), || {
     groups.fold(
-      (sigs, collect_used.fold(Map.empty(), |m, k| m.insert(k, True))),
-      |(known, used), group| {
-        (inferred, group_used) = Body.infer_group(program, table, traits, known, group)
+      (
+        sigs,
+        collect_used.fold(Map.empty(), |m, k| m.insert(k, True)),
+        HandlerFacts(Map.empty(), Map.empty()),
+      ),
+      |(known, used, facts), group| {
+        (inferred, group_used, next_facts) = Body.infer_group(
+          program,
+          table,
+          traits,
+          known,
+          facts,
+          group,
+        )
         next = inferred.fold(known, |acc, (def, sig)| insert_sig(acc, def, sig))
-        (next, group_used.fold(used, |m, k, v| m.insert(k, v)))
+        (next, group_used.fold(used, |m, k, v| m.insert(k, v)), next_facts)
       },
     )
   })
-  (final_sigs, used) = inferred
+  (final_sigs, used, _) = inferred
   diags = sig_diags.append(trait_diags).append(Cycles.check(program)).append(
     lowered.diags.reverse(),
   ).append(Traits.unused_derives(program, traits, used)).append(
