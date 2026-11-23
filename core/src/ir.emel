@@ -13,10 +13,15 @@ pub type Module(
   effects: Map[Int, EffectDef],
   ## Prelude's `Option`, if added.
   option: Option[Int],
+  ## Types with a written Show impl (by `type_key`) → the function showing them, which
+  ## interpolation, `dbg` and `inspect` call instead of showing the structure.
+  show_impls: Map[String, Int],
+  ## Prelude's `Ordering`, which `compare` of built-in and derived impls makes.
+  ordering: Option[Int],
 )
 
 pub fn empty_module() -> Module {
-  Module(Map.empty(), Map.empty(), Map.empty(), Map.empty(), None)
+  Module(Map.empty(), Map.empty(), Map.empty(), Map.empty(), None, Map.empty(), None)
 }
 
 pub type LocalData(hint: String, ty: Type)
@@ -247,3 +252,25 @@ pub enum OpTy {
   ## A comparison through the structure of the values (`==` on records, lists, ...).
   OpStructural
 } derive Eq
+
+## A string telling types apart, for instance keys.
+pub fn type_key(ty: Type) -> String {
+  list = |ts: List[Type]| String.join(ts.map(type_key), ",")
+  ty match {
+    CInt             -> "Int"
+    CInt64           -> "Int64"
+    CFloat           -> "Float"
+    CBool            -> "Bool"
+    CString          -> "String"
+    CBytes           -> "Bytes"
+    CArray(e)        -> "Array(#{type_key(e)})"
+    CUnit            -> "()"
+    CNever           -> "!"
+    CTuple(es)       -> "(#{list(es)})"
+    CList(e)         -> "[#{type_key(e)}]"
+    CEnum(id, targs) -> "E#{id}(#{list(targs)})"
+    CParam(i)        -> "P#{i}"
+    CFn(f)           -> "fn(#{list(f.params)})#{type_key(f.ret)}"
+    _                -> "?"
+  }
+}

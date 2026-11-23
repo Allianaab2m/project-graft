@@ -97,6 +97,7 @@ import Check.Ty.{
   PString,
 }
 import Check.Typeck
+import Check.Traits
 import Check.Numbers
 import Check.Signature
 import Check.Tylower
@@ -189,6 +190,7 @@ import Ir.{
   OpStructural,
   empty_module,
   pure_fn,
+  type_key,
 }
 import Builtins
 
@@ -217,6 +219,8 @@ type Lowering(
   ## Newest first.
   errors: List[String],
   sources: Map[Int, Array[Int]],
+  ## The built-in Bytes and Array types → their definitions.
+  intrinsic_types: Map[String, Int],
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -261,6 +265,7 @@ pub fn lower(
         0,
         [],
         sources,
+        Map.empty(),
       )
       (_, done) = State.run(start, || {
         instance(root, [])
@@ -305,28 +310,6 @@ fn instance(def: Int, args: List[Type]) -> Int uses { State[Lowering] } {
       )
       id
     }
-  }
-}
-
-## A string telling types apart, for instance keys.
-fn type_key(ty: Type) -> String {
-  list = |ts: List[Type]| String.join(ts.map(type_key), ",")
-  ty match {
-    CInt             -> "Int"
-    CInt64           -> "Int64"
-    CFloat           -> "Float"
-    CBool            -> "Bool"
-    CString          -> "String"
-    CBytes           -> "Bytes"
-    CArray(e)        -> "Array(#{type_key(e)})"
-    CUnit            -> "()"
-    CNever           -> "!"
-    CTuple(es)       -> "(#{list(es)})"
-    CList(e)         -> "[#{type_key(e)}]"
-    CEnum(id, targs) -> "E#{id}(#{list(targs)})"
-    CParam(i)        -> "P#{i}"
-    CFn(f)           -> "fn(#{list(f.params)})#{type_key(f.ret)}"
-    _                -> "?"
   }
 }
 
@@ -504,11 +487,148 @@ fn convert(ty: Ty, subst: List[Type]) -> Type uses { State[Lowering] } {
 fn named_type(def: Int, args: List[Type]) -> Type uses { State[Lowering] } {
   program = st().program
   program.items.get(def) match {
-    Some(IType(t)) if t.is_intrinsic -> args.head().map(CArray).or(CBytes)
+    Some(IType(t)) if t.is_intrinsic -> {
+      ty = args.head().map(CArray).or(CBytes)
+      key = if args.is_empty() { "Bytes" } else { "Array" }
+      upd(|l| Lowering(intrinsic_types: l.intrinsic_types.insert(key, def), ..l))
+      ty
+    }
     _ -> {
       enum_def(def)
-      CEnum(def, args)
+      ty = CEnum(def, args)
+      register_show(ty, def)
+      ty
     }
+  }
+}
+
+## A type with a written Show impl is shown through it. Option's impl in core shows the same as
+## its structure.
+fn register_show(ty: Type, def: Int) -> () uses { State[Lowering] } {
+  key = type_key(ty)
+  if !st().module.show_impls.contains(key) && def != option_def() {
+    show_trait = Tylower.prelude_def(st().program, "Show")
+    written = show_trait.and_then(|t| written_impl_fn(t, def, "show"))
+    when_some(written, |(f, head)| {
+      args = impl_args(head, ty)
+      # Recorded before the instance, so a recursive type ends.
+      set_module(|m| Module(show_impls: m.show_impls.insert(key, -1), ..m))
+      id = instance(f, args)
+      set_module(|m| Module(show_impls: m.show_impls.insert(key, id), ..m))
+    })
+  }
+}
+
+fn when_some[A](o: Option[A], f: fn(A) -> ()) -> () {
+  o match {
+    Some(x) -> f(x)
+    None    -> ()
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Traits
+
+## The written impl of `trait_def` for the type `head` and its fn `name`, with the impl's head.
+## None for a derived impl, or an impl without that fn.
+fn written_impl_fn(trait_def: Int, head: Int, name: String) -> Option[(Int, Traits.ImplHead)]
+  uses { State[Lowering] } {
+  traits = st().checked.traits
+  if traits.derived.contains((trait_def, head)) {
+    None
+  } else {
+    traits.impls.get((trait_def, head)).and_then(|impl_def| {
+      found = st().program.items.get(impl_def) match {
+        Some(Hir.IImpl(item)) -> item.fns.find(|f| f.name.name == name).map(|f| f.def)
+        _                     -> None
+      }
+      found.and_then(|f| traits.heads.get(impl_def).map(|h| (f, h)))
+    })
+  }
+}
+
+## The impl's type arguments: what its type parameters stand for in the concrete type `ty`.
+fn impl_args(head: Traits.ImplHead, ty: Type) -> List[Type] uses { State[Lowering] } {
+  bound = match_type(head.self_ty, ty, Map.empty())
+  List.range(0, head.params.length()).map(|i| bound.get(i).or(CUnit))
+}
+
+fn match_type(pattern: Ty, ty: Type, acc: Map[Int, Type]) -> Map[Int, Type] {
+  (pattern, ty) match {
+    (TyBound(i), _)                -> acc.insert(i, ty)
+    (TyNamed(_, ps), CEnum(_, ts)) -> ps.zip(ts).fold(acc, |a, (p, t)| match_type(p, t, a))
+    (TyNamed(_, ps), CArray(t))    -> ps.head().map(|p| match_type(p, t, acc)).or(acc)
+    (TyList(p), CList(t))          -> match_type(p, t, acc)
+    (TyTuple(ps), CTuple(ts))      -> ps.zip(ts).fold(acc, |a, (p, t)| match_type(p, t, a))
+    _                              -> acc
+  }
+}
+
+## The definition of the head of a type, as the type checker's impl table has it.
+fn head_def(ty: Type) -> Option[Int] uses { State[Lowering] } {
+  program = st().program
+  prelude = |name: String| Tylower.prelude_def(program, name)
+  ty match {
+    CEnum(id, _) -> Some(id)
+    CInt         -> prelude("Int")
+    CInt64       -> prelude("Int64")
+    CFloat       -> prelude("Float")
+    CBool        -> prelude("Bool")
+    CString      -> prelude("String")
+    CList(_)     -> prelude("List")
+    CArray(_)    -> st().intrinsic_types.get("Array")
+    CBytes       -> st().intrinsic_types.get("Bytes")
+    _            -> None
+  }
+}
+
+## A call of the trait function `def` with the type arguments `targs` (Self first): the impl's fn
+## for Self, the trait's default body, or what the compiler provides for built-in and derived
+## impls (`==`, the structural comparison, the structural show).
+fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { State[Lowering] } {
+  program = st().program
+  data = def_of(program, def)
+  self_ty = targs.head().or(CUnit)
+  trait_def = data.parent.or(-1)
+  name = data.name
+  written = head_def(self_ty).and_then(|h| written_impl_fn(trait_def, h, name))
+  written match {
+    Some((f, head)) -> {
+      id = instance(f, impl_args(head, self_ty).append(targs.drop(1)))
+      XCall(Direct(id, []), args, False, False)
+    }
+    None -> {
+      trait_name = def_of(program, trait_def).name
+      prelude = trait_name == "Eq" || trait_name == "Ord" || trait_name == "Show"
+      default = program.items.get(def) match {
+        Some(Hir.ITraitFn(t)) -> t.body.is_some()
+        _                     -> False
+      }
+      if default && !prelude {
+        XCall(Direct(instance(def, targs), []), args, False, False)
+      } else {
+        builtin_trait_call(trait_name, name, self_ty, args)
+      }
+    }
+  }
+}
+
+## What the compiler provides for the Prelude's Eq, Ord and Show on built-in and derived impls.
+fn builtin_trait_call(trait_name: String, name: String, ty: Type, args: List[Expr]) -> Expr
+  uses { State[Lowering] } {
+  a = args.get(0).or(XLit(VUnit))
+  b = args.get(1).or(XLit(VUnit))
+  (trait_name, name) match {
+    ("Eq", "eq")     -> XBinary(BEq, op_ty(ty), a, b)
+    ("Ord", "compare") -> {
+      when_some(Tylower.prelude_def(st().program, "Ordering"), |o| {
+        enum_def(o)
+        set_module(|m| Module(ordering: Some(o), ..m))
+      })
+      XBuiltin("$compareValues", [ty], [a, b])
+    }
+    ("Show", "show") -> XBuiltin("$showValue", [ty], [a])
+    _                -> unsupported("#{trait_name}.#{name} of a built-in or derived impl")
   }
 }
 
@@ -664,7 +784,10 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
 ## `C(f: e, ..base)`: the written fields in order, then the others from `base`, evaluated once.
 fn lower_update(expr: Int, ctor: Int, base: Int) -> Expr uses { State[Lowering] } {
   program = st().program
-  slots = st().checked.types.calls.get(expr).or([])
+  written = program.exprs.get(expr).map(|e| e.kind) match {
+    Some(Hir.EUpdate(_, fields, _)) -> fields
+    _                               -> []
+  }
   ctor_def = program.exprs.get(ctor).map(|c| c.kind) match {
     Some(EPath(ResDef(d))) -> Some(d)
     _                      -> None
@@ -673,11 +796,25 @@ fn lower_update(expr: Int, ctor: Int, base: Int) -> Expr uses { State[Lowering] 
     None -> unsupported("this record update")
     Some(d) -> {
       ref = ctor_ref(d)
-      written = slots.map(|s| s.map(lower_expr))
+      names = ctor_fields(d) match {
+        NamedFields(fs) -> fs.map(|f| f.name)
+        _               -> []
+      }
+      # The written fields are evaluated in source order, before `base`.
+      values = written.map(|a| {
+        label = a.label.map(|l| l.name).or("")
+        local = fresh_local(label, expr_type(a.value), None)
+        (label, local, lower_expr(a.value))
+      })
       b = lower_expr(base)
       bound = fresh_local("base", expr_type(base), None)
-      args = written.enumerate().map(|(i, w)| w.or(XField(XVar(bound), ref, i)))
-      XLet(bound, b, XCtor(ref, enum_args(expr), args))
+      args = names.enumerate().map(|(i, n)| {
+        values.find(|(l, _, _)| l == n).map(|(_, local, _)| XVar(local)).or(
+          XField(XVar(bound), ref, i),
+        )
+      })
+      made = XLet(bound, b, XCtor(ref, enum_args(expr), args))
+      values.reverse().fold(made, |acc, (_, local, v)| XLet(local, v, acc))
     }
   }
 }
@@ -754,6 +891,12 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
           locals = ptys.map(|t| fresh_local("x", t, None))
           builtin_call(expr, def, locals.map(XVar)) match {
             Some(b) -> XLambda(locals, fn_ty, b, False)
+            None if data.kind == Hir.TraitFnKind -> XLambda(
+              locals,
+              fn_ty,
+              trait_call(def, type_args(expr), locals.map(XVar)),
+              False,
+            )
             None    -> unsupported("a reference to #{def_name(def)}")
           }
         }
@@ -818,7 +961,8 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
         XCtor(ctor_ref(def), enum_args(expr), args)
       } else {
         builtin_call(callee, def, args) match {
-          Some(b) -> b
+          Some(b)                              -> b
+          None if data.kind == Hir.TraitFnKind -> trait_call(def, type_args(callee), args)
           None -> callable(callee, def) match {
             Some(f) -> XCall(Direct(f, []), args, may_fail(callee), False)
             None    -> unsupported("a call of #{def_name(def)}")
