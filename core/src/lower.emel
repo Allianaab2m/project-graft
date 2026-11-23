@@ -225,6 +225,9 @@ type Lowering(
   intrinsic_types: Map[String, Int],
   ## The local holding the evidence table where the expression being lowered runs.
   ev: Int,
+  ## The `with` expressions of the definition around the expression, innermost first: the
+  ## evidence table after the handler, and the keys of the effects it provides.
+  withs: List[(Int, List[String])],
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -271,6 +274,7 @@ pub fn lower(
         sources,
         Map.empty(),
         -1,
+        [],
       )
       (_, done) = State.run(start, || {
         instance(root, [])
@@ -350,10 +354,24 @@ fn fresh_ev() -> Int uses { State[Lowering] } {
 }
 
 ## Runs `f` for the body of a closure, which takes its own evidence table. Returns its local.
-fn in_closure[A](f: fn() -> A uses { State[Lowering] }) -> (Int, A) uses { State[Lowering] } {
+## `use E` in a closure looks at the `with`s around it in the same definition first, then at its
+## caller: the closure's evidence is the caller's with those handlers on top.
+fn in_closure(f: fn() -> Expr uses { State[Lowering] }) -> (Int, Expr) uses { State[Lowering] } {
   outer = st().ev
   ev = fresh_ev()
-  out = f()
+  withs = st().withs
+  (_, bindings) = withs.fold(([], []), |(seen, acc), (w, keys)| {
+    keys.fold((seen, acc), |(s, a), k| {
+      if s.any(|x| x == k) { (s, a) } else { (s.append([k]), a.append([(k, Ir.XUse(XVar(w), k))])) }
+    })
+  })
+  out = if bindings.is_empty() {
+    f()
+  } else {
+    inner = fresh_ev()
+    body = f()
+    XLet(inner, Ir.XProvide(Some(XVar(ev)), bindings), body)
+  }
   upd(|l| Lowering(ev: outer, ..l))
   (ev, out)
 }
@@ -363,6 +381,7 @@ fn ev_var() -> Expr uses { State[Lowering] } {
 }
 
 fn lower_plain_fn(inst: Instance) -> () uses { State[Lowering] } {
+  upd(|l| Lowering(withs: [], ..l))
   program = st().program
   def = inst.def
   parts = program.items.get(def) match {
@@ -943,17 +962,16 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
           locals = ptys.map(|t| fresh_local("x", t, None))
           (ev, made) = in_closure(|| {
             builtin_call(expr, def, locals.map(XVar)) match {
-              Some(b) -> Some(b)
-              None if data.kind == Hir.TraitFnKind -> Some(
-                trait_call(def, type_args(expr), locals.map(XVar)),
+              Some(b) -> b
+              None if data.kind == Hir.TraitFnKind -> trait_call(
+                def,
+                type_args(expr),
+                locals.map(XVar),
               )
-              None    -> None
+              None    -> unsupported("a reference to #{def_name(def)}")
             }
           })
-          made match {
-            Some(b) -> XLambda(locals.append([ev]), fn_ty, b, False)
-            None    -> unsupported("a reference to #{def_name(def)}")
-          }
+          XLambda(locals.append([ev]), fn_ty, made, False)
         }
       }
     }
@@ -1275,6 +1293,7 @@ fn effect_key(tag: Ty.Tag) -> String uses { State[Lowering] } {
 ## The parts of a handler: its init (1), the function making its handler value from its `self`
 ## (2), and its release (3).
 fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
+  upd(|l| Lowering(withs: [], ..l))
   program = st().program
   def = inst.def
   upd(|l| Lowering(locals: Map.empty(), subst: inst.args, ..l))
@@ -1369,9 +1388,13 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
     provide = Ir.XProvide(Some(XVar(ev)), keys.map(|k| (k, XVar(h))))
     (acc.append([(l, me, h, next, init_call, made, provide)]), next)
   })
-  upd(|x| Lowering(ev: last_ev, ..x))
+  outer_withs = st().withs
+  added = steps.map(|(l, _, _, next, _, _, _)| {
+    (next, Signature.effects_of_handler(st().checked.sigs, l.hdl).map(effect_key))
+  })
+  upd(|x| Lowering(ev: last_ev, withs: added.reverse().append(outer_withs), ..x))
   inner = lower_expr(body)
-  upd(|x| Lowering(ev: outer, ..x))
+  upd(|x| Lowering(ev: outer, withs: outer_withs, ..x))
   # Each handler is released, then retired, however the body ends; the last one first.
   guarded = steps.reverse().fold(inner, |acc, (l, me, h, _, _, _, _)| {
     has_release = program.items.get(l.hdl) match {
