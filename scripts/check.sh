@@ -20,9 +20,12 @@ core="$emela_repo/crates/emela-core/lib"
 # `main` (W0304), and the parts of handlers and `with` items checked with them (E0401, E0404 to
 # E0407, E0413 to E0415, E0418, E0419, E0434, E0435, E0447, E0448, E0452). Of error sets, the
 # errors not handled (E0318, E0420), not errors (E0319), set mismatches (E0321) and errors never
-# raised (W0302). Of effect sets, the effects not handled (E0402) and set mismatches (E0403).
-# E0423 waits for the check of `with` items (`Hits by Box`).
-implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452|E031[89]|E0321|E0420|E040[23]|W0302)\]'
+# raised (W0302). Of effect sets, the effects not handled (E0402) and set mismatches (E0403),
+# Immediate sets and fn operation bodies that may suspend (E0416, E0417), values leaving a fiber
+# scope (E0425), and of `with` items and layers, dependency cycles (E0411), duplicate effects
+# (E0421), layer cycles (E0422), type arguments right of `by` (E0423), labels (E0430 to E0432)
+# and unused label providers (W0401).
+implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452|E031[89]|E0321|E0420|E040[23]|W0302|E041[167]|E042[1235]|E043[0-2]|W0401)\]'
 # `IMPLEMENTED` replaces the list, to try codes before adding them.
 implemented=${IMPLEMENTED:-$implemented}
 # Paths are printed as given (Graft) or relative to the current directory (the oracle), so the

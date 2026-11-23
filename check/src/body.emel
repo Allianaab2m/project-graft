@@ -258,6 +258,8 @@ import Bodystate.{
   Closed,
   named_capability,
   is_fn_param,
+  ImmediateObligation,
+  Fibers,
 }
 
 fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] } {
@@ -276,9 +278,10 @@ pub fn infer_group(
   sigs: Signatures,
   facts: HandlerFacts,
   closed: Map[Int, Closed],
+  fibers: Fibers,
   group: List[Int],
 ) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts) uses { State[TyLower] } {
-  start = new_state(program, table, traits, sigs, facts, closed)
+  start = new_state(program, table, traits, sigs, facts, closed, fibers)
   (((inferred, solved), state), _) = State.run(new_infer(), || {
     set_error_tags(Tylower.error_tags(table))
     State.run(start, || {
@@ -477,14 +480,18 @@ fn finish() -> (List[(Int, Signature)], HandlerFacts) {
   Sets.infer_errors()
   Sets.infer_effects()
   Sets.solve()
+  Suspend.check_immediates()
+  Suspend.check_fn_op_bodies()
+  Sets.check_handler_cycles()
   check_coverage()
+  Sets.check_scope_values()
   program = prog()
   inferred = bs().pending.map(|p| {
     labels = program.items.get(p.def) match {
       Some(IFn(f)) -> param_labels(program, f.sig.params)
       _            -> []
     }
-    (scheme, _, _) = generalize_bounded(p.ty, p.params, [], [])
+    (scheme, _, _) = generalize_bounded(p.ty, p.params, [], bs().immediate_vars)
     params = fn_parts(program, p.def).map(|(ps, _)| ps.map(|q| q.local)).or([])
     (p.def, Signature(Scheme(scheme.params, widened_keeping_params(scheme.ty, params)), labels))
   })
@@ -784,6 +791,7 @@ fn check_external(def: Int, span: Span) -> () {
 ## Opening a handler member is written only as an item of `with` and, as a call, inside an init
 ## (E0448).
 fn check_member_open(expr: Int, member: Int, span: Span) -> () {
+  bupd(|s| BodyState(member_opens: s.member_opens.insert(expr, member), ..s))
   b = bs()
   if b.in_init.is_none() || !b.member_callees.contains(expr) {
     diag(
@@ -823,6 +831,7 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
   Signature.get(b.sigs, def) match {
     Some(sig) -> {
       (tys, rows) = fresh_args(sig.scheme.params)
+      require_immediate(def, sig.scheme.params, rows, span)
       require_traits(sig.scheme.params, tys, span)
       require_known_self(def, sig.scheme, tys, span)
       (substitute(sig.scheme.ty, tys, rows), tys, rows)
@@ -832,6 +841,7 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
       Some(p) -> {
         ty = resolve(p.ty)
         (args, rows) = fresh_args(p.params)
+        require_immediate(def, p.params, rows, span)
         require_traits(p.params, args, span)
         instance = instance_sets(ty, freshen(substitute(ty, args, rows)), args, rows)
         bupd(
@@ -876,6 +886,18 @@ fn instance_sets(ty: Ty, instance: Ty, args: List[Ty], rows: List[Row]) -> Ty {
     }
     _ -> instance
   }
+}
+
+## Records the sets a reference to `def` instantiates set type parameters bounded by `Immediate`
+## with, to check once sets are solved (E0416).
+fn require_immediate(def: Int, params: List[TyParam], rows: List[Row], span: Span) -> () {
+  owner = bs().current
+  params.zip(rows).each(|(p, row)| {
+    if p.bounds.any(|b| b == "Immediate") {
+      ob = ImmediateObligation(row, span, owner)
+      bupd(|b| BodyState(immediates: b.immediates.append([ob]), ..b))
+    }
+  })
 }
 
 ## Replaces undetermined type variables with fresh ones, consistently.

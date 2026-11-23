@@ -6,10 +6,11 @@
 ##   An item bound to a name (`x = H`) that a later item overrides is still initialized for its
 ##   name, but no longer provides its effect.
 import Hir.{Program, Span, WithItem, ResDef, MemberKind, EffectKind, IHandler, ILayer, IEffect}
-import Ty.{Tag}
-import Signature.{Signatures, base_of, effects_of_handler, label_base}
+import Std.Map.{Map}
+import Ty.{Tag, Row, RTag, EMPTY_ROW}
+import Signature.{Signatures, base_of, effects_of_handler, is_label, label_base}
 import Std.State.{State}
-import Tylower.{TyTable, def_of, effect_tag, new_lower}
+import Tylower.{TyTable, TyDiag, def_of, effect_tag, new_lower}
 import Infer.{new_infer}
 import Groups.{flatten_layer, item_args}
 
@@ -120,7 +121,8 @@ fn by_supplier(
       if !effects.is_empty() {
         Some((SHandler(d), effects))
       } else if def_of(program, d).kind == EffectKind {
-        effect_tag_of(program, table, d, args).map(|tag| (SEffect(tag), [base_of(sigs, tag)]))
+        (tag, _) = effect_tag_of(program, table, d, args)
+        tag.map(|t| (SEffect(t), [base_of(sigs, t)]))
       } else {
         None
       }
@@ -131,11 +133,16 @@ fn by_supplier(
 
 ## The effect `eff` with the type arguments `args` written after it, read outside any scope.
 ## Their diagnostics are reported where `with` items are checked, not here.
-fn effect_tag_of(program: Program, table: TyTable, eff: Int, args: List[Int]) -> Option[Tag] {
-  ((tag, _), _) = State.run(new_lower(program, table, []), || {
+fn effect_tag_of(
+  program: Program,
+  table: TyTable,
+  eff: Int,
+  args: List[Int],
+) -> (Option[Tag], List[TyDiag]) {
+  ((tag, _), lowered) = State.run(new_lower(program, table, []), || {
     State.run(new_infer(), || effect_tag(eff, args, None, None))
   })
-  tag
+  (tag, lowered.diags.reverse())
 }
 
 ## For providers of the same effect, only the later one is kept. An item bound to a name is kept
@@ -192,4 +199,291 @@ pub fn evaluated_args(
   items.enumerate().flat_map(|(i, item)| {
     if item_evaluated(program, entries, items, i) { item_args(item) } else { [] }
   })
+}
+
+## `i` depends on `j`: `i`'s dependencies include `j`'s effect, and that is not one of `i`'s own
+## effects.
+fn depends(entries: List[Entry], deps: List[Row], i: Int, j: Int) -> Bool {
+  (entries.get(i), entries.get(j), deps.get(i)) match {
+    (Some(a), Some(b), Some(d)) -> j != i
+      && b.named
+      && !a.own.any(|o| o == b.provided)
+      && d.elems.any(|e| e == RTag(b.provided))
+    _ -> False
+  }
+}
+
+## A dependency cycle among the providers, as the indices along it, found by depth-first search
+## from each provider in order.
+pub fn find_cycle(entries: List[Entry], deps: List[Row]) -> Option[List[Int]] {
+  n = entries.length()
+  edges = |v: Int| List.range(0, n).filter(|w| depends(entries, deps, v, w))
+  (found, _) = List.range(0, n).fold((None, Map.empty()), |(found, state), v| {
+    if found.is_some() || state.contains(v) {
+      (found, state)
+    } else {
+      visit(v, edges, state, [])
+    }
+  })
+  found
+}
+
+## 1: in progress, 2: done. `path` is oldest first.
+fn visit(
+  v: Int,
+  edges: fn(Int) -> List[Int],
+  state: Map[Int, Int],
+  path: List[Int],
+) -> (Option[List[Int]], Map[Int, Int]) {
+  here = path.append([v])
+  (found, after) = edges(v).fold((None, state.insert(v, 1)), |(found, st), w| {
+    if found.is_some() {
+      (found, st)
+    } else {
+      st.get(w) match {
+        Some(1) -> {
+          start = here.enumerate().find(|(_, p)| p == w).map(|(i, _)| i).or(0)
+          (Some(here.drop(start)), st)
+        }
+        Some(_) -> (None, st)
+        None    -> visit(w, edges, st, here)
+      }
+    }
+  })
+  if found.is_some() { (found, after) } else { (None, after.insert(v, 2)) }
+}
+
+fn err_at(span: Option[Span], code: String, message: String) -> TyDiag {
+  TyDiag(span, code, message, False)
+}
+
+## Reports the items in `with` that do not fit (issue #255): an effect that is not a label listed
+## alone or left of `by` (E0430), a provider of another effect right of `by` (E0431), the same
+## label given a provider twice (E0432), and wrong type arguments right of `by` (E0423, E0304).
+pub fn check_with_items(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  items: List[WithItem],
+) -> List[TyDiag] {
+  (diags, _) = items.fold(([], []), |(ds, plugged), item| {
+    eff = item.res match {
+      ResDef(d) if def_of(program, d).kind == EffectKind -> Some(d)
+      _                                                  -> None
+    }
+    (eff, item.by) match {
+      (None, _)       -> (ds, plugged)
+      (Some(d), _) if !is_label(program, d) -> (
+        ds.append([err_at(Some(item.span), "E0430", "not a label")]),
+        plugged,
+      )
+      (Some(_), None) -> (ds, plugged)
+      (Some(d), Some((by, by_span))) -> {
+        twice = if plugged.any(|p| p == d) {
+          [err_at(Some(item.span), "E0432", "this label is given a provider twice")]
+        } else {
+          []
+        }
+        found = label_base(sigs, d).and_then(|base| {
+          by_provided(program, table, sigs, by, item.by_args).map(|(p, a)| (base, p, a))
+        })
+        more = found match {
+          None -> []
+          Some((_, _, arg_diags)) if !arg_diags.is_empty() -> arg_diags.map(
+            |x| TyDiag(span: Some(by_span), ..x),
+          )
+          Some((base, provided, _)) if !provided.any(|t| t == base) -> [
+            err_at(Some(by_span), "E0431", "this provider does not provide the label's effect"),
+          ]
+          _    -> []
+        }
+        (ds.append(twice).append(more), plugged.append([d]))
+      }
+    }
+  })
+  diags
+}
+
+## The effects the right of `by` provides, with the diagnostics of its type arguments.
+fn by_provided(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  by: Hir.Res,
+  args: List[Int],
+) -> Option[(List[Tag], List[TyDiag])] {
+  by match {
+    ResDef(d) -> {
+      effects = effects_of_handler(sigs, d)
+      if !effects.is_empty() {
+        Some((effects, []))
+      } else if def_of(program, d).kind == EffectKind {
+        (tag, diags) = effect_tag_of(program, table, d, args)
+        tag.map(|t| ([base_of(sigs, t)], diags))
+      } else {
+        None
+      }
+    }
+    _ -> None
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Layer declarations
+
+## Checks layer declarations (spec 8.5): layers that include each other (E0422, once per cycle),
+## a handler member in a layer (E0447), two handlers for the same effect (E0421) and dependency
+## cycles (E0411). `uses` holds the dependencies of the handlers.
+pub fn check_layers(
+  program: Program,
+  sigs: Signatures,
+  handler_uses: Map[Int, Row],
+) -> List[TyDiag] {
+  (diags, _) = program.items.fold(([], []), |(ds, reported), lay, item| {
+    item match {
+      ILayer(li) -> {
+        data = def_of(program, lay)
+        (cycle_diags, now_reported) = layer_cycle(program, lay) match {
+          Some(cycle) -> {
+            key = cycle.sort_by(|a, b| Ord.compare(a, b))
+            if reported.any(|k| k == key) {
+              ([], reported)
+            } else {
+              ([err_at(data.span, "E0422", "layers include each other")], reported.append([key]))
+            }
+          }
+          None -> ([], reported)
+        }
+        members = li.members.filter_map(|m| {
+          m.res match {
+            ResDef(d) if def_of(program, d).kind == MemberKind -> Some(
+              err_at(Some(m.span), "E0447", "a layer cannot open a handler member"),
+            )
+            _ -> None
+          }
+        })
+        (entries, dup_diags) = layer_entries(program, sigs, lay, li)
+        deps = entries.map(|e| entry_handler(e).and_then(|h| handler_uses.get(h)).or(EMPTY_ROW))
+        cycle_diag = find_cycle(entries, deps).and_then(|cycle| {
+          cycle.head().and_then(|i| entries.get(i)).and_then(|first| {
+            same_layer = first.from_layer
+              && cycle.all(|i| entries.get(i).map(|e| e.origin == first.origin).or(False))
+            if same_layer {
+              None
+            } else {
+              Some(err_at(Some(first.span), "E0411", "the handlers depend on each other"))
+            }
+          })
+        }).map(|d| [d]).or([])
+        (ds.append(cycle_diags).append(members).append(dup_diags).append(cycle_diag), now_reported)
+      }
+      _ -> (ds, reported)
+    }
+  })
+  diags
+}
+
+## The providers of a layer, one per effect of each handler, and E0421 for an effect provided
+## twice (a duplicate only inside a nested layer is reported at that layer).
+fn layer_entries(
+  program: Program,
+  sigs: Signatures,
+  lay: Int,
+  li: Hir.LayerItem,
+) -> (List[Entry], List[TyDiag]) {
+  flatten_with_origins(program, lay, li).fold(([], []), |(entries, ds), (h, origin)| {
+    own = effects_of_handler(sigs, h)
+    member = li.members.get(origin)
+    span = member.map(|m| m.span).or(Span(0, 0, 0))
+    from_layer = member.map(|m| {
+      m.res match {
+        ResDef(d) -> program.items.get(d) match {
+          Some(ILayer(_)) -> True
+          _               -> False
+        }
+        _ -> False
+      }
+    }).or(False)
+    own.fold((entries, ds), |(es, d2), t| {
+      es.find(|e: Entry| e.provided == t) match {
+        Some(first) -> {
+          nested = from_layer && first.from_layer && first.origin == origin
+          if nested {
+            (es, d2)
+          } else {
+            (es, d2.append([err_at(Some(span), "E0421", "two handlers provide the same effect")]))
+          }
+        }
+        None -> (es.append([Entry(SHandler(h), t, span, origin, from_layer, True, own)]), d2)
+      }
+    })
+  })
+}
+
+## The handlers of a layer in source order, with the index of the member each came from.
+fn flatten_with_origins(program: Program, lay: Int, li: Hir.LayerItem) -> List[(Int, Int)] {
+  li.members.enumerate().flat_map(|(i, m)| {
+    m.res match {
+      ResDef(d) -> program.items.get(d) match {
+        Some(IHandler(_)) -> [(d, i)]
+        Some(ILayer(_))   -> nested_handlers(program, d, [lay]).map(|h| (h, i))
+        _                 -> []
+      }
+      _ -> []
+    }
+  })
+}
+
+fn nested_handlers(program: Program, lay: Int, visiting: List[Int]) -> List[Int] {
+  if visiting.any(|v| v == lay) {
+    []
+  } else {
+    program.items.get(lay) match {
+      Some(ILayer(item)) -> item.members.flat_map(|m| {
+        m.res match {
+          ResDef(d) -> program.items.get(d) match {
+            Some(IHandler(_)) -> [d]
+            Some(ILayer(_))   -> nested_handlers(program, d, visiting.append([lay]))
+            _                 -> []
+          }
+          _ -> []
+        }
+      })
+      _ -> []
+    }
+  }
+}
+
+## A cycle in the layer inclusion relation leading from `lay` back to itself.
+fn layer_cycle(program: Program, lay: Int) -> Option[List[Int]] {
+  layer_path(program, lay, lay, [lay])
+}
+
+fn layer_path(program: Program, target: Int, at: Int, path: List[Int]) -> Option[List[Int]] {
+  members = program.items.get(at) match {
+    Some(ILayer(item)) -> item.members
+    _                  -> []
+  }
+  members.fold(None, |found, m| {
+    found match {
+      Some(_) -> found
+      None -> m.res match {
+        ResDef(d) if is_layer_def(program, d) -> if d == target {
+          Some(path)
+        } else if path.any(|p| p == d) {
+          None
+        } else {
+          layer_path(program, target, d, path.append([d]))
+        }
+        _ -> None
+      }
+    }
+  })
+}
+
+fn is_layer_def(program: Program, d: Int) -> Bool {
+  program.items.get(d) match {
+    Some(ILayer(_)) -> True
+    _               -> False
+  }
 }

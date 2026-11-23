@@ -8,6 +8,7 @@ import Ty.{Ty, Row, RowElem, Tag, TyParam, ParamKind, FnTy, SetKind}
 import Tylower.{TyTable}
 import Signature.{Signatures}
 import Traits.{Traits}
+import Layer.{Entry}
 
 ## A definition without a declared type: its monomorphic type within the group and its type
 ## parameters (written and invisible set ones).
@@ -113,7 +114,28 @@ pub type BodyState(
   cap_roots: Map[Int, Int],
   ## Definitions whose R must be empty apart from the host effects the entry provides.
   closed: Map[Int, Closed],
+  ## Sets that instantiate set type parameters bounded by `Immediate`, checked once solved.
+  immediates: List[ImmediateObligation],
+  ## Set variables to be generalized that get the `Immediate` bound.
+  immediate_vars: List[Int],
+  ## Openings of handler members → the member.
+  member_opens: Map[Int, Int],
+  ## `with` expressions with their providers and dependencies, whose initialization order is
+  ## decided once sets are solved.
+  withs: List[PendingWith],
+  fibers: Fibers,
 )
+
+## A `with` whose providers' initialization order is decided once sets are solved.
+pub type PendingWith(expr: Int, body: Int, entries: List[Entry], deps: List[Row])
+
+## The scope functions of the built-in effects (`Fiber.scope`) and the types their operations
+## return (`Fiber`, `Deferred`), which cannot leave a scope (E0425).
+pub type Fibers(scope_fns: List[Int], handles: List[Int])
+
+## A set that must be Immediate (E0416): where it was required, and the definition whose type
+## parameters it may name.
+pub type ImmediateObligation(row: Row, span: Span, owner: Option[Int])
 
 ## Why a definition's R is closed.
 pub enum Closed {
@@ -131,6 +153,7 @@ pub fn new_state(
   sigs: Signatures,
   facts: HandlerFacts,
   closed: Map[Int, Closed],
+  fibers: Fibers,
 ) -> BodyState {
   BodyState(
     program:,
@@ -180,6 +203,11 @@ pub fn new_state(
     with_stack: [],
     cap_roots: Map.empty(),
     closed:,
+    immediates: [],
+    immediate_vars: [],
+    member_opens: Map.empty(),
+    withs: [],
+    fibers:,
   )
 }
 

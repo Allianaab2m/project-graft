@@ -29,8 +29,21 @@ import Hir.{
   SLet,
   SLocalFn,
   SExpr,
+  ResDef,
+  MemberKind,
+  WithItem,
+  IFn,
+  IOp,
+  IMember,
+  IHandler,
 }
-import Signature.{Signatures}
+import Std.State.{State}
+import Signature.{Signatures, is_immediate_effect}
+import Infer.{Infer, resolve_row, shallow_resolve}
+import Ty.{TyFn, TyError, TyParam, RowElem, RTag, RCap, RBound, RVar, effect_tag}
+import Tylower.{TyLower, def_of, report}
+import Bodystate.{BodyState, bs, bupd, prog}
+import Sets
 import Tylower.{TyTable}
 import Layer
 
@@ -135,5 +148,153 @@ fn walk(
       EWith(items, body) -> all(Layer.evaluated_args(program, table, sigs, items)) || go(body)
       ELambda(_, body) -> walk(program, table, sigs, resume, body, True)
     }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Immediate sets and fn operation bodies (`body/suspend.rs`), once sets are solved
+
+## Whether an element of R may suspend: an effect (or a capability of one) that is Async or has a
+## suspend operation or member.
+fn suspends(program: Program, e: RowElem) -> Bool {
+  effect_tag(e).map(|t| !is_immediate_effect(program, t.def)).or(False)
+}
+
+## E0416: a set instantiating a type parameter bounded by `Immediate` is not Immediate. A set
+## variable still to be generalized gets the bound instead.
+pub fn check_immediates() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  program = prog()
+  bs().immediates.each(|ob| {
+    row = resolve_row(ob.row)
+    params = ob.owner.map(def_params).or([])
+    bad = row.elems.any(|e| {
+      e match {
+        RTag(_)   -> suspends(program, e)
+        RCap(_)   -> suspends(program, e)
+        RBound(i) -> params.get(i).map(|p| !p.bounds.any(|b| b == "Immediate")).or(False)
+        RVar(v) -> {
+          bupd(|b| BodyState(immediate_vars: b.immediate_vars.append([v]), ..b))
+          False
+        }
+        _         -> False
+      }
+    })
+    if bad {
+      report(Some(ob.span), "E0416", "this set must be Immediate")
+    }
+  })
+}
+
+fn def_params(def: Int) -> List[TyParam] uses { State[BodyState] } {
+  b = bs()
+  Signature.get(b.sigs, def).map(|s| s.scheme.params) match {
+    Some(ps) -> ps
+    None     -> b.pending.find(|p| p.def == def).map(|p| p.params).or([])
+  }
+}
+
+## E0417: the body of an fn operation implementation, or the init and release of an inner
+## handler implementing a handler member without `suspend`, may suspend. Passes if the body's R
+## is Immediate; otherwise each call that may suspend is reported.
+pub fn check_fn_op_bodies() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  program = prog()
+  b = bs()
+  op_bodies = b.handler_bodies.filter(|hb| !hb.is_suspend).map(|hb| hb.body)
+  member_parts = b.handler_parts.filter(|p| {
+    program.items.get(p.owner) match {
+      Some(IHandler(h)) -> h.member match {
+        Some(ResDef(m)) -> program.items.get(m) match {
+          Some(IMember(mi)) -> !mi.sig.is_suspend
+          _                 -> False
+        }
+        _ -> False
+      }
+      _ -> False
+    }
+  }).map(|p| p.body)
+  op_bodies.append(member_parts).each(|body| {
+    immediate = bs().expr_effects.get(body).map(
+      |r| !resolve_row(r).elems.any(|e| suspends(program, e)),
+    ).or(False)
+    if !immediate {
+      report_suspending(body)
+    }
+  })
+}
+
+## Reports the calls in `expr` that may suspend, in source order.
+fn report_suspending(expr: Int) -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  program = prog()
+  kind = program.exprs.get(expr).map(|e| e.kind)
+  callee = kind match {
+    Some(ECall(c, _)) -> Some(c)
+    # `x |> f` is `f(x)`. If the right side is a call, that call expression counts.
+    Some(EBinary(OpPipe, _, rhs)) -> program.exprs.get(rhs).map(|r| r.kind) match {
+      Some(ECall(_, _)) -> None
+      _                 -> Some(rhs)
+    }
+    _                 -> None
+  }
+  span = program.exprs.get(expr).map(|e| e.span)
+  if callee.map(suspending_call).or(False) {
+    report(span, "E0417", "this call may suspend")
+  }
+  # Opening a suspend handler member as an item of `with` may suspend.
+  kind match {
+    Some(EWith(items, _)) -> items.each(|item| {
+      if member_item(item).map(|m| suspending_member(program, m)).or(False) {
+        report(Some(item.span), "E0417", "opening this handler member may suspend")
+      }
+    })
+    _ -> ()
+  }
+  Sets.sub_exprs(expr).each(report_suspending)
+}
+
+## Whether a call of `callee` may suspend: an operation declared `suspend fn`, an `@external
+## suspend fn`, or a function whose R is not Immediate.
+fn suspending_call(callee: Int) -> Bool uses { State[BodyState], State[Infer] } {
+  program = prog()
+  b = bs()
+  b.member_opens.get(callee) match {
+    Some(member) -> suspending_member(program, member)
+    None -> b.ops.get(callee) match {
+      Some(op) -> program.items.get(op) match {
+        Some(IOp(o)) -> o.sig.is_suspend
+        _            -> False
+      }
+      None -> {
+        named = program.exprs.get(callee).map(|e| e.kind) match {
+          Some(EPath(ResDef(d))) -> Some(d)
+          _                      -> b.methods.get(callee)
+        }
+        external = named.and_then(|d| program.items.get(d)) match {
+          Some(IFn(f)) -> f.is_external && f.sig.is_suspend
+          _            -> False
+        }
+        by_type = shallow_resolve(b.expr_tys.get(callee).or(TyError)) match {
+          TyFn(f) -> resolve_row(f.uses).elems.any(|e| suspends(program, e))
+          _       -> False
+        }
+        external || by_type
+      }
+    }
+  }
+}
+
+fn suspending_member(program: Program, member: Int) -> Bool {
+  program.items.get(member) match {
+    Some(IMember(m)) -> m.sig.is_suspend
+    _                -> False
+  }
+}
+
+## The handler member an item of `with` opens.
+fn member_item(item: WithItem) -> Option[Int] uses { State[BodyState] } {
+  program = prog()
+  (item.res, item.cap) match {
+    (ResDef(d), _) if def_of(program, d).kind == MemberKind -> Some(d)
+    (_, Some((c, _)))                                       -> bs().member_opens.get(c)
+    _                                                       -> None
   }
 }

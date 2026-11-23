@@ -5,13 +5,14 @@ import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program}
 import Body
-import Bodystate.{HandlerFacts, Closed, ClosedMain, ClosedExport}
+import Bodystate.{HandlerFacts, Closed, ClosedMain, ClosedExport, Fibers}
 import Cycles
 import Groups
+import Layer
 import Signature.{Signatures, insert_sig}
 import Traits
 import Tylower.{TyDiag, TyLower, TyTable, con_def, def_of, new_lower, new_table}
-import Hir.{SourceModule, FnKind, IFn, TFn, ResDef}
+import Hir.{SourceModule, FnKind, IFn, IEffect, IOp, TFn, TPath, ResDef}
 import Ty.{TyFn, TyPrim, TyNever, TyError, TyBound, TyVar, TyNamed}
 
 ## The diagnostics of type checking, sorted by module and start position (stable), as the
@@ -23,6 +24,7 @@ pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
   (traits, sigs, trait_diags, collect_used) = Traits.collect(program, table, declared)
   groups = Groups.groups(program, sigs)
   closed = closed_defs(program, entry)
+  fibers = fibers_of(program)
   (inferred, lowered) = State.run(new_lower(program, table, []), || {
     groups.fold(
       (
@@ -38,6 +40,7 @@ pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
           known,
           facts,
           closed,
+          fibers,
           group,
         )
         next = inferred.fold(known, |acc, (def, sig)| insert_sig(acc, def, sig))
@@ -45,12 +48,12 @@ pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
       },
     )
   })
-  (final_sigs, used, _) = inferred
+  (final_sigs, used, facts) = inferred
   diags = sig_diags.append(trait_diags).append(Cycles.check(program)).append(
     lowered.diags.reverse(),
   ).append(Traits.unused_derives(program, traits, used)).append(
     main_value(program, table, final_sigs, entry),
-  ).append(export_fails(program, final_sigs))
+  ).append(export_fails(program, final_sigs)).append(Layer.check_layers(program, sigs, facts.uses))
   diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
 }
 
@@ -190,4 +193,53 @@ fn export_fails(program: Program, sigs: Signatures) -> List[TyDiag] {
       _ -> acc
     }
   })
+}
+
+## The built-in effects' scope functions and handle types (`fiber.rs`). A built-in effect is an
+## `@intrinsic effect`; its provider is the `@intrinsic` fn of the same module whose parameter's
+## function type names the effect in `uses`. The named types its operations return are handles.
+fn fibers_of(program: Program) -> Fibers {
+  effects = program.items.fold([], |acc, def, item| {
+    item match {
+      IEffect(e) if e.is_intrinsic -> acc.append([(def, e)])
+      _                            -> acc
+    }
+  })
+  handles = effects.fold([], |acc, (_, e)| {
+    e.ops.fold(acc, |a, op| {
+      ret = program.items.get(op) match {
+        Some(IOp(o)) -> o.sig.ret.and_then(|r| program.types.get(r)).map(|r| r.kind)
+        _            -> None
+      }
+      ret match {
+        Some(TPath(ResDef(t), _)) if def_of(program, t).kind == Hir.TypeKind
+          && !a.any(|x| x == t) -> a.append([t])
+        _ -> a
+      }
+    })
+  })
+  effect_defs = effects.map(|(d, _)| d)
+  names_effect = |ty: Int| {
+    program.types.get(ty).map(|r| r.kind) match {
+      Some(TFn(_, _, _, Some(uses))) -> uses.items.any(|u| {
+        u.res match {
+          ResDef(d) -> effect_defs.any(|e| e == d)
+          _         -> False
+        }
+      })
+      _ -> False
+    }
+  }
+  scope_fns = program.items.fold([], |acc, def, item| {
+    item match {
+      IFn(f) if f.is_intrinsic -> {
+        module = def_of(program, def).module
+        same = effect_defs.any(|e| def_of(program, e).module == module)
+        provides = f.sig.params.any(|p| p.ty.map(names_effect).or(False))
+        if same && provides { acc.append([def]) } else { acc }
+      }
+      _ -> acc
+    }
+  })
+  Fibers(scope_fns, handles)
 }

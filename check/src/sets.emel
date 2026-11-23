@@ -113,6 +113,7 @@ import Tylower.{TyLower, def_of, prelude_def, report, self_ty}
 import Signature
 import Bodystate.{
   BodyState,
+  PendingWith,
   EscapeInfo,
   Closed,
   ClosedMain,
@@ -727,7 +728,7 @@ fn origin_of(rows: Map[Int, Row], expr: Int, elem: RowElem) -> Int {
 
 ## Sub-expressions whose E flows into this one, in source order. Lambda and local fn bodies are
 ## excluded.
-fn sub_exprs(expr: Int) -> List[Int] {
+pub fn sub_exprs(expr: Int) -> List[Int] uses { State[BodyState] } {
   program = prog()
   program.exprs.get(expr).map(|e| e.kind) match {
     None -> []
@@ -1075,6 +1076,9 @@ fn with_effects(expr: Int, items: List[WithItem], body: Int) -> Row {
   bupd(|b| BodyState(with_stack: [(expr, provided), ..b.with_stack], ..b))
   body_row = expr_effects(body)
   bupd(|b| BodyState(with_stack: b.with_stack.drop(1), ..b))
+  Layer.check_with_items(program, bs().table, bs().sigs, items).each(
+    |d| report(d.span, d.code, d.message),
+  )
   deps = entries.map(|e| {
     e.supplier match {
       Layer.SHandler(h) -> handler_deps(h)
@@ -1110,6 +1114,8 @@ fn with_effects(expr: Int, items: List[WithItem], body: Int) -> Row {
   with_members = bs().with_members.get(expr).or([]).fold(with_deps, |acc, (_, f)| {
     union(acc, subtract(f.uses, provided))
   })
+  pending = PendingWith(expr, body, entries, deps)
+  bupd(|b| BodyState(withs: b.withs.append([pending]), ..b))
   items.enumerate().zip(arg_rows).fold(with_members, |acc, ((i, _), rows)| {
     if Layer.item_evaluated(program, entries, items, i) {
       rows.fold(acc, union)
@@ -1226,4 +1232,103 @@ fn subtract(row: Row, tags: List[Tag]) -> Row {
       _                                       -> insert(out, e)
     }
   })
+}
+
+# ---------------------------------------------------------------------------------------------
+# Once sets are solved
+
+## The initialization order of the handlers listed in the same `with` (spec 14.2): a dependency
+## cycle is E0411, unless the whole cycle comes from one nested layer (reported there). Also
+## W0401 for label items whose effect nothing uses.
+pub fn check_handler_cycles() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  bs().withs.each(|w| {
+    deps = w.deps.map(resolve_row)
+    when_some(Layer.find_cycle(w.entries, deps), |cycle| {
+      when_some(cycle.head().and_then(|i| w.entries.get(i)), |first| {
+        same_layer = first.from_layer
+          && cycle.all(|i| w.entries.get(i).map(|e| e.origin == first.origin).or(False))
+        if !same_layer {
+          diag(first.span, "E0411", "the handlers depend on each other")
+        }
+      })
+    })
+    body_row = bs().expr_effects.get(w.body).map(resolve_row).or(EMPTY_ROW)
+    # An item that opens a handler member of a label uses the label.
+    used = bs().with_members.get(w.expr).or([]).fold(body_row, |acc, (_, f)| {
+      union(acc, resolve_row(f.uses))
+    })
+    unused_label_providers(w.entries, deps, used)
+  })
+}
+
+## W0401 for label items of a `with` (`with L`, `L by P`) whose effect neither the body nor
+## another provider of the same `with` uses. Only when the body's R is fully known.
+fn unused_label_providers(entries: List[Layer.Entry], deps: List[Row], body: Row) -> () {
+  known = body.elems.all(|e| {
+    e match {
+      RTag(_) -> True
+      _       -> False
+    }
+  })
+  if known {
+    sigs = bs().sigs
+    entries.enumerate().each(|(i, entry)| {
+      by_effect = entry.supplier match {
+        Layer.SEffect(_) -> True
+        _                -> False
+      }
+      label_item = by_effect || Signature.label_base(sigs, entry.provided.def).is_some()
+      if label_item && !entry.from_layer {
+        tag = RTag(entry.provided)
+        in_deps = deps.enumerate().any(|(j, d)| {
+          j != i
+            && entries.get(j).map(|e| e.provided != entry.provided).or(False)
+            && d.elems.any(|x| x == tag)
+        })
+        if !body.elems.any(|x| x == tag) && !in_deps {
+          Tylower.report_warning(Some(entry.span), "W0401", "this label provider is not used")
+        }
+      }
+    })
+  }
+}
+
+## E0425: the value of a scope function (`Fiber.scope`) cannot contain a fiber handle or a
+## Deferred (spec 11.8): every child has ended once the scope returns.
+pub fn check_scope_values() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  b = bs()
+  if !b.fibers.scope_fns.is_empty() {
+    b.expr_tys.each(|expr, ty| {
+      if scope_call(expr) && handle_in(resolve(ty)) {
+        diag(expr_span(expr), "E0425", "this value cannot leave the scope")
+      }
+    })
+  }
+}
+
+## Whether `expr` calls a scope function.
+fn scope_call(expr: Int) -> Bool {
+  program = prog()
+  callee = program.exprs.get(expr).map(|e| e.kind) match {
+    Some(ECall(c, args)) if !args.is_empty() -> Some(c)
+    Some(EBinary(OpPipe, _, rhs)) -> program.exprs.get(rhs).map(|r| r.kind) match {
+      Some(ECall(c, _)) -> Some(c)
+      _                 -> Some(rhs)
+    }
+    _                                        -> None
+  }
+  callee.and_then(|c| program.exprs.get(c)).map(|e| e.kind) match {
+    Some(EPath(ResDef(d))) -> bs().fibers.scope_fns.any(|f| f == d)
+    _                      -> False
+  }
+}
+
+## Whether a fiber handle or Deferred type occurs anywhere in `ty`.
+fn handle_in(ty: Ty) -> Bool {
+  b = bs()
+  here = ty match {
+    TyNamed(con, _) -> b.fibers.handles.any(|h| h == Tylower.con_def(b.table, con))
+    _               -> False
+  }
+  here || Ty.child_types(ty).any(handle_in)
 }
