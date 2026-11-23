@@ -231,6 +231,8 @@ type Lowering(
   withs: List[(Int, List[String])],
   ## In an init, the cell holding the release of the handler members it opens.
   opened: Option[Int],
+  ## Function indices → whether the function may suspend.
+  suspending: Map[Int, Bool],
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -279,6 +281,7 @@ pub fn lower(
         -1,
         [],
         None,
+        Map.empty(),
       )
       (_, done) = State.run(start, || {
         instance(root, [])
@@ -318,8 +321,10 @@ fn instance_of(def: Int, args: List[Type], role: Int) -> Int uses { State[Loweri
     Some(id) -> id
     None -> {
       id = st().instances.size()
+      suspends = instance_suspends(def, args, role)
       upd(
         |l| Lowering(
+          suspending: l.suspending.insert(id, suspends),
           instances: l.instances.insert(key, id),
           queue: l.queue.append([Instance(id, def, args, role)]),
           ..l,
@@ -354,6 +359,94 @@ fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
     lower_handler_part(inst)
   } else {
     lower_plain_fn(inst)
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Sets and suspension
+
+## A call of the function `f`, which suspends as the function does.
+fn direct(f: Int, args: List[Expr], fails: Bool) -> Expr uses { State[Lowering] } {
+  XCall(Direct(f, []), args, fails, st().suspending.get(f).or(False))
+}
+
+## What decides how a function with an error or effect set is called (`SetSummary` of the
+## reference): whether it may fail (as an E), may suspend (as an R: not Immediate), and has an
+## effect other than Async. A set type parameter `RBound(i)` is the summary in `subst[i]`.
+fn summary(row: Ty.Row, subst: List[Type]) -> Ir.SetSummary uses { State[Lowering] } {
+  program = st().program
+  async_def = Tylower.prelude_def(program, "Async")
+  of_tag = |t: Ty.Tag| Ir.SetSummary(
+    True,
+    !Signature.is_immediate_effect(program, t.def),
+    Some(t.def) != async_def,
+    [],
+  )
+  row.elems.fold(Ir.SetSummary(False, False, False, []), |acc, e| {
+    part = e match {
+      Ty.RTag(t) -> of_tag(t)
+      Ty.RCap(c) -> of_tag(c.tag)
+      Ty.RBound(i) -> subst.get(i) match {
+        Some(Ir.CSet(s2)) -> s2
+        _                 -> Ir.SetSummary(True, True, True, [])
+      }
+      Ty.ROf(_)  -> Ir.SetSummary(True, False, False, [])
+      _          -> Ir.SetSummary(False, False, False, [])
+    }
+    Ir.SetSummary(acc.fails || part.fails, acc.suspends || part.suspends, acc.ev || part.ev, [])
+  })
+}
+
+## Whether a function value of type `ty` may suspend when called.
+fn fn_suspends(ty: Type) -> Bool {
+  ty match {
+    CFn(f) -> f.suspends
+    _      -> False
+  }
+}
+
+## The type arguments of a reference to `def`: its set type parameters are given the summaries of
+## the sets they are instantiated with.
+fn ref_args(expr: Int, def: Int) -> List[Type] uses { State[Lowering] } {
+  types = st().checked.types
+  tys = type_args(expr)
+  rows = types.type_rows.get(expr).or([])
+  params = Signature.get(st().checked.sigs, def).map(|s| s.scheme.params).or([])
+  tys.enumerate().map(|(i, t)| {
+    set = params.get(i).map(|p| p.kind == Ty.SetParamKind).or(False)
+    if set {
+      Ir.CSet(
+        rows.get(i).map(|r| summary(r, st().subst)).or(Ir.SetSummary(False, False, False, [])),
+      )
+    } else {
+      t
+    }
+  })
+}
+
+## Whether an instance may suspend: its R with the type arguments placed. A handler's init and
+## release may suspend as its dependencies do.
+fn instance_suspends(def: Int, args: List[Type], role: Int) -> Bool uses { State[Lowering] } {
+  role match {
+    0 -> Signature.get(st().checked.sigs, def).map(|s| s.scheme.ty) match {
+      Some(TyFn(f)) -> summary(f.uses, args).suspends
+      _             -> False
+    }
+    2 -> False
+    _ -> handler_suspends(def)
+  }
+}
+
+## Whether what a handler's bodies do may suspend: its dependencies are not Immediate.
+fn handler_suspends(hdl: Int) -> Bool uses { State[Lowering] } {
+  st().checked.facts.uses.get(hdl).map(|r| summary(r, []).suspends).or(False)
+}
+
+## Whether the effect operation `op` is declared `suspend fn`.
+fn op_is_suspend(op: Int) -> Bool uses { State[Lowering] } {
+  st().program.items.get(op) match {
+    Some(Hir.IOp(o)) -> o.sig.is_suspend
+    _                -> False
   }
 }
 
@@ -446,9 +539,10 @@ fn lower_plain_fn(inst: Instance) -> () uses { State[Lowering] } {
       name = if main { "main" } else { "#{def_name(def)}$#{inst.id}" }
       # The exit code `main` returns is set by `exit_with` of Std.Process.
       exit_with = if main { exit_code_setter(ret) } else { None }
-      value = exit_with.map(|f| XCall(Direct(f, []), [lowered, ev_var()], False, False)).or(lowered)
+      value = exit_with.map(|f| direct(f, [lowered, ev_var()], False)).or(lowered)
       display = def_of(program, def).name
-      fun = Function(name, main, locals, ret, 0, False, value, None, False, constant, display)
+      suspends = st().suspending.get(inst.id).or(False)
+      fun = Function(name, main, locals, ret, 0, False, value, None, suspends, constant, display)
       set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
     }
     _ -> {
@@ -549,7 +643,11 @@ fn convert(ty: Ty, subst: List[Type]) -> Type uses { State[Lowering] } {
     TyNever            -> CNever
     TyTuple(elems)     -> CTuple(elems.map(c))
     TyList(elem)       -> CList(c(elem))
-    TyFn(f)            -> CFn(pure_fn(f.params.map(c), c(f.ret)))
+    TyFn(f) -> {
+      e = summary(f.fails, subst)
+      r = summary(f.uses, subst)
+      CFn(Ir.FnType(f.params.map(c), c(f.ret), e.fails, r.suspends, r.ev))
+    }
     TyBound(i)         -> subst.get(i).or(CParam(i))
     TyNamed(con, args) -> named_type(con_def(st().checked.table, con), args.map(c))
     _                  -> CUnit
@@ -668,7 +766,7 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
   written match {
     Some((f, head)) -> {
       id = instance(f, impl_args(head, self_ty).append(targs.drop(1)))
-      XCall(Direct(id, []), args.append([ev_var()]), False, False)
+      direct(id, args.append([ev_var()]), False)
     }
     None -> {
       trait_name = def_of(program, trait_def).name
@@ -678,7 +776,7 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
         _                     -> False
       }
       if default && !prelude {
-        XCall(Direct(instance(def, targs), []), args.append([ev_var()]), False, False)
+        direct(instance(def, targs), args.append([ev_var()]), False)
       } else {
         builtin_trait_call(trait_name, name, self_ty, args)
       }
@@ -834,7 +932,8 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
       ELambda(params, body) -> {
         locals = params.map(|p| new_local(p.local))
         (ev, lowered) = in_closure(|| lower_expr(body))
-        XLambda(locals.append([ev]), expr_type(expr), lowered, False)
+        ty = expr_type(expr)
+        XLambda(locals.append([ev]), ty, lowered, fn_suspends(ty))
       }
       Hir.EUpdate(ctor, _, base) -> lower_update(expr, ctor, base)
       Hir.EAssert(cond)     -> lower_assert(cond)
@@ -962,7 +1061,7 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
       }
     } else {
       callable(expr, def) match {
-        Some(f) if data.kind == Hir.ConstKind -> XCall(Direct(f, []), [], False, False)
+        Some(f) if data.kind == Hir.ConstKind -> direct(f, [], False)
         Some(f)                               -> XFn(f, [])
         None -> {
           # An intrinsic as a function value: a closure calling the builtin.
@@ -983,7 +1082,7 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
               None    -> unsupported("a reference to #{def_name(def)}")
             }
           })
-          XLambda(locals.append([ev]), fn_ty, made, False)
+          XLambda(locals.append([ev]), fn_ty, made, fn_suspends(fn_ty))
         }
       }
     }
@@ -1024,7 +1123,7 @@ fn callable(expr: Int, def: Int) -> Option[Int] uses { State[Lowering] } {
     None                -> kind == ImplFnKind
     _                   -> False
   }
-  if has_body { Some(instance(def, type_args(expr))) } else { None }
+  if has_body { Some(instance(def, ref_args(expr, def))) } else { None }
 }
 
 fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[Lowering] } {
@@ -1053,7 +1152,14 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
   (op, member) match {
     (Some((o, base)), _) -> {
       h = lower_expr(base)
-      Ir.XOp(h, def_of(program, o).name, args, may_fail(callee))
+      Ir.XOp(
+        h,
+        def_of(program, o).name,
+        args,
+        may_fail(callee),
+        fn_suspends(expr_type(callee)),
+        op_is_suspend(o),
+      )
     }
     (None, Some(m)) -> {
       provider = callee_kind match {
@@ -1077,9 +1183,9 @@ fn plain_call(expr: Int, callee: Int, target: Option[Int], args: List[Expr]) -> 
       } else {
         builtin_call(callee, def, args) match {
           Some(b)                              -> b
-          None if data.kind == Hir.TraitFnKind -> trait_call(def, type_args(callee), args)
+          None if data.kind == Hir.TraitFnKind -> trait_call(def, ref_args(callee, def), args)
           None -> callable(callee, def) match {
-            Some(f) -> XCall(Direct(f, []), args.append([ev_var()]), may_fail(callee), False)
+            Some(f) -> direct(f, args.append([ev_var()]), may_fail(callee))
             None    -> unsupported("a call of #{def_name(def)}")
           }
         }
@@ -1087,7 +1193,12 @@ fn plain_call(expr: Int, callee: Int, target: Option[Int], args: List[Expr]) -> 
     }
     None -> {
       value = lower_expr(callee)
-      XCall(Indirect(value), args.append([ev_var()]), may_fail(callee), False)
+      XCall(
+        Indirect(value),
+        args.append([ev_var()]),
+        may_fail(callee),
+        fn_suspends(expr_type(callee)),
+      )
     }
   }
 }
@@ -1095,7 +1206,8 @@ fn plain_call(expr: Int, callee: Int, target: Option[Int], args: List[Expr]) -> 
 ## `State.run(initial, body)` (spec 8.8), a handler the runtime provides: a cell holding the
 ## state, a handler value reading and writing it under the key of `State[S]`, the call of `body`
 ## with it, and the pair of its value and the final state. A failure of `body` propagates.
-fn state_run(run: Int, targs: List[Type], args: List[Expr]) -> Expr uses { State[Lowering] } {
+fn state_run(run: Int, targs: List[Type], args: List[Expr], run_ty: Type) -> Expr
+  uses { State[Lowering] } {
   program = st().program
   state = targs.head().or(CUnit)
   module = def_of(program, run).module match {
@@ -1118,11 +1230,20 @@ fn state_run(run: Int, targs: List[Type], args: List[Expr]) -> Expr uses { State
   ]
   initial = args.get(0).or(XLit(VUnit))
   body = args.get(1).or(XLit(VUnit))
-  call = XCall(Indirect(body), [Ir.XProvide(Some(ev_var()), [(key, XVar(hv))])], True, False)
+  body_suspends = run_ty match {
+    CFn(f) -> f.params.get(1).map(fn_suspends).or(False)
+    _      -> False
+  }
+  call = XCall(
+    Indirect(body),
+    [Ir.XProvide(Some(ev_var()), [(key, XVar(hv))])],
+    True,
+    body_suspends,
+  )
   XLet(
     cell,
     XBuiltin("$cellNew", [], [initial]),
-    XLet(hv, Ir.XHandler(ops), XLet(result, call, XTuple([XVar(result), get()]))),
+    XLet(hv, Ir.XHandler("State", ops, []), XLet(result, call, XTuple([XVar(result), get()]))),
   )
 }
 
@@ -1149,7 +1270,7 @@ fn builtin_call(callee: Int, def: Int, args: List[Expr]) -> Option[Expr] uses { 
       _               -> ""
     }
     if module == "Std.State" && data.name == "run" {
-      Some(state_run(def, type_args(callee), args))
+      Some(state_run(def, ref_args(callee, def), args, expr_type(callee)))
     } else {
       Builtins.runtime_name(module, data.name) match {
         Some(name) -> Some(XBuiltin(name, type_args(callee), args))
@@ -1163,6 +1284,37 @@ fn builtin_call(callee: Int, def: Int, args: List[Expr]) -> Option[Expr] uses { 
 
 ## A field of a record.
 fn field_value(expr: Int, base: Int) -> Expr uses { State[Lowering] } {
+  types = st().checked.types
+  types.ops.get(expr) match {
+    Some(o) -> op_value(expr, base, o)
+    None    -> record_field(expr, base)
+  }
+}
+
+## An operation of a capability as a function value (`log.log`): the capability is taken once,
+## and the closure calls its operation.
+fn op_value(expr: Int, base: Int, op: Int) -> Expr uses { State[Lowering] } {
+  fn_ty = expr_type(expr)
+  ptys = fn_ty match {
+    CFn(f) -> f.params
+    _      -> []
+  }
+  h = fresh_local("cap", CUnit, None)
+  capability = lower_expr(base)
+  locals = ptys.map(|t| fresh_local("x", t, None))
+  ev = fresh_local("ev", Ir.CEvidence, None)
+  call = Ir.XOp(
+    XVar(h),
+    def_of(st().program, op).name,
+    locals.map(XVar),
+    may_fail(expr),
+    fn_suspends(fn_ty),
+    op_is_suspend(op),
+  )
+  XLet(h, capability, XLambda(locals.append([ev]), fn_ty, call, fn_suspends(fn_ty)))
+}
+
+fn record_field(expr: Int, base: Int) -> Expr uses { State[Lowering] } {
   types = st().checked.types
   types.fields.get(expr) match {
     Some(index) -> {
@@ -1294,7 +1446,7 @@ fn lower_block(stmts: List[Hir.Stmt], tail: Option[Int]) -> Expr uses { State[Lo
         params = f.sig.params.map(|p| new_local(p.local))
         ty = st().checked.types.locals.get(f.local).map(lower_type).or(CUnit)
         (ev, lowered) = in_closure(|| lower_expr(f.body))
-        value = XLambda(params.append([ev]), ty, lowered, False)
+        value = XLambda(params.append([ev]), ty, lowered, fn_suspends(ty))
         XLet(bound, value, lower_block(rest, tail))
       }
     }
@@ -1384,12 +1536,10 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
             op_name = hop.name.name
             params = hop.params.map(|p| new_local(p.local))
             self_local = new_local(hop.self_local)
-            if hop.is_suspend {
-              unsupported("a suspend fn implementation")
-              ()
-            }
             lowered = lower_expr(body)
-            (op_name, XLambda(params, CUnit, XLet(self_local, XVar(me), lowered), False))
+            # A suspend fn implementation is a generator when what it does may suspend.
+            gen = hop.is_suspend && handler_suspends(def)
+            (op_name, XLambda(params, CUnit, XLet(self_local, XVar(me), lowered), gen))
           })
         })
         # An inner handler is opened through its member: its init, its handler value, and a
@@ -1405,7 +1555,8 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
             _ -> None
           }
         })
-        ([me, ev], Ir.XHandler(ops.append(members)))
+        suspend_ops = h.ops.filter(|hop| hop.is_suspend).map(|hop| hop.name.name)
+        ([me, ev], Ir.XHandler(def_of(program, def).name, ops.append(members), suspend_ops))
       }
       _ -> {
         me = fresh_local("self", handler_ty, None)
@@ -1419,7 +1570,8 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
     }
   })
   when_some(made, |(params, body)| {
-    fun = Function(name, False, params, CUnit, 0, False, body, None, False, False, name)
+    suspends = st().suspending.get(inst.id).or(False)
+    fun = Function(name, False, params, CUnit, 0, False, body, None, suspends, False, name)
     set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
   })
 }
@@ -1434,7 +1586,7 @@ fn open_member_fn(inner: Int, item: Hir.HandlerItem, ev: Int) -> Expr uses { Sta
   init = instance_of(inner, [], 1)
   maker = instance_of(inner, [], 2)
   release = if item.release.is_some() {
-    XCall(Direct(instance_of(inner, [], 3), []), [XVar(me), XVar(ev)], False, False)
+    direct(instance_of(inner, [], 3), [XVar(me), XVar(ev)], False)
   } else {
     XLit(VUnit)
   }
@@ -1450,7 +1602,7 @@ fn open_member_fn(inner: Int, item: Hir.HandlerItem, ev: Int) -> Expr uses { Sta
     XLet(
       me,
       init_call(init, params.map(XVar), cell, ev),
-      XTuple([XCall(Direct(maker, []), [XVar(me), XVar(ev)], False, False), release_all]),
+      XTuple([direct(maker, [XVar(me), XVar(ev)], False), release_all]),
     ),
   )
   XLambda(params, CUnit, body, False)
@@ -1467,7 +1619,7 @@ fn open_member(
   body: Expr,
 ) -> Expr
   uses { State[Lowering] } {
-  opened = Ir.XOp(provider, def_of(st().program, member).name, args, True)
+  opened = Ir.XOp(provider, def_of(st().program, member).name, args, True, False, False)
   XMatch(opened, [Arm(QTuple([QBind(value), QBind(release)]), None, body)])
 }
 
@@ -1577,7 +1729,7 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
     lets = [
       (m.cell, XBuiltin("$cellNew", [], [XLambda([], CUnit, XLit(VUnit), False)])),
       (m.me, init_call(init, m.args.map(XVar), m.cell, ev)),
-      (m.value, XCall(Direct(maker, []), [XVar(m.me), XVar(ev)], False, False)),
+      (m.value, direct(maker, [XVar(m.me), XVar(ev)], False)),
       (next, Ir.XProvide(Some(XVar(ev)), bindings)),
     ]
     (ls.append([lets]), next, done.append([Made(ev:, ..m)]))
@@ -1643,7 +1795,7 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
       _                        -> False
     }
     release = if has_release {
-      XCall(Direct(instance_of(m.hdl, [], 3), []), [XVar(m.me), XVar(m.ev)], False, False)
+      direct(instance_of(m.hdl, [], 3), [XVar(m.me), XVar(m.ev)], False)
     } else {
       XLit(VUnit)
     }
@@ -1659,7 +1811,7 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
 ## are released before the failure goes on; its own release does not run.
 fn init_call(init: Int, args: List[Expr], cell: Int, ev: Int) -> Expr uses { State[Lowering] } {
   r = fresh_local("init", CUnit, None)
-  call = XCall(Direct(init, []), args.append([XVar(cell), XVar(ev)]), False, False)
+  call = direct(init, args.append([XVar(cell), XVar(ev)]), False)
   opened = XCall(Indirect(XBuiltin("$cellGet", [], [XVar(cell)])), [], False, False)
   failed = XSeq(opened, XFail(XBuiltin("$errorOf", [], [XVar(r)])))
   XLet(r, call, XIf(XBuiltin("$failed", [], [XVar(r)]), failed, XVar(r)))

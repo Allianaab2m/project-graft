@@ -192,6 +192,14 @@ const RUNTIME: List[String] = [
   "$cellNew",
   "$cellGet",
   "$cellSet",
+  "$spend",
+  "$pause",
+  "$perform",
+  "$maybe",
+  "$sync",
+  "$syncPerform",
+  "$start",
+  "$suspendOp",
 ]
 
 ## The comparison of derived and built-in Ord impls: by `<` on primitive values, element by
@@ -248,10 +256,14 @@ pub fn emit(module: Module) -> String {
   functions = module.functions.fold([], |acc, id, f| {
     acc.append(emit_fn(module, hosts, id, f)).append([""])
   })
-  exported = module.functions.fold(
+  exported0 = module.functions.fold(
     [],
     |acc, _, f| if f.exported { acc.append([f.name]) } else { acc },
   )
+  # A `main` that may suspend is started by the runtime's scheduler, which the launcher takes
+  # from the module.
+  starts = module.functions.fold(False, |acc, _, f| acc || (f.exported && f.suspends))
+  exported = if starts { exported0.append(["$start"]) } else { exported0 }
   units = units0.append(COMPARE)
   ordering = module.ordering.map(|o| {
     name = enum_name(module, o)
@@ -375,18 +387,21 @@ fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) 
       "}",
       "",
       "function #{f.name}$init() {",
-    ].append(body_lines(module, f.body, None)).append(["}"])
+    ].append(body_lines(module, f.body, None, False)).append(["}"])
     None -> if self_tail(f.body, id) {
       # Self tail calls go round a loop: the parameters are `$p0`, `$p1`, ..., bound afresh to
       # the parameters' locals on each round, so closures keep the values of their round.
       temps = f.params.enumerate().map(|(i, _)| "$p#{i}")
       binds = f.params.zip(temps).map(|(p, t)| "    const #{local_name(module, p)} = #{t};")
-      body = body_lines(module, f.body, Some(Tail(id, temps))).map(|l| "  #{l}")
-      ["function #{f.name}(#{String.join(temps, ", ")}) {", "  $L: for (;;) {"].append(
-        binds,
-      ).append(body).append(["  }", "}"])
+      body = body_lines(module, f.body, Some(Tail(id, temps)), f.suspends).map(|l| "  #{l}")
+      [
+        "#{keyword(f.suspends)} #{f.name}(#{String.join(temps, ", ")}) {",
+        "  $L: for (;;) {",
+      ].append(binds).append(body).append(["  }", "}"])
     } else {
-      ["function #{f.name}(#{params}) {"].append(body_lines(module, f.body, None)).append(["}"])
+      ["#{keyword(f.suspends)} #{f.name}(#{params}) {"].append(
+        body_lines(module, f.body, None, f.suspends),
+      ).append(["}"])
     }
   }
 }
@@ -452,6 +467,8 @@ type Em(
   ## failure. None means the caller (`return`).
   fail_targets: List[(String, String)],
   tail: Option[Tail],
+  ## Whether the function being emitted is a generator (it may suspend).
+  generator: Bool,
 )
 
 fn em() -> Em uses { State[Em] } {
@@ -489,8 +506,8 @@ fn mdl() -> Module uses { State[Em] } {
 }
 
 ## The lines of a function body that returns `expr`, indented by one.
-fn body_lines(module: Module, expr: Expr, tail: Option[Tail]) -> List[String] {
-  (_, done) = State.run(Em(module, [], 1, 0, [], tail), || stmt(expr, DReturn))
+fn body_lines(module: Module, expr: Expr, tail: Option[Tail], generator: Bool) -> List[String] {
+  (_, done) = State.run(Em(module, [], 1, 0, [], tail, generator), || stmt(expr, DReturn))
   done.lines.reverse()
 }
 
@@ -774,34 +791,34 @@ fn escape_stmt(body: Expr, arms: List[Arm], dest: Dest) -> () uses { State[Em] }
 ## Whether `expr` can be emitted as an expression without statements before it.
 fn is_simple(expr: Expr) -> Bool {
   expr match {
-    XLit(_)               -> True
-    XVar(_)               -> True
-    XFn(_, _)             -> True
-    XLambda(_, _, _, _)   -> True
-    XCall(_, _, True, _)  -> False
+    XLit(_)                -> True
+    XVar(_)                -> True
+    XFn(_, _)              -> True
+    XLambda(_, _, _, _)    -> True
+    XCall(_, _, True, _)   -> False
     XCall(Direct(_, _), args, _, _) -> args.all(is_simple)
     XCall(Indirect(c), args, _, _) -> is_simple(c) && args.all(is_simple)
-    XBuiltin(_, _, args)  -> args.all(is_simple)
-    XCtor(_, _, args)     -> args.all(is_simple)
-    XTuple(args)          -> args.all(is_simple)
-    Ir.XUse(ev, _)        -> is_simple(ev)
+    XBuiltin(_, _, args)   -> args.all(is_simple)
+    XCtor(_, _, args)      -> args.all(is_simple)
+    XTuple(args)           -> args.all(is_simple)
+    Ir.XUse(ev, _)         -> is_simple(ev)
     Ir.XProvide(base, bindings) -> base.map(is_simple).or(True)
       && bindings.all(|(_, h)| is_simple(h))
-    Ir.XHandler(ops)      -> ops.all(|(_, f)| is_simple(f))
-    Ir.XOp(_, _, _, True) -> False
-    Ir.XOp(t, _, args, _) -> is_simple(t) && args.all(is_simple)
-    XField(base, _, _)    -> is_simple(base)
-    XList(_, elems, tail) -> elems.all(is_simple) && tail.map(is_simple).or(True)
-    XBinary(_, _, a, b)   -> is_simple(a) && is_simple(b)
-    XUnary(_, _, a)       -> is_simple(a)
-    XIf(c, t, e)          -> is_simple(c) && is_simple(t) && is_simple(e)
+    Ir.XHandler(_, ops, _) -> ops.all(|(_, f)| is_simple(f))
+    Ir.XOp(_, _, _, True, _, _) -> False
+    Ir.XOp(t, _, args, _, _, _) -> is_simple(t) && args.all(is_simple)
+    XField(base, _, _)     -> is_simple(base)
+    XList(_, elems, tail)  -> elems.all(is_simple) && tail.map(is_simple).or(True)
+    XBinary(_, _, a, b)    -> is_simple(a) && is_simple(b)
+    XUnary(_, _, a)        -> is_simple(a)
+    XIf(c, t, e)           -> is_simple(c) && is_simple(t) && is_simple(e)
     XConcat(parts) -> parts.all(|p| {
       p match {
         SLit(_)      -> True
         SValue(v, _) -> is_simple(v)
       }
     })
-    _                     -> False
+    _                      -> False
   }
 }
 
@@ -843,9 +860,9 @@ fn via_tmp(expr: Expr) -> String uses { State[Em] } {
 fn value_of(expr: Expr) -> String uses { State[Em] } {
   module = mdl()
   expr match {
-    XLit(lit)                   -> emit_lit(lit)
-    XVar(local)                 -> local_name(module, local)
-    XFn(f, _)                   -> fn_name(module, f)
+    XLit(lit)                  -> emit_lit(lit)
+    XVar(local)                -> local_name(module, local)
+    XFn(f, _)                  -> fn_name(module, f)
     XLet(bound, value, body) -> {
       v = bound_value(bound, value)
       line("const #{local_name(module, bound)} = #{v};")
@@ -855,7 +872,7 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       discard(first)
       value_of(rest)
     }
-    XCall(callee, args, fails, _) -> {
+    XCall(callee, args, fails, suspends) -> {
       (head, vs) = callee match {
         Direct(f, _) -> (fn_name(module, f), values_in_order(args))
         Indirect(c) -> values_in_order([c, ..args]) match {
@@ -863,7 +880,12 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
           []           -> ("undefined", [])
         }
       }
-      call = "#{head}(#{String.join(vs, ", ")})"
+      plain = "#{head}(#{String.join(vs, ", ")})"
+      direct = callee match {
+        Direct(_, _) -> True
+        _            -> False
+      }
+      call = suspending_call(plain, suspends, direct)
       if fails { checked(call) } else { call }
     }
     XBuiltin("$showNested", targs, args) -> {
@@ -909,8 +931,8 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       b = value_of(base)
       "#{b}.#{field_key(variant_fields(module, ctor), index)}"
     }
-    XTuple(elems)               -> "[#{String.join(values_in_order(elems), ", ")}]"
-    Ir.XUse(ev, key)            -> "#{value_of(ev)}[#{quote(key)}]"
+    XTuple(elems)              -> "[#{String.join(values_in_order(elems), ", ")}]"
+    Ir.XUse(ev, key)           -> "#{value_of(ev)}[#{quote(key)}]"
     Ir.XProvide(base, bindings) -> {
       vs = values_in_order(base.map(|b| [b]).or([]).append(bindings.map(|(_, h)| h)))
       (proto, hs) = base match {
@@ -920,14 +942,33 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       entries = bindings.zip(hs).map(|((k, _), h)| ", #{quote(k)}: #{h}")
       "{ __proto__: #{proto}#{String.concat(entries)} }"
     }
-    Ir.XHandler(ops) -> {
+    Ir.XHandler(named, ops, suspend_ops) -> {
       vs = values_in_order(ops.map(|(_, f)| f))
-      entries = ops.zip(vs).map(|((name, _), v)| "#{quote(name)}: #{v}")
+      entries = ops.zip(vs).map(|((name, _), v)| {
+        value = if suspend_ops.any(|o| o == name) {
+          "$suspendOp(#{quote(named)}, #{quote(name)}, #{v})"
+        } else {
+          v
+        }
+        "#{quote(name)}: #{value}"
+      })
       "{ #{String.join(entries, ", ")} }"
     }
-    Ir.XOp(target, name, args, fails) -> values_in_order([target, ..args]) match {
+    Ir.XOp(target, name, args, fails, suspends, perform) -> values_in_order(
+      [target, ..args],
+    ) match {
       [h, ..rest] -> {
-        call = "#{h}[#{quote(name)}](#{String.join(rest, ", ")})"
+        op = "#{h}[#{quote(name)}]"
+        call = if perform {
+          # A suspend fn operation: a request to the scheduler.
+          if em().generator {
+            paused("(yield $perform(#{op}, [#{String.join(rest, ", ")}]))")
+          } else {
+            "$syncPerform(#{op}, [#{String.join(rest, ", ")}])"
+          }
+        } else {
+          suspending_call("#{op}(#{String.join(rest, ", ")})", suspends, False)
+        }
         if fails { checked(call) } else { call }
       }
       [] -> "undefined"
@@ -943,15 +984,15 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       }
     }
     XIf(c, t, e) if is_simple(expr) -> "(#{value_of(c)} ? #{value_of(t)} : #{value_of(e)})"
-    XBinary(BAnd, _, lhs, rhs)  -> logical(True, lhs, rhs)
-    XBinary(BOr, _, lhs, rhs)   -> logical(False, lhs, rhs)
+    XBinary(BAnd, _, lhs, rhs) -> logical(True, lhs, rhs)
+    XBinary(BOr, _, lhs, rhs)  -> logical(False, lhs, rhs)
     XBinary(op, ty, lhs, rhs) -> values_in_order([lhs, rhs]) match {
       [a, b] -> binary(op, ty, a, b)
       _      -> "undefined"
     }
-    XUnary(UNot, _, operand)    -> "(!#{value_of(operand)})"
-    XUnary(UNeg, ty, operand)   -> wrap(ty, "(-#{value_of(operand)})")
-    XLambda(params, _, body, _) -> lambda_js(params, body, None)
+    XUnary(UNot, _, operand)   -> "(!#{value_of(operand)})"
+    XUnary(UNeg, ty, operand)  -> wrap(ty, "(-#{value_of(operand)})")
+    XLambda(params, _, body, gen) -> lambda_js(params, body, None, gen)
     XConcat(parts) -> {
       values = values_in_order(
         parts.filter_map(|p| {
@@ -977,20 +1018,21 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       })
       "`#{String.concat(pieces)}`"
     }
-    _                           -> via_tmp(expr)
+    _                          -> via_tmp(expr)
   }
 }
 
 ## The value bound to `bound`: a local fn whose self calls in tail position go round a loop.
 fn bound_value(bound: Int, value: Expr) -> String uses { State[Em] } {
   value match {
-    XLambda(params, _, body, _) -> lambda_js(params, body, Some(0 - (bound + 1)))
-    _                           -> value_of(value)
+    XLambda(params, _, body, gen) -> lambda_js(params, body, Some(0 - (bound + 1)), gen)
+    _                             -> value_of(value)
   }
 }
 
 ## A closure. With `self` (the local fn's id in `Tail`), self tail calls become a loop.
-fn lambda_js(params: List[Int], body: Expr, me: Option[Int]) -> String uses { State[Em] } {
+fn lambda_js(params: List[Int], body: Expr, me: Option[Int], gen: Bool) -> String
+  uses { State[Em] } {
   module = mdl()
   pad = String.concat(List.range(0, em().indent).map(|_| "  "))
   looped = me.and_then(|f| if self_tail(body, f) { Some(f) } else { None })
@@ -999,16 +1041,43 @@ fn lambda_js(params: List[Int], body: Expr, me: Option[Int]) -> String uses { St
       temps = params.enumerate().map(|(i, _)| "$p#{i}")
       binds = params.zip(temps).map(|(p, t)| "    const #{local_name(module, p)} = #{t};")
       lines = ["  $L: for (;;) {"].append(binds).append(
-        body_lines(module, body, Some(Tail(f, temps))).map(|l| "  #{l}"),
+        body_lines(module, body, Some(Tail(f, temps)), gen).map(|l| "  #{l}"),
       ).append(["  }"])
       (String.join(temps, ", "), lines)
     }
     None -> (
       String.join(params.map(|p| local_name(module, p)), ", "),
-      body_lines(module, body, None),
+      body_lines(module, body, None, gen),
     )
   }
-  "((#{ps}) => {\n#{String.join(inner.map(|l| "#{pad}#{l}"), "\n")}\n#{pad}})"
+  # A generator cannot be an arrow function.
+  head = if gen { "(function* (#{ps}) {" } else { "((#{ps}) => {" }
+  "#{head}\n#{String.join(inner.map(|l| "#{pad}#{l}"), "\n")}\n#{pad}})"
+}
+
+## A call that may suspend: chained with `yield*` in a generator (through `$maybe` when the
+## callee is a function value, which may turn out not to suspend), run to completion with `$sync`
+## elsewhere.
+fn suspending_call(call: String, suspends: Bool, direct: Bool) -> String uses { State[Em] } {
+  if !suspends {
+    call
+  } else if !em().generator {
+    "$sync(#{call})"
+  } else if direct {
+    paused("(yield* #{call})")
+  } else {
+    paused("(yield* $maybe(#{call}))")
+  }
+}
+
+## A suspending call in a generator spends the running fiber's budget first, and the fiber
+## yields to the others when it runs out (spec 11.1).
+fn paused(call: String) -> String {
+  "($spend() && (yield $pause()), #{call})"
+}
+
+fn keyword(generator: Bool) -> String {
+  if generator { "function*" } else { "function" }
 }
 
 ## `a && b` and `a || b`. When the right side needs statements, it is evaluated only if the left

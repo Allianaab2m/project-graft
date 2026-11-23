@@ -199,9 +199,13 @@ pub enum Expr {
   ## An evidence table: `base` (or none) with the effects of `bindings` provided by the handlers.
   XProvide(base: Option[Expr], bindings: List[(String, Expr)])
   ## A handler value: its operations by name.
-  XHandler(ops: List[(String, Expr)])
+  ## `named` names the handler for the messages of its suspend fn implementations, listed in
+  ## `suspend_ops`.
+  XHandler(named: String, ops: List[(String, Expr)], suspend_ops: List[String])
   ## A call of the operation `name` of the handler value `handler`.
-  XOp(target: Expr, name: String, args: List[Expr], fails: Bool)
+  ## `perform` for a suspend fn operation (a request to the scheduler); `suspends` when the call
+  ## may suspend.
+  XOp(target: Expr, name: String, args: List[Expr], fails: Bool, suspends: Bool, perform: Bool)
   ## `body`, then `cleanup` however `body` ends: the release of the handler value `retired` (named
   ## `name`) of a `with`, which is retired afterwards. A defect of the release notes a defect of
   ## the body.
