@@ -48,7 +48,8 @@ jobs:
 
   # Every .emel of emela-lang/emela, at the tag of the release Graft is built with:
   # - M1: lexes into tokens that concatenate back to the file
-  # - Graft's tokens and syntax tree equal those of the reference implementation (tools/oracle)
+  # - Graft's tokens, syntax tree and formatted output equal those of the reference implementation
+  #   (tools/oracle), except for scripts/known-differences.txt
   corpus:
     runs-on: ubuntu-latest
     steps:
@@ -86,3 +87,5 @@ jobs:
         run: scripts/compare.sh tokens corpus/emela
       - name: Compare syntax trees with the reference
         run: scripts/compare.sh tree corpus/emela
+      - name: Compare formatted output with the reference
+        run: scripts/compare.sh fmt corpus/emela

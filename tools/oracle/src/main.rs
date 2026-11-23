@@ -1,5 +1,8 @@
 //! `graft-oracle tokens <file>` and `graft-oracle tree <file>` print the tokens or the syntax
 //! tree that the reference implementation makes of a file, in the format Graft prints.
+//! `graft-oracle fmt <file> [width]` prints the file as `emela fmt` formats it (at `width`,
+//! 100 by default), or `error` if it refuses to (syntax errors), or `internal error` (a
+//! formatter bug).
 //!
 //! - One element per line: `Kind@start..end`, nested elements indented by two spaces.
 //! - Positions count code points, not bytes, because Graft reads sources as code points.
@@ -31,10 +34,15 @@ const PARSER_CODES: &[&str] = &[
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (mode, path) = match args.as_slice() {
-        [mode, path] if mode == "tokens" || mode == "tree" => (mode.as_str(), path),
+    let (mode, path, width) = match args.as_slice() {
+        [mode, path] if mode == "tokens" || mode == "tree" || mode == "fmt" => {
+            (mode.as_str(), path, emela_fmt::DEFAULT_WIDTH)
+        }
+        [mode, path, width] if mode == "fmt" && width.parse::<usize>().is_ok() => {
+            (mode.as_str(), path, width.parse().unwrap())
+        }
         _ => {
-            eprintln!("usage: graft-oracle <tokens|tree> <file>");
+            eprintln!("usage: graft-oracle <tokens|tree> <file> | graft-oracle fmt <file> [width]");
             return ExitCode::from(2);
         }
     };
@@ -45,6 +53,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if mode == "fmt" {
+        match emela_fmt::format_with_width(&src, width) {
+            Ok(out) => print!("{out}"),
+            Err(emela_fmt::FormatError::Syntax(_)) => println!("error"),
+            Err(emela_fmt::FormatError::Internal(message)) => {
+                eprintln!("{message}");
+                println!("internal error");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     let positions = Positions::new(&src);
     let mut out = String::new();
     if mode == "tokens" {

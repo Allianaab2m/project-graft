@@ -4,6 +4,8 @@
 ##   the file without gaps.
 ## - `graft tokens <file>` prints the tokens of a file as `Kind@start..end`, one per line, in the
 ##   format of `tools/oracle`.
+## - `graft fmt <file> [width]` prints the file formatted (at `width`, 100 by default), `error`
+##   if it has syntax errors, or `internal error`, in the format of `tools/oracle`.
 ## - `graft parse <file>...` parses each file and prints the number of diagnostics, to time the
 ##   parser.
 ## - `graft tree <file>` prints the syntax tree of a file and the diagnostics of the parser, in the
@@ -12,6 +14,7 @@ import Std.Array.{Array}
 import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
 import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
+import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
 import Grammar
 import Lexer
 import Parser
@@ -25,16 +28,23 @@ fn main() -> ExitCode {
     args.list() match {
       ["roundtrip", ..files] -> roundtrip(files)
       ["tokens", path]       -> tokens(path)
+      ["fmt", path]          -> fmt(path, DEFAULT_WIDTH)
+      ["fmt", path, width] -> Some(Int.parse(width)) escape { _ -> None } match {
+        Some(w) -> fmt(path, w)
+        None    -> usage()
+      }
       ["parse", ..files]     -> parse(files)
       ["tree", path]         -> tree(path)
-      _ -> {
-        console.print_error_line(
-          "usage: graft roundtrip <file>... | graft parse <file>... | graft tokens <file> | graft tree <file>",
-        )
-        Process.exit_code(2)
-      }
+      _                      -> usage()
     }
   }
+}
+
+fn usage() -> ExitCode uses { Console } {
+  (use Console).print_error_line(
+    "usage: graft roundtrip <file>... | graft parse <file>... | graft tokens <file> | graft tree <file> | graft fmt <file> [width]",
+  )
+  Process.exit_code(2)
 }
 
 fn roundtrip(files: List[String]) -> ExitCode uses { Console, FileSystem } {
@@ -112,6 +122,26 @@ fn tree(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
       built = build(text)
       errors = List.map(built.diagnostics, |d| "error[#{d.code}]@#{d.start}..#{d.end}\n")
       (use Stdout).print(String.concat(List.append(Syntax.dump(built.tree), errors)))
+      EXIT_SUCCESS
+    }
+  }
+}
+
+fn fmt(path: String, width: Int) -> ExitCode uses { Console, FileSystem, Stdout } {
+  console = use Console
+  fs = use FileSystem
+  Some(fs.read_text(path)) escape { _ -> None } match {
+    None -> {
+      console.print_error_line("cannot read #{path}")
+      EXIT_FAILURE
+    }
+    Some(text) -> {
+      out = Format.format_with_width(text, width) match {
+        Done(formatted) -> formatted
+        SyntaxErrors    -> "error\n"
+        Internal(_)     -> "internal error\n"
+      }
+      (use Stdout).print(out)
       EXIT_SUCCESS
     }
   }

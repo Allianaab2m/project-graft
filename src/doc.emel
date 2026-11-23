@@ -1,0 +1,245 @@
+## Documents for line breaking, Wadler style. Follows the `pretty` crate 0.12 that the reference
+## formatter uses, down to its rendering algorithm (`render.rs`), so that both break lines at the
+## same places.
+##
+## The constructors simplify as `pretty`'s builder does: appending `Nil` returns the other side,
+## a group of a text or of a group is itself, and nesting `Nil` or by 0 is itself.
+import Std.Array.{Array}
+
+pub enum Doc {
+  Nil
+  ## A text without newlines and its display width.
+  Text(text: String, width: Int)
+  Append(left: Doc, right: Doc)
+  ## Laid out on one line if it fits, with every `FlatAlt` inside taking its flat side.
+  Group(doc: Doc)
+  Nest(offset: Int, doc: Doc)
+  ## `broken` when the enclosing group breaks, `flat` when it does not.
+  FlatAlt(broken: Doc, flat: Doc)
+  Hardline
+  ## The document for the current column.
+  Column(f: fn(Int) -> Doc)
+  ## The document for the current indentation.
+  Nesting(f: fn(Int) -> Doc)
+}
+
+pub fn nil() -> Doc {
+  Nil
+}
+
+pub fn text(s: String) -> Doc {
+  if s == "" { Nil } else { Text(s, display_width(s)) }
+}
+
+pub fn hardline() -> Doc {
+  Hardline
+}
+
+## A newline, or a space when the group is flat.
+pub fn line() -> Doc {
+  FlatAlt(Hardline, Text(" ", 1))
+}
+
+## A newline, or nothing when the group is flat.
+pub fn line_() -> Doc {
+  FlatAlt(Hardline, Nil)
+}
+
+pub fn append(left: Doc, right: Doc) -> Doc {
+  (left, right) match {
+    (Nil, _) -> right
+    (_, Nil) -> left
+    _        -> Append(left, right)
+  }
+}
+
+## `docs` appended in order.
+pub fn concat(docs: List[Doc]) -> Doc {
+  List.fold(docs, Nil, append)
+}
+
+pub fn group(doc: Doc) -> Doc {
+  doc match {
+    Group(_)   -> doc
+    Text(_, _) -> doc
+    Nil        -> doc
+    _          -> Group(doc)
+  }
+}
+
+pub fn nest(doc: Doc, offset: Int) -> Doc {
+  doc match {
+    Nil -> doc
+    _   -> if offset == 0 { doc } else { Nest(offset, doc) }
+  }
+}
+
+pub fn flat_alt(broken: Doc, flat: Doc) -> Doc {
+  FlatAlt(broken, flat)
+}
+
+pub fn column(f: fn(Int) -> Doc fails {} uses {}) -> Doc {
+  Column(f)
+}
+
+pub fn nesting(f: fn(Int) -> Doc fails {} uses {}) -> Doc {
+  Nesting(f)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Rendering (`pretty`'s `Best`)
+
+enum Mode {
+  Break
+  Flat
+} derive Eq
+
+type Cmd(indent: Int, mode: Mode, doc: Doc)
+
+type Out(
+  ## The column after the last piece written.
+  pos: Int,
+  ## Pieces written, newest first.
+  pieces: List[String],
+)
+
+## Lays `doc` out within `width` columns where it can.
+pub fn render(doc: Doc, width: Int) -> String {
+  out = best([Cmd(0, Break, doc)], width, Out(0, []))
+  String.concat(List.reverse(out.pieces))
+}
+
+fn best(cmds: List[Cmd], width: Int, out: Out) -> Out {
+  cmds match {
+    []            -> out
+    [cmd, ..rest] -> step(cmd.indent, cmd.mode, cmd.doc, rest, width, out)
+  }
+}
+
+fn step(indent: Int, mode: Mode, doc: Doc, rest: List[Cmd], width: Int, out: Out) -> Out {
+  doc match {
+    Nil                 -> best(rest, width, out)
+    Append(left, right) -> step(indent, mode, left, [Cmd(indent, mode, right), ..rest], width, out)
+    FlatAlt(broken, flat) -> {
+      next = if mode == Break { broken } else { flat }
+      step(indent, mode, next, rest, width, out)
+    }
+    Group(inner) -> {
+      flat = mode == Break && fits([inner], rest, out.pos, indent, width, Flat)
+      step(indent, if flat { Flat } else { mode }, inner, rest, width, out)
+    }
+    Nest(offset, inner) -> {
+      step(max(indent + offset, 0), mode, inner, rest, width, out)
+    }
+    # The next document may have a different indentation, so the newline takes it.
+    Hardline -> rest match {
+      [next, ..after] -> {
+        written = Out(next.indent, [spaces(next.indent), "\n", ..out.pieces])
+        step(next.indent, next.mode, next.doc, after, width, written)
+      }
+      [] -> Out(indent, [spaces(indent), "\n", ..out.pieces])
+    }
+    Text(s, w)          -> best(rest, width, Out(out.pos + w, [s, ..out.pieces]))
+    Column(f)           -> step(indent, mode, f(out.pos), rest, width, out)
+    Nesting(f)          -> step(indent, mode, f(indent), rest, width, out)
+  }
+}
+
+fn max(a: Int, b: Int) -> Int {
+  if a > b { a } else { b }
+}
+
+fn spaces(n: Int) -> String {
+  String.concat(List.map(List.range(0, n), |_| " "))
+}
+
+## Whether the documents in `docs` (flat) and then those in `rest` (as they are) fit on the line
+## up to the first newline. A newline in the flat part does not fit; one in the rest ends the
+## line, so everything before it fit.
+##
+## As in `pretty`, `indent` stays the indentation of the group being tried, also for `Nesting`
+## in the rest.
+fn fits(docs: List[Doc], rest: List[Cmd], pos: Int, indent: Int, width: Int, mode: Mode) -> Bool {
+  docs match {
+    [] -> rest match {
+      []            -> True
+      [cmd, ..more] -> fits([cmd.doc], more, pos, indent, width, Break)
+    }
+    [doc, ..more] -> doc match {
+      Nil                 -> fits(more, rest, pos, indent, width, mode)
+      Append(left, right) -> fits([left, right, ..more], rest, pos, indent, width, mode)
+      Hardline            -> mode == Break
+      Text(_, w) -> if pos + w > width {
+        False
+      } else {
+        fits(more, rest, pos + w, indent, width, mode)
+      }
+      FlatAlt(broken, flat) -> {
+        next = if mode == Break { broken } else { flat }
+        fits([next, ..more], rest, pos, indent, width, mode)
+      }
+      Column(f)           -> fits([f(pos), ..more], rest, pos, indent, width, mode)
+      Nesting(f)          -> fits([f(indent), ..more], rest, pos, indent, width, mode)
+      Nest(_, d)          -> fits([d, ..more], rest, pos, indent, width, mode)
+      Group(d)            -> fits([d, ..more], rest, pos, indent, width, mode)
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Display width
+
+## The display width of `s` in a terminal: `pretty` counts ASCII text by its length and other
+## text with `unicode-width`. Wide East Asian characters and emoji count 2, combining marks 0.
+pub fn display_width(s: String) -> Int {
+  List.fold(String.code_points(s), 0, |sum, c| sum + char_width(c))
+}
+
+fn char_width(c: Int) -> Int {
+  if c < 0x300 {
+    1
+  } else if is_zero_width(c) {
+    0
+  } else if is_wide(c) {
+    2
+  } else {
+    1
+  }
+}
+
+fn in_ranges(c: Int, ranges: List[(Int, Int)]) -> Bool {
+  List.any(ranges, |(lo, hi)| lo <= c && c <= hi)
+}
+
+const ZERO_WIDTH = [
+  (0x0300, 0x036F),
+  (0x200B, 0x200F),
+  (0x20D0, 0x20FF),
+  (0xFE00, 0xFE0F),
+  (0xFE20, 0xFE2F),
+]
+
+const WIDE = [
+  (0x1100, 0x115F),
+  (0x2E80, 0x303E),
+  (0x3041, 0x33FF),
+  (0x3400, 0x4DBF),
+  (0x4E00, 0x9FFF),
+  (0xA000, 0xA4CF),
+  (0xAC00, 0xD7A3),
+  (0xF900, 0xFAFF),
+  (0xFE30, 0xFE4F),
+  (0xFF00, 0xFF60),
+  (0xFFE0, 0xFFE6),
+  (0x1F300, 0x1F64F),
+  (0x1F900, 0x1F9FF),
+  (0x20000, 0x3FFFD),
+]
+
+fn is_zero_width(c: Int) -> Bool {
+  in_ranges(c, ZERO_WIDTH)
+}
+
+fn is_wide(c: Int) -> Bool {
+  in_ranges(c, WIDE)
+}

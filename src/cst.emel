@@ -1,0 +1,157 @@
+## Navigating the syntax tree as the reference formatter does with rowan's red tree: a node knows
+## its ancestors, so the printer can look up (`parent`, `ancestors`) as well as down.
+import Syntax.{NodeKind, Tree, Branch, Leaf}
+import Token.{Kind, Token, is_trivia, Newline, Comment, DocComment}
+
+## A node with its ancestors, innermost first.
+##
+## The fields are not named `children` and `ancestors`: a function of the module has each name.
+pub type Node(kind: NodeKind, start: Int, end: Int, trees: List[Tree], outer: List[Node])
+
+pub enum Element {
+  NodeElement(node: Node)
+  TokenElement(token: Token)
+}
+
+## The kind of an element: a token kind or a node kind.
+pub enum ElementKind {
+  TokenKind(kind: Kind)
+  OfNode(kind: NodeKind)
+} derive Eq
+
+pub fn root(tree: Tree) -> Node {
+  tree match {
+    Branch(kind, start, end, children) -> Node(kind, start, end, children, [])
+    Leaf(t)                            -> Node(Syntax.Root, t.start, t.end, [tree], [])
+  }
+}
+
+## Whether `a` and `b` are the same node. Nested nodes of the same kind never span the same range
+## at the same depth.
+pub fn same(a: Node, b: Node) -> Bool {
+  a.kind == b.kind
+    && a.start == b.start
+    && a.end == b.end
+    && List.length(a.outer) == List.length(b.outer)
+}
+
+pub fn parent(node: Node) -> Option[Node] {
+  List.head(node.outer)
+}
+
+fn child_of(parent: Node, tree: Tree) -> Element {
+  tree match {
+    Branch(kind, start, end, children) -> {
+      NodeElement(Node(kind, start, end, children, [parent, ..parent.outer]))
+    }
+    Leaf(t) -> TokenElement(t)
+  }
+}
+
+pub fn children_with_tokens(node: Node) -> List[Element] {
+  List.map(node.trees, |c| child_of(node, c))
+}
+
+## The child nodes, without tokens.
+pub fn children(node: Node) -> List[Node] {
+  List.filter_map(node.trees, |c| {
+    child_of(node, c) match {
+      NodeElement(n)  -> Some(n)
+      TokenElement(_) -> None
+    }
+  })
+}
+
+pub fn element_kind(element: Element) -> ElementKind {
+  element match {
+    NodeElement(n)  -> OfNode(n.kind)
+    TokenElement(t) -> TokenKind(t.kind)
+  }
+}
+
+pub fn is_token(element: Element, kind: Kind) -> Bool {
+  element match {
+    TokenElement(t) -> t.kind == kind
+    NodeElement(_)  -> False
+  }
+}
+
+pub fn is_node(element: Element, kind: NodeKind) -> Bool {
+  element match {
+    NodeElement(n)  -> n.kind == kind
+    TokenElement(_) -> False
+  }
+}
+
+## Not trivia and not a Newline.
+pub fn is_significant(kind: Kind) -> Bool {
+  !is_trivia(kind) && kind != Newline
+}
+
+## Children other than trivia and Newline.
+pub fn significant_children(node: Node) -> List[Element] {
+  List.filter(children_with_tokens(node), |e| {
+    e match {
+      TokenElement(t) -> is_significant(t.kind)
+      NodeElement(_)  -> True
+    }
+  })
+}
+
+## All the tokens under `node`, in order.
+pub fn tokens(node: Node) -> List[Token] {
+  List.reverse(tokens_onto(node.trees, []))
+}
+
+fn tokens_onto(trees: List[Tree], acc: List[Token]) -> List[Token] {
+  List.fold(trees, acc, |a, tree| {
+    tree match {
+      Leaf(t)                   -> [t, ..a]
+      Branch(_, _, _, children) -> tokens_onto(children, a)
+    }
+  })
+}
+
+## Declaration nodes contain the preceding `##` and newline, so leading items are looked up by
+## this token rather than by the first token.
+pub fn first_significant_token(node: Node) -> Option[Token] {
+  List.find(tokens(node), |t| is_significant(t.kind))
+}
+
+pub fn last_token(node: Node) -> Option[Token] {
+  List.last(tokens(node))
+}
+
+pub fn child_token(node: Node, kind: Kind) -> Option[Token] {
+  List.find(node.trees, |c| {
+    c match {
+      Leaf(t) -> t.kind == kind
+      _       -> False
+    }
+  }) match {
+    Some(Leaf(t)) -> Some(t)
+    _             -> None
+  }
+}
+
+pub fn has_newline_child(node: Node) -> Bool {
+  Option.is_some(child_token(node, Newline))
+}
+
+pub fn has_comments(node: Node) -> Bool {
+  List.any(tokens(node), |t| t.kind == Comment || t.kind == DocComment)
+}
+
+## The ancestors of `node`, itself first.
+pub fn ancestors(node: Node) -> List[Node] {
+  [node, ..node.outer]
+}
+
+## The descendant nodes of `node`, itself first, in preorder.
+pub fn descendants(node: Node) -> List[Node] {
+  List.reverse(descendants_onto(node, []))
+}
+
+fn descendants_onto(node: Node, acc: List[Node]) -> List[Node] {
+  List.fold(children(node), [node, ..acc], |a, child| descendants_onto(child, a))
+}

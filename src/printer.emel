@@ -1,0 +1,1953 @@
+## Builds a document from the syntax tree. Follows `printer.rs`, `printer/items.rs`,
+## `printer/exprs.rs` and `comments.rs` of the reference formatter (`emela-fmt`).
+##
+## The document is built in source order, because `tok`, `line` and friends hand along the state
+## (`pending`) that forces a newline after a trailing comment. The state, and the comments not yet
+## printed, are in `State[Printer]`.
+import Std.Array.{Array}
+import Std.Map.{Map}
+import Std.State.{State}
+import Cst.{
+  Node,
+  Element,
+  NodeElement,
+  TokenElement,
+  ElementKind,
+  TokenKind,
+  OfNode,
+  child_token,
+  children,
+  element_kind,
+  first_significant_token,
+  has_comments,
+  has_newline_child,
+  is_node,
+  is_token,
+  last_token,
+  parent,
+  same,
+  significant_children,
+  tokens,
+}
+import Doc.{Doc, append, concat, flat_alt, group, hardline, nest, nil, render}
+import Source.{slice}
+import Syntax.{
+  NodeKind,
+  Import,
+  ImportList,
+  Annotation,
+  AnnotArgList,
+  AnnotArg,
+  AnnotPath,
+  FnDecl,
+  LocalFn,
+  TypeDecl,
+  ErrorDecl,
+  EnumDecl,
+  FieldList,
+  Field,
+  VariantList,
+  Variant,
+  TupleFieldList,
+  DeriveClause,
+  ConstDecl,
+  EffectDecl,
+  OpSig,
+  EffectLabel,
+  MemberSig,
+  HandlerDecl,
+  HandlerEffect,
+  HandlerInit,
+  HandlerRelease,
+  LayerDecl,
+  TraitDecl,
+  ImplDecl,
+  ImplType,
+  ItemList,
+  TypeParamList,
+  TypeParam,
+  Path,
+  PathType,
+  TypeArgList,
+  TypeVar,
+  SelfType,
+  UnitType,
+  TupleType,
+  ParenType,
+  FnType,
+  CapType,
+  ParamTypeList,
+  RetType,
+  FailsClause,
+  ErrorSet,
+  UsesClause,
+  EffectSet,
+  Literal,
+  String,
+  Interp,
+  WildcardPat,
+  IdentPat,
+  LiteralPat,
+  ConstPat,
+  VariantPat,
+  PatArgList,
+  FieldPat,
+  UnitPat,
+  TuplePat,
+  ListPat,
+  RestPat,
+  NameRef,
+  PathExpr,
+  UnderscoreExpr,
+  UnitExpr,
+  ParenExpr,
+  TupleExpr,
+  ListExpr,
+  RestExpr,
+  CallExpr,
+  ArgList,
+  NamedArg,
+  SpreadArg,
+  FieldExpr,
+  PrefixExpr,
+  BinExpr,
+  UseExpr,
+  FailExpr,
+  AssertExpr,
+  BlockExpr,
+  Binding,
+  IfExpr,
+  MatchExpr,
+  MatchArmList,
+  MatchArm,
+  MatchGuard,
+  WithExpr,
+  WithBy,
+  Supply,
+  WithBind,
+  CapMember,
+  EscapeExpr,
+  LambdaExpr,
+  ParamList,
+  Param,
+  Root,
+  Error,
+  Tree,
+  Branch,
+  Leaf,
+}
+import Token.{
+  Kind,
+  Token,
+  is_trivia,
+  Whitespace,
+  Newline,
+  NewlineCont,
+  Comment,
+  DocComment,
+  TripleQuote,
+  LowerName,
+  UseKw,
+  ElseKw,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  Comma,
+  Colon,
+  ThinArrow,
+  Pipe,
+  PipeGt,
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  Percent,
+  Eq2,
+  Neq,
+  Lt,
+  LtEq,
+  Gt,
+  GtEq,
+  Amp2,
+  Pipe2,
+}
+
+pub const INDENT = 2
+
+## Rendering width used for measuring, wide enough that every group stays flat.
+pub const HUGE = 1073741824
+
+pub enum Leading {
+  LeadingComment(text: String)
+  ## Consecutive blank lines are collapsed into one.
+  BlankLine
+} derive Eq
+
+pub type Printer(
+  src: Array[Int],
+  ## All the tokens, and the index of each by its start.
+  all: Array[Token],
+  index: Map[Int, Int],
+  ## Line comments and blank lines, by the start of the token they precede.
+  leading: Map[Int, List[Leading]],
+  ## Trailing comments, by the start of the token they follow.
+  trailing: Map[Int, List[String]],
+  ## Items after the last token attach to this position.
+  eof: Int,
+  width: Int,
+  ## A trailing comment was just printed, so the next separator must be a newline.
+  pending: Bool,
+  ## The last thing printed ended with a forced newline.
+  at_break: Bool,
+  ## The hugging form of the last argument, set while an argument list is built.
+  hug: Option[Doc],
+)
+
+# ---------------------------------------------------------------------------------------------
+# Comments (`comments.rs`)
+
+type Scan(
+  prev: Option[Int],
+  newlines: Int,
+  ## Newest first.
+  items: List[Leading],
+  leading: Map[Int, List[Leading]],
+  trailing: Map[Int, List[String]],
+)
+
+## Attaches comments and blank lines to significant tokens. A trailing comment attaches to the
+## preceding significant token; line comments and blank lines attach to the following one, or to
+## the end of the input.
+pub fn new(src: Array[Int], root: Node, width: Int) -> Printer {
+  all = tokens(root)
+  initial = Scan(None, 0, [], Map.empty(), Map.empty())
+  scan = List.fold(all, initial, |s, token| {
+    kind = token.kind
+    if kind == Whitespace {
+      s
+    } else if kind == Newline || kind == NewlineCont {
+      Scan(newlines: s.newlines + 1, ..s)
+    } else if kind == Comment || kind == DocComment {
+      comment = trim_end(slice(src, token.start, token.end))
+      (s.prev, s.items) match {
+        (Some(p), []) if s.newlines == 0 -> {
+          earlier = Option.or(Map.get(s.trailing, p), [])
+          Scan(
+            newlines: 0,
+            trailing: Map.insert(s.trailing, p, List.append(earlier, [comment])),
+            ..s,
+          )
+        }
+        _ -> {
+          blank = if s.newlines >= 2 && (Option.is_some(s.prev) || !List.is_empty(s.items)) {
+            [BlankLine, ..s.items]
+          } else {
+            s.items
+          }
+          Scan(newlines: 0, items: [LeadingComment(comment), ..blank], ..s)
+        }
+      }
+    } else {
+      flushed = flush(s, token.start)
+      Scan(prev: Some(token.start), newlines: 0, ..flushed)
+    }
+  })
+  eof = root.end
+  done = flush(scan, eof)
+  index = List.fold(List.enumerate(all), Map.empty(), |m, (i, t)| Map.insert(m, t.start, i))
+  Printer(
+    src:,
+    all: Array.from_list(all),
+    index:,
+    leading: done.leading,
+    trailing: done.trailing,
+    eof:,
+    width:,
+    pending: False,
+    at_break: True,
+    hug: None,
+  )
+}
+
+fn flush(s: Scan, at: Int) -> Scan {
+  items = if s.newlines >= 2 && (Option.is_some(s.prev) || !List.is_empty(s.items)) {
+    [BlankLine, ..s.items]
+  } else {
+    s.items
+  }
+  if List.is_empty(items) {
+    Scan(items: [], ..s)
+  } else {
+    Scan(items: [], leading: Map.insert(s.leading, at, List.reverse(items)), ..s)
+  }
+}
+
+fn trim_end(s: String) -> String {
+  String.code_points(s)
+    |> List.reverse
+    |> drop_spaces
+    |> List.reverse
+    |> List.filter_map(String.from_code_point)
+    |> String.concat
+}
+
+fn drop_spaces(cs: List[Int]) -> List[Int] {
+  cs match {
+    [c, ..rest] if c == 0x20 || c == 0x09 || c == 0x0D || c == 0x0A -> drop_spaces(rest)
+    _                                                               -> cs
+  }
+}
+
+## Comments not printed yet. Checked to be zero after printing, so no comment is dropped.
+pub fn remaining(p: Printer) -> Int {
+  leading = Map.fold(p.leading, 0, |n, _, items| {
+    n + List.length(List.filter(items, |l| l != BlankLine))
+  })
+  Map.fold(p.trailing, leading, |n, _, items| n + List.length(items))
+}
+
+fn printer() -> Printer uses { State[Printer] } {
+  (use State[Printer]).get()
+}
+
+fn update(f: fn(Printer) -> Printer) -> () uses { State[Printer] } {
+  st = use State[Printer]
+  st.set(f(st.get()))
+}
+
+## Later calls for the same token return nothing.
+fn take_leading(token: Token) -> List[Leading] uses { State[Printer] } {
+  p = printer()
+  update(|q| Printer(leading: Map.remove(q.leading, token.start), ..q))
+  Option.or(Map.get(p.leading, token.start), [])
+}
+
+## Comments after the last declaration.
+fn take_leading_eof() -> List[Leading] uses { State[Printer] } {
+  p = printer()
+  update(|q| Printer(leading: Map.remove(q.leading, p.eof), ..q))
+  Option.or(Map.get(p.leading, p.eof), [])
+}
+
+fn take_trailing(token: Token) -> List[String] uses { State[Printer] } {
+  p = printer()
+  update(|q| Printer(trailing: Map.remove(q.trailing, token.start), ..q))
+  Option.or(Map.get(p.trailing, token.start), [])
+}
+
+## Does not claim them.
+fn has_leading_comment(token: Token) -> Bool uses { State[Printer] } {
+  Option.or(Map.get(printer().leading, token.start), []) |> List.any(|l| l != BlankLine)
+}
+
+fn is_comment(item: Leading) -> Bool {
+  item != BlankLine
+}
+
+## Whether a comment sits outside every block and arm list inside `node`. Blocks print the
+## newline after their own comments, so turning an outer separator into a space cannot break
+## them.
+fn has_comments_outside_blocks(node: Node) -> Bool {
+  comment_outside(node.trees)
+}
+
+fn comment_outside(trees: List[Tree]) -> Bool {
+  List.any(trees, |tree| {
+    tree match {
+      Leaf(t) -> t.kind == Comment || t.kind == DocComment
+      Branch(kind, _, _, inner) -> kind != BlockExpr
+        && kind != MatchArmList
+        && comment_outside(inner)
+    }
+  })
+}
+
+# ---------------------------------------------------------------------------------------------
+# Tokens and separators (`printer.rs`)
+
+fn token_text(token: Token) -> String uses { State[Printer] } {
+  slice(printer().src, token.start, token.end)
+}
+
+fn target_width() -> Int uses { State[Printer] } {
+  printer().width
+}
+
+fn is_pending() -> Bool uses { State[Printer] } {
+  printer().pending
+}
+
+fn set_flags(pending: Bool, at_break: Bool) -> () uses { State[Printer] } {
+  update(|p| Printer(pending:, at_break:, ..p))
+}
+
+fn set_at_break(at_break: Bool) -> () uses { State[Printer] } {
+  update(|p| Printer(at_break:, ..p))
+}
+
+fn set_pending() -> () uses { State[Printer] } {
+  update(|p| Printer(pending: True, ..p))
+}
+
+fn text(s: String) -> Doc {
+  Doc.text(s)
+}
+
+## Also prints any unclaimed leading comments and the trailing comments of the token.
+fn tok(token: Token) -> Doc uses { State[Printer] } {
+  tok_as(token, text(token_text(token)))
+}
+
+## A piece of a multiline string `"""`. The text is printed as is, without adding indentation
+## after its newlines, because the indentation is part of the value.
+fn raw_tok(token: Token) -> Doc uses { State[Printer] } {
+  lines = String.split(token_text(token), "\n") |> List.map(|l| text(strip_cr(l)))
+  doc = lines match {
+    [] -> nil()
+    [first, ..rest] -> List.fold(rest, first, |doc, line| {
+      # Cancel the current indentation and write from column 0. The newline takes the
+      # indentation of the next piece, so the newline and the line are un-nested together. An
+      # empty line still needs a piece right after the newline, hence the zero-width marker.
+      append(
+        doc,
+        Doc.nesting(|indent| {
+          nest(concat([hardline(), Doc.column(|_| nil()), line]), -indent)
+        }),
+      )
+    })
+  }
+  tok_as(token, doc)
+}
+
+fn strip_cr(s: String) -> String {
+  if String.ends_with(s, "\r") {
+    String.code_points(s)
+      |> List.reverse
+      |> List.drop(1)
+      |> List.reverse
+      |> List.filter_map(String.from_code_point)
+      |> String.concat
+  } else {
+    s
+  }
+}
+
+## Prints `doc` in place of `token`, handling comments as `tok` does.
+fn tok_as(token: Token, doc: Doc) -> Doc uses { State[Printer] } {
+  before = if is_pending() {
+    set_flags(False, True)
+    hardline()
+  } else {
+    nil()
+  }
+  comments = List.filter_map(take_leading(token), |l| {
+    l match {
+      LeadingComment(c) -> Some(c)
+      BlankLine         -> None
+    }
+  })
+  lead = if List.is_empty(comments) {
+    nil()
+  } else {
+    start = if printer().at_break { nil() } else { hardline() }
+    concat([start, ..List.map(comments, |c| append(text(c), hardline()))])
+  }
+  set_at_break(False)
+  after = trailing_of(token)
+  concat([before, lead, doc, after])
+}
+
+## Forces the next separator to be a newline.
+fn trailing_of(token: Token) -> Doc uses { State[Printer] } {
+  print_trailing(take_trailing(token))
+}
+
+## Claims the trailing comments of `token` now, to be printed later with `print_trailing` (after
+## a parenthesis the printer adds, for one).
+fn hold_trailing(token: Token) -> List[String] uses { State[Printer] } {
+  take_trailing(token)
+}
+
+fn print_trailing(comments: List[String]) -> Doc uses { State[Printer] } {
+  if !List.is_empty(comments) { set_pending() }
+  concat(List.map(comments, |c| append(text(" "), text(c))))
+}
+
+fn line() -> Doc uses { State[Printer] } {
+  soft(Doc.line())
+}
+
+fn line_() -> Doc uses { State[Printer] } {
+  soft(Doc.line_())
+}
+
+## A newline instead if a trailing comment was just printed.
+fn space() -> Doc uses { State[Printer] } {
+  soft(text(" "))
+}
+
+fn soft(doc: Doc) -> Doc uses { State[Printer] } {
+  if is_pending() {
+    hard()
+  } else {
+    set_at_break(False)
+    doc
+  }
+}
+
+fn hard() -> Doc uses { State[Printer] } {
+  set_flags(False, True)
+  hardline()
+}
+
+fn brk(hard_break: Bool) -> Doc uses { State[Printer] } {
+  if hard_break { hard() } else { line() }
+}
+
+## Leading items of a declaration, statement or arm. Call at the start of a line. With `first`,
+## leading blank lines are dropped.
+fn leading_lines(token: Token, first: Bool) -> Doc uses { State[Printer] } {
+  leading_items(take_leading(token), first)
+}
+
+fn leading_items(items: List[Leading], first: Bool) -> Doc uses { State[Printer] } {
+  (docs, _) = List.fold(items, ([], !first), |(docs, emitted), item| {
+    item match {
+      BlankLine -> if emitted { ([hardline(), ..docs], emitted) } else { (docs, emitted) }
+      LeadingComment(c) -> {
+        set_at_break(True)
+        ([append(text(c), hardline()), ..docs], True)
+      }
+    }
+  })
+  concat(List.reverse(docs))
+}
+
+## Leading comments of a list element. Blank lines are dropped.
+fn leading_in_list(token: Token) -> Doc uses { State[Printer] } {
+  leading_items(List.filter(take_leading(token), is_comment), True)
+}
+
+## Comments before a closing bracket (or the end of the input). Called at the end of the last
+## element's line. `started` is false when nothing has been printed yet (an empty block).
+fn closing_comments(items: List[Leading], started: Bool) -> Doc uses { State[Printer] } {
+  (docs, _, _) = List.fold(items, ([], False, started), |(docs, blank, any), item| {
+    item match {
+      BlankLine -> (docs, any, any)
+      LeadingComment(c) -> {
+        set_pending()
+        breaks = if !any { [] } else if blank { [hardline(), hardline()] } else { [hardline()] }
+        ([text(c), ..List.append(breaks, docs)], False, True)
+      }
+    }
+  })
+  concat(List.reverse(docs))
+}
+
+## `None` if the document contains a forced newline.
+fn flat_width(doc: Doc) -> Option[Int] {
+  s = render(doc, HUGE)
+  if String.contains(s, "\n") { None } else { Some(Doc.display_width(s)) }
+}
+
+## Width of the first line when rendered as flat as possible.
+fn first_line_width(doc: Doc) -> Int {
+  Doc.display_width(Option.or(List.head(String.split(render(doc, HUGE), "\n")), ""))
+}
+
+## Freezes the shape rendered with no width limit. Forced newlines remain, and following lines are
+## indented relative to the current indentation.
+fn unbreakable(doc: Doc) -> Doc {
+  lines = String.split(render(doc, HUGE), "\n")
+  lines match {
+    [] -> nil()
+    [first, ..rest] -> {
+      List.fold(rest, text(first), |d, line| concat([d, hardline(), text(line)]))
+    }
+  }
+}
+
+fn element(e: Element) -> Doc uses { State[Printer] } {
+  e match {
+    TokenElement(t) -> tok(t)
+    NodeElement(n)  -> doc_of(n)
+  }
+}
+
+fn first_token_of(e: Element) -> Option[Token] {
+  e match {
+    NodeElement(n)  -> first_significant_token(n)
+    TokenElement(t) -> Some(t)
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lists
+
+## Every element except the last includes its separating comma.
+type ListParts(
+  open: Doc,
+  breaks: List[Doc],
+  elements: List[Doc],
+  ## Printed only when the list breaks.
+  last_comma: Doc,
+  ## Comments before the closing bracket.
+  closing: Doc,
+  end_break: Doc,
+  close: Doc,
+)
+
+type ListShape(
+  prefix: List[Token],
+  open: Option[Token],
+  close: Option[Token],
+  ## Newest first, each with the comma after it.
+  elements: List[(Element, Option[Token])],
+)
+
+fn list(node: Node, item: fn(Node) -> Doc uses { State[Printer] }) -> Doc uses { State[Printer] } {
+  grouped(list_parts(node, |n, _| item(n)))
+}
+
+## The second argument of `item` tells whether it is the last element.
+fn list_parts(node: Node, item: fn(Node, Bool) -> Doc uses { State[Printer] }) -> ListParts
+  uses { State[Printer] } {
+  shape = List.fold(significant_children(node), ListShape([], None, None, []), |s, child| {
+    child match {
+      TokenElement(t) if t.kind == Comma -> s.elements match {
+        [(e, _), ..rest] -> ListShape(elements: [(e, Some(t)), ..rest], ..s)
+        []               -> s
+      }
+      TokenElement(t) if Option.is_none(s.open)
+        && (t.kind == LParen || t.kind == LBrack || t.kind == LBrace) -> {
+        ListShape(open: Some(t), ..s)
+      }
+      TokenElement(t) if t.kind == RParen || t.kind == RBrack || t.kind == RBrace -> {
+        ListShape(close: Some(t), ..s)
+      }
+      # Tokens before the opening bracket (the `.` of an import).
+      TokenElement(t) if Option.is_none(s.open) -> ListShape(prefix: [t, ..s.prefix], ..s)
+      _ -> ListShape(elements: [(child, None), ..s.elements], ..s)
+    }
+  })
+  # Effect-set braces get inner spaces (`{ Io, Clock }`); an import's `.{a, b}` does not.
+  braces = Option.map(shape.open, |t| t.kind) == Some(LBrace) && node.kind != ImportList
+  prefix_docs = List.map(List.reverse(shape.prefix), tok)
+  open_doc = append(concat(prefix_docs), Option.map(shape.open, tok) |> Option.or(nil()))
+  elements = List.reverse(shape.elements)
+  n = List.length(elements)
+  trailing_comma = flat_alt(text(","), nil())
+  (breaks, docs, last_comma) = List.fold(
+    List.enumerate(elements),
+    ([], [], nil()),
+    |(breaks, docs, last_comma), (i, (elem, comma))| {
+      b = if i == 0 && !braces { line_() } else { line() }
+      lead = first_token_of(elem) match {
+        Some(t) -> leading_in_list(t)
+        None    -> nil()
+      }
+      last = i + 1 == n
+      elem_doc = elem match {
+        NodeElement(m)  -> item(m, last)
+        TokenElement(t) -> tok(t)
+      }
+      doc = append(lead, elem_doc)
+      (with_comma, lc) = (comma, last) match {
+        (Some(c), False) -> (append(doc, tok(c)), last_comma)
+        (Some(c), True)  -> (doc, tok_as(c, trailing_comma))
+        # A comma cannot follow a trailing comment (it would become part of the comment). The
+        # comment forces the list to break anyway, so print no comma.
+        (None, True)     -> if is_pending() { (doc, last_comma) } else { (doc, trailing_comma) }
+        (None, False)    -> (doc, last_comma)
+      }
+      ([b, ..breaks], [with_comma, ..docs], lc)
+    },
+  )
+  closing = shape.close match {
+    Some(t) -> {
+      items = take_leading(t)
+      has = List.any(items, is_comment)
+      start = if n == 0 && has { hard() } else { nil() }
+      append(start, closing_comments(items, n > 0))
+    }
+    None -> nil()
+  }
+  end_break = if braces && n > 0 { line() } else { line_() }
+  close_doc = Option.map(shape.close, tok) |> Option.or(nil())
+  ListParts(
+    open: open_doc,
+    breaks: List.reverse(breaks),
+    elements: List.reverse(docs),
+    last_comma:,
+    closing:,
+    end_break:,
+    close: close_doc,
+  )
+}
+
+## One line if it fits; otherwise one element per line with a trailing comma.
+fn grouped(parts: ListParts) -> Doc {
+  inner = if List.is_empty(parts.elements) {
+    parts.closing
+  } else {
+    pairs = List.zip(parts.breaks, parts.elements) |> List.map(|(b, e)| append(b, e))
+    concat(List.append(pairs, [parts.last_comma, parts.closing]))
+  }
+  group(concat([parts.open, nest(inner, INDENT), parts.end_break, parts.close]))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Files and declarations (`printer/items.rs`)
+
+## Keeps at most one blank line between declarations and ends with a newline.
+pub fn root(node: Node) -> Doc uses { State[Printer] } {
+  (docs, started) = List.fold(children(node), ([], False), |(docs, started), d| {
+    sep = if started { hard() } else { nil() }
+    lead = first_significant_token(d) match {
+      Some(first) -> leading_lines(first, !started)
+      None        -> nil()
+    }
+    body = decl(d)
+    ([body, lead, sep, ..docs], True)
+  })
+  items = take_leading_eof()
+  any_comment = List.any(items, is_comment)
+  closing = closing_comments(items, started)
+  end = if started || any_comment { hard() } else { nil() }
+  concat(List.reverse([end, closing, ..docs]))
+}
+
+fn decl(node: Node) -> Doc uses { State[Printer] } {
+  kind = node.kind
+  is_decl = (
+    kind == FnDecl
+      || kind == TypeDecl
+      || kind == ErrorDecl
+      || kind == EnumDecl
+      || kind == ConstDecl
+      || kind == EffectDecl
+      || kind == HandlerDecl
+      || kind == LayerDecl
+      || kind == TraitDecl
+      || kind == ImplDecl
+      || kind == Import
+  )
+  if is_decl { decl_seq(node) } else { verbatim(node) }
+}
+
+type DeclAcc(docs: List[Doc], clauses: Option[Doc], first: Bool)
+
+fn flush_clauses(acc: DeclAcc) -> DeclAcc {
+  acc.clauses match {
+    Some(c) -> DeclAcc(docs: [group(c), ..acc.docs], clauses: None, ..acc)
+    None    -> acc
+  }
+}
+
+fn newline_before_first(n: Node) -> Bool uses { State[Printer] } {
+  first_significant_token(n) match {
+    Some(t) -> newline_before(t)
+    None    -> False
+  }
+}
+
+## Also prints effect operations and handler `init` and `release`. Each annotation goes on its own
+## line. Type parameter, parameter and field lists attach to the name.
+##
+## `fails` and `uses` clauses go on their own lines, indented, when they do not fit on the line,
+## and stay there if the source had them there, like `derive`. Both clauses are one group, so they
+## break together. Each clause itself never breaks.
+fn decl_seq(node: Node) -> Doc uses { State[Printer] } {
+  acc = List.fold(significant_children(node), DeclAcc([], None, True), |acc, child| {
+    child match {
+      NodeElement(n) if n.kind == FailsClause || n.kind == UsesClause -> {
+        b = brk(newline_before_first(n))
+        doc = unbreakable(doc_of(n))
+        clause = nest(append(b, doc), INDENT)
+        clauses = acc.clauses match {
+          Some(c) -> append(c, clause)
+          None    -> clause
+        }
+        DeclAcc(clauses: Some(clauses), first: False, ..acc)
+      }
+      _ -> decl_child(flush_clauses(acc), child)
+    }
+  })
+  concat(List.reverse(flush_clauses(acc).docs))
+}
+
+fn decl_child(acc: DeclAcc, child: Element) -> DeclAcc uses { State[Printer] } {
+  child match {
+    NodeElement(n) if n.kind == Annotation -> {
+      doc = element(child)
+      DeclAcc(docs: [hard(), doc, ..acc.docs], ..acc)
+    }
+    # Keep `derive` on the next line if the source had it there; it also moves to the next line
+    # when it does not fit.
+    NodeElement(n) if n.kind == DeriveClause -> {
+      b = brk(newline_before_first(n))
+      doc = element(child)
+      DeclAcc(docs: [group(nest(append(b, doc), INDENT)), ..acc.docs], ..acc)
+    }
+    _ -> {
+      attached = child match {
+        NodeElement(n) -> (
+          n.kind == TypeParamList
+            || n.kind == ParamList
+            || n.kind == FieldList
+            || n.kind == TupleFieldList
+            || n.kind == ImportList
+        )
+        TokenElement(t) -> t.kind == Colon
+      }
+      sep = if !acc.first && !attached { space() } else { nil() }
+      doc = child match {
+        TokenElement(t) -> tok(t)
+        NodeElement(n) -> {
+          if n.kind == BlockExpr {
+            group(assemble(block(n), False))
+          } else if n.kind == RetType {
+            # The return type never breaks.
+            unbreakable(doc_of(n))
+          } else if n.kind == ItemList || n.kind == VariantList {
+            item_list(n)
+          } else {
+            doc_of(n)
+          }
+        }
+      }
+      DeclAcc(docs: [doc, sep, ..acc.docs], first: False, ..acc)
+    }
+  }
+}
+
+type ItemAcc(body: List[Doc], count: Int, close: Option[Token])
+
+## A declaration body `{ ... }`: enum variants, layer handlers, and the items of effects,
+## handlers, traits and impls.
+##
+## A multiline source gets one item per line with the separating commas removed. A one-line
+## source stays as `{ Red, Green }` while it fits, and becomes multiline otherwise.
+fn item_list(node: Node) -> Doc uses { State[Printer] } {
+  # A variant with attributes has them on lines of their own, so the list is multiline.
+  annotated = List.any(children(node), |c| {
+    c.kind == Variant && List.any(children(c), |a| a.kind == Annotation)
+  })
+  multi = has_newline_child(node) || annotated
+  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  forced = is_pending()
+  first_break = brk(multi)
+  kids = significant_children(node)
+  acc = List.fold(List.enumerate(kids), ItemAcc([], 0, None), |acc, (i, child)| {
+    child match {
+      TokenElement(t) if t.kind == Comma -> {
+        # The comma is printed only when the list stays flat on one line.
+        last = List.all(List.drop(kids, i + 1), |c| is_token(c, RBrace))
+        doc = if multi || last { nil() } else { flat_alt(nil(), text(",")) }
+        ItemAcc(body: [tok_as(t, doc), ..acc.body], ..acc)
+      }
+      TokenElement(t) if t.kind == RBrace -> ItemAcc(close: Some(t), ..acc)
+      TokenElement(t) if t.kind == LBrace -> acc
+      TokenElement(t)                     -> ItemAcc(body: [tok(t), ..acc.body], ..acc)
+      NodeElement(n) -> {
+        sep = if acc.count > 0 { brk(multi) } else { nil() }
+        lead = first_significant_token(n) match {
+          Some(first) -> leading_lines(first, acc.count == 0)
+          None        -> nil()
+        }
+        doc = item(n)
+        ItemAcc(body: [doc, lead, sep, ..acc.body], count: acc.count + 1, ..acc)
+      }
+    }
+  })
+  (body, has_closing) = acc.close match {
+    Some(t) -> {
+      items = take_leading(t)
+      closing = closing_comments(items, acc.count > 0)
+      ([closing, ..acc.body], List.any(items, is_comment))
+    }
+    None -> (acc.body, False)
+  }
+  last_break = brk(multi)
+  close = acc.close |> Option.map(tok) |> Option.or(nil())
+  if acc.count == 0 && !has_closing {
+    inner = if forced { hardline() } else { nil() }
+    concat([open, inner, close])
+  } else {
+    inner = append(first_break, concat(List.reverse(body)))
+    group(concat([open, nest(inner, INDENT), last_break, close]))
+  }
+}
+
+fn item(node: Node) -> Doc uses { State[Printer] } {
+  kind = node.kind
+  if (
+    kind == FnDecl
+      || kind == OpSig
+      || kind == MemberSig
+      || kind == HandlerDecl
+      || kind == HandlerInit
+      || kind == HandlerRelease
+  ) {
+    decl_seq(node)
+  } else {
+    doc_of(node)
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Expressions, types and patterns (`printer/exprs.rs`)
+
+## Binding strength of a binary operator. A run of operators of equal strength is formatted as
+## one chain.
+fn op_class(kind: Kind) -> Int {
+  kind match {
+    PipeGt  -> 1
+    Pipe2   -> 2
+    Amp2    -> 3
+    Eq2     -> 4
+    Neq     -> 4
+    Lt      -> 4
+    LtEq    -> 4
+    Gt      -> 4
+    GtEq    -> 4
+    Plus    -> 5
+    Minus   -> 5
+    Star    -> 6
+    Slash   -> 6
+    Percent -> 6
+    _       -> 0
+  }
+}
+
+fn always(_prev: ElementKind, _cur: ElementKind) -> Bool {
+  True
+}
+
+fn never(_prev: ElementKind, _cur: ElementKind) -> Bool {
+  False
+}
+
+fn not_before_colon(_prev: ElementKind, cur: ElementKind) -> Bool {
+  cur != TokenKind(Colon)
+}
+
+fn not_before_type_args(_prev: ElementKind, cur: ElementKind) -> Bool {
+  cur != OfNode(TypeArgList)
+}
+
+fn is_any(kind: NodeKind, kinds: List[NodeKind]) -> Bool {
+  List.any(kinds, |k| k == kind)
+}
+
+const PLAIN_SEQ = [
+  Path,
+  PathType,
+  TypeVar,
+  SelfType,
+  NameRef,
+  PathExpr,
+  UnderscoreExpr,
+  ParenExpr,
+  FieldExpr,
+  PrefixExpr,
+  RestExpr,
+  Literal,
+  ParenType,
+  SpreadArg,
+  WildcardPat,
+  IdentPat,
+  ConstPat,
+  LiteralPat,
+  VariantPat,
+  RestPat,
+  Annotation,
+  AnnotPath,
+  CapMember,
+]
+
+const LISTS = [
+  TypeArgList,
+  ParamTypeList,
+  UnitType,
+  TupleType,
+  TypeParamList,
+  ParamList,
+  UnitExpr,
+  TupleExpr,
+  ListExpr,
+  PatArgList,
+  UnitPat,
+  TuplePat,
+  ListPat,
+  AnnotArgList,
+  FieldList,
+  TupleFieldList,
+  ImportList,
+]
+
+const SPACED_SEQ = [RetType, FailsClause, FailExpr, AssertExpr, MatchGuard, CapType, WithBind]
+
+const COLON_SEQ = [Param, TypeParam, NamedArg, FieldPat, Binding, AnnotArg]
+
+fn doc_of(node: Node) -> Doc uses { State[Printer] } {
+  kind = node.kind
+  if kind == ParenExpr && Option.is_some(paren_or_chain_of(node)) {
+    paren_or_chain(node)
+  } else if is_any(kind, PLAIN_SEQ) {
+    seq(node, never)
+  } else if is_any(kind, LISTS) {
+    list(node, doc_of)
+  } else if kind == Variant {
+    variant(node)
+  } else if kind == Field {
+    seq(node, not_before_colon)
+  } else if kind == DeriveClause {
+    seq(node, |_, cur| cur != TokenKind(Comma))
+  } else if kind == HandlerEffect || kind == UseExpr || kind == EffectLabel || kind == WithBy {
+    # Effect type arguments (`handler H: State[Int]`, `use State[Int]`) attach to the name.
+    seq(node, not_before_type_args)
+  } else if kind == ImplType {
+    # `Map[K: Eq, V: Eq]` in `impl Map[K: Eq, V: Eq]: Eq`.
+    seq(node, |_, cur| cur != OfNode(TypeParamList))
+  } else if is_any(kind, SPACED_SEQ) {
+    seq(node, always)
+  } else if kind == UsesClause {
+    uses_clause(node)
+  } else if is_any(kind, COLON_SEQ) {
+    # No space before `:`.
+    seq(node, not_before_colon)
+  } else if kind == FnType {
+    seq(node, |_, cur| cur != OfNode(ParamTypeList))
+  } else if kind == ErrorSet {
+    seq(node, |prev, cur| prev != TokenKind(LBrace) && cur != TokenKind(RBrace))
+  } else if kind == EffectSet {
+    if Option.is_some(child_token(node, LBrace)) { list(node, doc_of) } else { seq(node, always) }
+  } else if kind == String {
+    string(node)
+  } else if kind == Interp {
+    interp(node)
+  } else if kind == CallExpr || kind == Supply {
+    # `WorkerKv(binding: "KV")` in `with` and `layer` reads as a call.
+    call(node)
+  } else if kind == BinExpr {
+    bin_chain(node)
+  } else if kind == BlockExpr {
+    group(assemble(block(node), False))
+  } else if kind == LocalFn {
+    # A local fn is laid out as a top-level fn, indented in its block (`[fn.local]`).
+    decl_seq(node)
+  } else if kind == IfExpr {
+    group(if_chain(node))
+  } else if kind == MatchExpr || kind == EscapeExpr {
+    arms_expr(node)
+  } else if kind == MatchArmList {
+    arm_list(node)
+  } else if kind == WithExpr {
+    with_expr(node)
+  } else if kind == LambdaExpr {
+    lambda(node)
+  } else {
+    verbatim(node)
+  }
+}
+
+## Puts a space between children when `space(prev, cur)` is true.
+fn seq(node: Node, space_between: fn(ElementKind, ElementKind) -> Bool fails {} uses {}) -> Doc
+  uses { State[Printer] } {
+  (docs, _) = List.fold(significant_children(node), ([], None), |(docs, prev), child| {
+    kind = element_kind(child)
+    sep = prev match {
+      Some(p) if space_between(p, kind) -> space()
+      _                                 -> nil()
+    }
+    doc = element(child)
+    ([doc, sep, ..docs], Some(kind))
+  })
+  concat(List.reverse(docs))
+}
+
+## `expr match { ... }` and `expr escape { ... }`. When the left side is a pipe that breaks across
+## lines, the keyword starts the next line so the arms do not hang off the last link.
+fn arms_expr(node: Node) -> Doc uses { State[Printer] } {
+  significant_children(node) match {
+    [] -> nil()
+    [first, ..others] -> {
+      pipe = first match {
+        NodeElement(n)  -> is_pipe(n)
+        TokenElement(_) -> False
+      }
+      lhs = element(first)
+      (gap, rest) = List.fold(others, (None, []), |(gap, rest), child| {
+        s = space()
+        (g, r) = gap match {
+          None    -> (Some(s), rest)
+          Some(_) -> (gap, [s, ..rest])
+        }
+        (g, [element(child), ..r])
+      })
+      gap_doc = Option.or(gap, nil())
+      rest_doc = concat(List.reverse(rest))
+      if !pipe {
+        concat([lhs, gap_doc, rest_doc])
+      } else {
+        keyword = List.get(others, 0) match {
+          Some(TokenElement(t)) -> token_text(t)
+          _                     -> ""
+        }
+        inline = concat([lhs, gap_doc, rest_doc])
+        broken = append(lhs, nest(append(hardline(), rest_doc), INDENT))
+        w = target_width()
+        Doc.column(|col| {
+          Doc.nesting(|indent| {
+            # Render the left side where it stands, followed by the keyword, and see whether the
+            # pipe breaks.
+            probe = nest(concat([text(spaces(col)), lhs, text(" #{keyword} {")]), indent)
+            link = "#{spaces(indent + INDENT)}|>"
+            broke = String.split(render(probe, w), "\n")
+              |> List.drop(1)
+              |> List.any(|l| String.starts_with(l, link))
+            if broke { broken } else { inline }
+          })
+        })
+      }
+    }
+  }
+}
+
+fn spaces(n: Int) -> String {
+  String.concat(List.map(List.range(0, n), |_| " "))
+}
+
+## A variant. Each attribute goes on its own line above the name (`@tag("open")⏎Open`).
+fn variant(node: Node) -> Doc uses { State[Printer] } {
+  docs = List.fold(significant_children(node), [], |docs, child| {
+    doc = element(child)
+    if is_node(child, Annotation) { [hard(), doc, ..docs] } else { [doc, ..docs] }
+  })
+  concat(List.reverse(docs))
+}
+
+## For nodes the printer does not expect. Prints the source text as is and marks the comments
+## inside as printed.
+fn verbatim(node: Node) -> Doc uses { State[Printer] } {
+  first_significant_token(node) match {
+    None -> nil()
+    Some(first) -> {
+      last = last_token(node)
+      List.each(tokens(node), |t| {
+        take_leading(t)
+        # The trailing comment of the last token lies outside the node; it is printed below.
+        if Some(t) != last {
+          take_trailing(t)
+          ()
+        }
+      })
+      source = slice(printer().src, first.start, node.end)
+      lines = String.split(source, "\n") |> List.map(|l| text(strip_cr(l)))
+      doc = lines match {
+        []             -> nil()
+        [line, ..rest] -> List.fold(rest, line, |d, l| concat([d, hardline(), l]))
+      }
+      set_at_break(False)
+      last match {
+        Some(t) -> append(doc, trailing_of(t))
+        None    -> doc
+      }
+    }
+  }
+}
+
+## The parts of a block `{ ... }`. The caller decides whether to wrap it in a group.
+type BlockDoc(
+  open: Doc,
+  first_break: Doc,
+  body: Doc,
+  last_break: Doc,
+  close: Doc,
+  ## No statements and no comments: printed as `{}`.
+  empty: Bool,
+  ## Nothing inside, but `{` has a trailing comment: printed as `{ # c⏎}`.
+  comment_only: Bool,
+)
+
+## With `force`, the block breaks even if the source had it on one line.
+fn assemble(b: BlockDoc, force: Bool) -> Doc {
+  if b.empty {
+    append(b.open, b.close)
+  } else if b.comment_only {
+    # Two newlines in a row would make a blank line, so print only one.
+    concat([b.open, hardline(), b.close])
+  } else {
+    (first, last) = if force { (hardline(), hardline()) } else { (b.first_break, b.last_break) }
+    concat([b.open, nest(append(first, b.body), INDENT), last, b.close])
+  }
+}
+
+## `{ stmt NL ... }`. A one-line source (at most one statement) stays on one line while it fits.
+fn block(node: Node) -> BlockDoc uses { State[Printer] } {
+  multi = has_newline_child(node)
+  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  # A trailing comment after `{` forces a newline here.
+  forced = is_pending()
+  first_break = brk(multi)
+  stmts = children(node)
+  body = List.fold(List.enumerate(stmts), [], |docs, (i, stmt)| {
+    sep = if i > 0 { hard() } else { nil() }
+    lead = first_significant_token(stmt) match {
+      Some(first) -> leading_lines(first, i == 0)
+      None        -> nil()
+    }
+    doc = doc_of(stmt)
+    [doc, lead, sep, ..docs]
+  })
+  (closing, has_closing) = child_token(node, RBrace) match {
+    Some(t) -> {
+      items = take_leading(t)
+      (closing_comments(items, !List.is_empty(stmts)), List.any(items, is_comment))
+    }
+    None -> (nil(), False)
+  }
+  last_break = brk(multi)
+  close = child_token(node, RBrace) |> Option.map(tok) |> Option.or(nil())
+  BlockDoc(
+    open:,
+    first_break:,
+    body: concat(List.reverse([closing, ..body])),
+    last_break:,
+    close:,
+    empty: List.is_empty(stmts) && !has_closing && !forced,
+    comment_only: List.is_empty(stmts) && !has_closing && forced,
+  )
+}
+
+## The parts of a match arm. Head and body are kept apart so that `->` can be aligned.
+type ArmDoc(
+  ## The separator from the previous arm, and leading comments.
+  pre: Doc,
+  head: Doc,
+  ## Between the head and `->` when the arm is not aligned.
+  gap: Doc,
+  arrow: Doc,
+  after_arrow: Doc,
+  body: Doc,
+  ## Widths of the head and body, if the arm may be aligned.
+  widths: Option[(Int, Int)],
+)
+
+## Arms of `match` and `escape`. One-line arms get their `->` aligned.
+fn arm_list(node: Node) -> Doc uses { State[Printer] } {
+  multi = has_newline_child(node)
+  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  forced = is_pending()
+  first_break = brk(multi)
+  arms = children(node)
+  docs = List.fold(List.enumerate(arms), [], |docs, (i, a)| {
+    sep = if i > 0 { hard() } else { nil() }
+    lead = first_significant_token(a) match {
+      Some(first) -> leading_lines(first, i == 0)
+      None        -> nil()
+    }
+    [arm(a, append(sep, lead)), ..docs]
+  }) |> List.reverse
+  (closing, has_closing) = child_token(node, RBrace) match {
+    Some(t) -> {
+      items = take_leading(t)
+      (closing_comments(items, !List.is_empty(arms)), List.any(items, is_comment))
+    }
+    None -> (nil(), False)
+  }
+  last_break = brk(multi)
+  close = child_token(node, RBrace) |> Option.map(tok) |> Option.or(nil())
+  if List.is_empty(arms) && !has_closing {
+    # Even when `{` has a trailing comment, print only one newline.
+    inner = if forced { hardline() } else { nil() }
+    concat([open, inner, close])
+  } else {
+    w = target_width()
+    arms_doc = Doc.nesting(|indent| aligned_arms(docs, indent, w))
+    inner = concat([first_break, arms_doc, closing])
+    group(concat([open, nest(inner, INDENT), last_break, close]))
+  }
+}
+
+type ArmAcc(head: List[Doc], gap: Doc, arrow: Doc, after_arrow: Doc, body: Doc, seen_arrow: Bool)
+
+## `pattern [ "if" expr ] "->" expr`
+fn arm(node: Node, pre: Doc) -> ArmDoc uses { State[Printer] } {
+  initial = ArmAcc([], nil(), nil(), nil(), nil(), False)
+  acc = List.fold(significant_children(node), initial, |acc, child| {
+    child match {
+      TokenElement(t) if t.kind == ThinArrow -> {
+        gap = space()
+        arrow = tok(t)
+        ArmAcc(gap:, arrow:, seen_arrow: True, ..acc)
+      }
+      TokenElement(t) -> ArmAcc(head: [tok(t), ..acc.head], ..acc)
+      NodeElement(n) if acc.seen_arrow -> {
+        after_arrow = space()
+        body = doc_of(n)
+        ArmAcc(after_arrow:, body:, ..acc)
+      }
+      NodeElement(n) -> {
+        sep = if n.kind == MatchGuard { space() } else { nil() }
+        doc = doc_of(n)
+        ArmAcc(head: [doc, sep, ..acc.head], ..acc)
+      }
+    }
+  })
+  head = concat(List.reverse(acc.head))
+  widths = if has_comments(node) {
+    None
+  } else {
+    (flat_width(head), flat_width(acc.body)) match {
+      (Some(h), Some(b)) -> Some((h, b))
+      _                  -> None
+    }
+  }
+  ArmDoc(pre, head, acc.gap, acc.arrow, acc.after_arrow, acc.body, widths)
+}
+
+## Arms with `->` aligned. `indent` is the arms' indentation.
+##
+## Only arms that fit on one line are aligned. If alignment pushes any arm past the width, the arm
+## with the longest head is dropped from the alignment and it is retried.
+fn aligned_arms(arms: List[ArmDoc], indent: Int, width: Int) -> Doc {
+  aligned = List.map(arms, |a| Option.is_some(a.widths))
+  (column, on) = align(arms, aligned, indent, width)
+  List.zip(arms, on)
+    |> List.map(|(a, is_on)| {
+      gap = (is_on, a.widths) match {
+        (True, Some((h, _))) -> text(spaces(column - h + 1))
+        _                    -> a.gap
+      }
+      concat([a.pre, a.head, gap, a.arrow, a.after_arrow, a.body])
+    })
+    |> concat
+}
+
+fn align(arms: List[ArmDoc], aligned: List[Bool], indent: Int, width: Int) -> (Int, List[Bool]) {
+  pairs = List.zip(arms, aligned)
+  column = List.fold(pairs, 0, |m, (a, on)| {
+    (on, a.widths) match {
+      (True, Some((h, _))) -> if h > m { h } else { m }
+      _                    -> m
+    }
+  })
+  overflow = List.any(pairs, |(a, on)| {
+    (on, a.widths) match {
+      (True, Some((_, b))) -> indent + column + 4 + b > width
+      _                    -> False
+    }
+  })
+  if !overflow {
+    (column, aligned)
+  } else {
+    # Drop the arm with the longest head (the later one on ties).
+    widest = List.fold(List.enumerate(pairs), None, |best, (i, (a, on))| {
+      h = a.widths match {
+        Some((h, _)) -> h
+        None         -> 0
+      }
+      (on, best) match {
+        (False, _)            -> best
+        (True, None)          -> Some((i, h))
+        (True, Some((_, bh))) -> if h >= bh { Some((i, h)) } else { best }
+      }
+    })
+    widest match {
+      None -> (0, aligned)
+      Some((i, _)) -> {
+        next = List.map(List.enumerate(aligned), |(j, on)| if j == i { False } else { on })
+        align(arms, next, indent, width)
+      }
+    }
+  }
+}
+
+## `if c { a } else if d { b } else { c }`. All blocks share one group for their newlines, so if
+## one breaks, all break.
+fn if_chain(node: Node) -> Doc uses { State[Printer] } {
+  (docs, _) = List.fold(significant_children(node), ([], 0), |(docs, nodes), child| {
+    child match {
+      TokenElement(t) if t.kind == ElseKw -> {
+        before = space()
+        keyword = tok(t)
+        after = space()
+        ([after, keyword, before, ..docs], nodes)
+      }
+      TokenElement(t) -> {
+        keyword = tok(t)
+        after = space()
+        ([after, keyword, ..docs], nodes)
+      }
+      NodeElement(n) -> {
+        doc = if nodes == 0 {
+          cond = doc_of(n)
+          append(cond, space())
+        } else if n.kind == BlockExpr {
+          assemble(block(n), False)
+        } else if n.kind == IfExpr {
+          if_chain(n)
+        } else {
+          doc_of(n)
+        }
+        ([doc, ..docs], nodes + 1)
+      }
+    }
+  })
+  concat(List.reverse(docs))
+}
+
+## `with A, B { ... }`
+fn with_expr(node: Node) -> Doc uses { State[Printer] } {
+  (docs, _) = List.fold(significant_children(node), ([], None), |(docs, prev), child| {
+    kind = element_kind(child)
+    sep = prev match {
+      None                                                         -> nil()
+      Some(p) if p != TokenKind(Comma) && kind == TokenKind(Comma) -> nil()
+      Some(_)                                                      -> space()
+    }
+    doc = child match {
+      TokenElement(t) -> tok(t)
+      NodeElement(n) -> if n.kind == BlockExpr {
+        group(assemble(block(n), False))
+      } else {
+        doc_of(n)
+      }
+    }
+    ([doc, sep, ..docs], Some(kind))
+  })
+  concat(List.reverse(docs))
+}
+
+## The body of an anonymous function: a block, which an argument list may hug, or an expression.
+enum LambdaBody {
+  BlockBody(block: BlockDoc)
+  ExprBody(doc: Doc)
+}
+
+## An anonymous function (`[fmt.closure]`), in parentheses where it is an operand.
+fn lambda(node: Node) -> Doc uses { State[Printer] } {
+  parens = needs_parens(node)
+  # A trailing comment at the end of the function goes after the closing parenthesis.
+  held = if parens {
+    last_token(node) match {
+      Some(last) -> hold_trailing(last)
+      None       -> []
+    }
+  } else {
+    []
+  }
+  (head, body) = lambda_parts(node)
+  doc = body match {
+    BlockBody(b) -> append(head, group(assemble(b, False)))
+    ExprBody(e)  -> append(head, e)
+  }
+  if parens {
+    close = print_trailing(held)
+    concat([text("("), doc, text(")"), close])
+  } else {
+    doc
+  }
+}
+
+## `(a || b)`, laid out as the parentheses the formatter adds around a chain of `||`.
+fn paren_or_chain(node: Node) -> Doc uses { State[Printer] } {
+  open = child_token(node, LParen) |> Option.map(tok) |> Option.or(nil())
+  chain = paren_or_chain_of(node) match {
+    Some(c) -> doc_of(c)
+    None    -> nil()
+  }
+  # After a trailing comment, `)` already starts a line of its own.
+  close_breaks = is_pending()
+  close = child_token(node, RParen) |> Option.map(tok) |> Option.or(nil())
+  or_chain_in_parens(open, chain, close, close_breaks, 1, target_width())
+}
+
+## The parameter list and the space after it, and the body. A body block written on one line with
+## one expression loses its braces; any other block keeps them.
+fn lambda_parts(node: Node) -> (Doc, LambdaBody) uses { State[Printer] } {
+  (head, body) = List.fold(significant_children(node), (nil(), None), |(head, body), child| {
+    child match {
+      # The `fn` of the old form.
+      TokenElement(t)                       -> (append(head, tok_as(t, nil())), body)
+      NodeElement(n) if n.kind == ParamList -> (append(head, closure_params(n)), body)
+      NodeElement(n) -> {
+        s = space()
+        stripped = strip_one_line_blocks(n)
+        b = if stripped.kind == BlockExpr {
+          BlockBody(block(stripped))
+        } else {
+          # The braces removed: a comment before `{` is printed before the expression, and one
+          # after `}` after it.
+          removed = take_until(stripped.outer, node)
+          opens = List.reverse(removed)
+            |> List.filter_map(|b| child_token(b, LBrace))
+            |> List.map(|t| tok_as(t, nil()))
+          expr = doc_of(stripped)
+          closes = removed
+            |> List.filter_map(|b| child_token(b, RBrace))
+            |> List.map(|t| tok_as(t, nil()))
+          ExprBody(concat(List.append(opens, [expr, ..closes])))
+        }
+        (append(head, s), Some(b))
+      }
+    }
+  })
+  (head, Option.or(body, ExprBody(nil())))
+}
+
+fn take_until(nodes: List[Node], stop: Node) -> List[Node] {
+  nodes match {
+    []                            -> []
+    [n, ..rest] if !same(n, stop) -> [n, ..take_until(rest, stop)]
+    _                             -> []
+  }
+}
+
+## `|a, b|` or `||`, on one line: outside brackets a newline would end the statement. The brackets
+## of the old form become `|`. A type with `|` outside brackets (only possible in the old form) is
+## parenthesized, since there `|` closes the list.
+fn closure_params(node: Node) -> Doc uses { State[Printer] } {
+  kids = significant_children(node)
+  empty = !List.any(kids, |c| is_node(c, Param))
+  last_param = List.fold(
+    List.enumerate(kids),
+    -1,
+    |p, (i, c)| if is_node(c, Param) { i } else { p },
+  )
+  last = List.length(kids) - 1
+  docs = List.map(List.enumerate(kids), |(i, child)| {
+    child match {
+      TokenElement(t) -> {
+        closing = i == last && i > 0 && (t.kind == RParen || t.kind == Pipe)
+        doc = if t.kind == Comma && last_param >= 0 && i > last_param {
+          nil()
+        } else if t.kind == Comma {
+          text(", ")
+        } else if closing && empty {
+          nil()
+        } else if closing {
+          text("|")
+        } else if empty {
+          text("||")
+        } else {
+          text("|")
+        }
+        tok_as(t, doc)
+      }
+      NodeElement(n) -> closure_param(n)
+    }
+  })
+  concat(docs)
+}
+
+fn closure_param(node: Node) -> Doc uses { State[Printer] } {
+  docs = List.map(significant_children(node), |child| {
+    child match {
+      TokenElement(t) if t.kind == Colon         -> append(tok(t), text(" "))
+      TokenElement(t)                            -> tok(t)
+      NodeElement(n) if pipe_outside_brackets(n) -> concat([text("("), doc_of(n), text(")")])
+      NodeElement(n)                             -> doc_of(n)
+    }
+  })
+  concat(docs)
+}
+
+fn call(node: Node) -> Doc uses { State[Printer] } {
+  docs = List.map(significant_children(node), |child| {
+    child match {
+      TokenElement(t)                     -> tok(t)
+      NodeElement(n) if n.kind == ArgList -> arg_list(n)
+      NodeElement(n)                      -> doc_of(n)
+    }
+  })
+  concat(docs)
+}
+
+## If the last argument is a lambda with a block, tries the hugging form that keeps the
+## parenthesis open around its body (`f(xs, |x| {` ... `})`).
+fn arg_list(node: Node) -> Doc uses { State[Printer] } {
+  args = children(node)
+  huggable = !has_comments_outside_blocks(node)
+    && (List.last(args) |> Option.map(is_lambda_arg)) == Some(True)
+  if !huggable {
+    list(node, doc_of)
+  } else {
+    update(|p| Printer(hug: None, ..p))
+    parts = list_parts(node, |n, last| {
+      if !last {
+        doc_of(n)
+      } else {
+        (normal, hug) = lambda_arg(n)
+        update(|p| Printer(hug: Some(hug), ..p))
+        normal
+      }
+    })
+    normal = grouped(parts)
+    hugged = printer().hug
+    update(|p| Printer(hug: None, ..p))
+    hugged match {
+      None -> normal
+      Some(h) -> {
+        init = List.take(parts.elements, List.length(parts.elements) - 1)
+        if List.any(init, |e| Option.is_none(flat_width(e))) {
+          normal
+        } else {
+          hug = concat(
+            [parts.open, concat(List.map(init, |e| append(e, text(" ")))), h, parts.close],
+          )
+          flat = flat_width(normal)
+          head = first_line_width(hug)
+          w = target_width()
+          Doc.column(|col| {
+            fits_flat = flat match {
+              Some(fw) -> col + fw <= w
+              None     -> False
+            }
+            if fits_flat || col + head > w { normal } else { hug }
+          })
+        }
+      }
+    }
+  }
+}
+
+## Returns (the plain form, the hugging form) of the trailing lambda argument.
+fn lambda_arg(node: Node) -> (Doc, Doc) uses { State[Printer] } {
+  (prefix, lam) = if node.kind == NamedArg {
+    List.fold(significant_children(node), (nil(), node), |(prefix, lam), child| {
+      child match {
+        TokenElement(t) -> (append(prefix, tok(t)), lam)
+        NodeElement(n)  -> (append(prefix, space()), n)
+      }
+    })
+  } else {
+    (nil(), node)
+  }
+  (head0, body) = lambda_parts(lam)
+  head = append(prefix, head0)
+  body match {
+    BlockBody(b) -> (append(head, group(assemble(b, False))), append(head, assemble(b, True)))
+    # `is_lambda_arg` admits only a body printed as a block.
+    ExprBody(e) -> {
+      doc = append(head, e)
+      (doc, doc)
+    }
+  }
+}
+
+## String interpolation. The contents never break by width; only forced newlines from comments
+## and multiline blocks remain.
+fn interp(node: Node) -> Doc uses { State[Printer] } {
+  # Hugging and arm alignment record the width at build time, so build the contents with no
+  # width limit.
+  saved = target_width()
+  update(|p| Printer(width: HUGE, ..p))
+  doc = seq(node, never)
+  update(|p| Printer(width: saved, ..p))
+  # A multiline string inside must not be re-indented, so do not freeze the shape.
+  if List.any(tokens(node), |t| t.kind == TripleQuote) { doc } else { unbreakable(doc) }
+}
+
+## The pieces of a multiline string `"""` are printed verbatim.
+fn string(node: Node) -> Doc uses { State[Printer] } {
+  multiline = Option.is_some(child_token(node, TripleQuote))
+  docs = List.map(significant_children(node), |child| {
+    child match {
+      TokenElement(t) -> if multiline { raw_tok(t) } else { tok(t) }
+      NodeElement(n)  -> doc_of(n)
+    }
+  })
+  concat(docs)
+}
+
+## The operands of a chain of operators of equal strength, from the left: the first operand, and
+## each operator with the operand to its right. `None` for a malformed node.
+fn chain_links(
+  node: Node,
+  class: Int,
+  links: List[(Token, Node)],
+) -> Option[(Node, List[(Token, Node)])] {
+  (children(node), bin_op(node)) match {
+    ([lhs, rhs, ..], Some(op)) -> {
+      more = [(op, rhs), ..links]
+      same_class = lhs.kind == BinExpr
+        && (bin_op(lhs) |> Option.map(|t| op_class(t.kind))) == Some(class)
+      if same_class { chain_links(lhs, class, more) } else { Some((lhs, more)) }
+    }
+    _ -> None
+  }
+}
+
+## A chain of operators of equal strength. When it breaks, each operator starts a line, indented
+## one level.
+##
+## Never break before `-`: a `-` at the start of a line is a unary minus that starts a new
+## statement (spec 2.5). A pipe chain breaks entirely if the source had a newline before any of
+## its `|>`. A chain of `||` that breaks outside brackets is put in parentheses and broken inside
+## them (`[fmt.wrap]`).
+fn bin_chain(node: Node) -> Doc uses { State[Printer] } {
+  class = bin_op(node) |> Option.map(|t| op_class(t.kind)) |> Option.or(0)
+  chain_links(node, class, []) match {
+    None -> verbatim(node)
+    Some((first, links)) -> {
+      pipe = class == op_class(PipeGt)
+      source_broken = pipe && List.any(links, |(op, _)| newline_before(op))
+      first_doc = doc_of(first)
+      (tail, ops) = List.fold(links, ([], []), |(tail, ops), (op, rhs)| {
+        # Breaking before `-` is only safe inside parentheses. A line comment before it keeps it
+        # at the start of a line.
+        b = if op.kind == Minus && has_leading_comment(op) {
+          hard()
+        } else if op.kind == Minus {
+          space()
+        } else {
+          brk(source_broken)
+        }
+        lead = leading_in_list(op)
+        op_doc = tok(op)
+        gap = space()
+        rhs_doc = doc_of(rhs)
+        link = concat([op_doc, gap, rhs_doc])
+        ([link, lead, b, ..tail], [link, ..ops])
+      })
+      ops_in_order = List.reverse(ops)
+      normal = group(append(first_doc, nest(concat(List.reverse(tail)), INDENT)))
+      if class == op_class(Pipe2) && !inside_brackets(node) {
+        or_chain_in_parens(text("("), normal, text(")"), False, 0, target_width())
+      } else if (pipe
+        && !source_broken
+        && List.length(ops_in_order) == 1
+        && !has_comments_outside_blocks(node)
+        && Option.is_none(flat_width(normal))) {
+        # When a single pipe breaks only inside a hugged body (`xs |> List.map(|x| {`), do not
+        # break the pipe if the first line fits.
+        only = Option.or(List.head(ops_in_order), nil())
+        spaced = concat([first_doc, text(" "), only])
+        broken = append(first_doc, nest(append(hardline(), only), INDENT))
+        head = first_line_width(spaced)
+        w = target_width()
+        Doc.column(|col| if col + head <= w { spaced } else { broken })
+      } else {
+        normal
+      }
+    }
+  }
+}
+
+## A chain of `||` that breaks before a `||` is written with `open` and `close` on lines of their
+## own around it (`[fmt.wrap]`); with `close_breaks`, `close` already starts a line. Otherwise the
+## chain is printed as is: alone for a chain outside brackets (`shift` 0: `open` and `close` are
+## the parentheses the formatter adds), or in its parentheses, `shift` being the width of `(`.
+fn or_chain_in_parens(
+  open: Doc,
+  chain: Doc,
+  close: Doc,
+  close_breaks: Bool,
+  shift: Int,
+  width: Int,
+) -> Doc {
+  inline = if shift == 0 { chain } else { concat([open, chain, close]) }
+  close_line = if close_breaks { close } else { append(hardline(), close) }
+  broken = concat([open, nest(append(hardline(), chain), INDENT), close_line])
+  Doc.column(|col| {
+    Doc.nesting(|indent| {
+      probe = nest(append(text(spaces(col + shift)), chain), indent)
+      broke = String.split(render(probe, width), "\n")
+        |> List.drop(1)
+        |> List.any(|l| String.starts_with(String.trim(l), "||"))
+      if broke { broken } else { inline }
+    })
+  })
+}
+
+## The chain of `||` that is the only thing in a ParenExpr.
+fn paren_or_chain_of(node: Node) -> Option[Node] {
+  children(node) match {
+    [only] if only.kind == BinExpr && (bin_op(only) |> Option.map(|t| t.kind)) == Some(Pipe2) -> {
+      Some(only)
+    }
+    _ -> None
+  }
+}
+
+fn bin_op(node: Node) -> Option[Token] {
+  List.find(children_tokens(node), |t| op_class(t.kind) != 0)
+}
+
+## A uses clause in its canonical form (`[fmt.signature]`): `uses` and the set in braces. The old
+## keyword `use` (E0147) is printed as `uses`, and a bare element gets braces.
+fn uses_clause(node: Node) -> Doc uses { State[Printer] } {
+  docs = List.map(significant_children(node), |child| {
+    child match {
+      TokenElement(t) if t.kind == UseKw || t.kind == LowerName -> tok_as(t, text("uses"))
+      NodeElement(set) if set.kind == EffectSet -> {
+        s = space()
+        doc = if Option.is_some(child_token(set, LBrace)) {
+          doc_of(set)
+        } else {
+          # The same document as the braced set `{ X }` gives, so that the output reads back
+          # to itself at every width.
+          b = line()
+          item = seq(set, always)
+          end_break = line()
+          grouped(
+            ListParts(
+              open: text("{"),
+              breaks: [b],
+              elements: [item],
+              last_comma: flat_alt(text(","), nil()),
+              closing: nil(),
+              end_break:,
+              close: text("}"),
+            ),
+          )
+        }
+        append(s, doc)
+      }
+      other                                                     -> element(other)
+    }
+  })
+  concat(docs)
+}
+
+## Whether there is a newline in the trivia right before the token.
+fn newline_before(token: Token) -> Bool uses { State[Printer] } {
+  p = printer()
+  Map.get(p.index, token.start) match {
+    None    -> False
+    Some(i) -> newline_before_index(p.all, i - 1)
+  }
+}
+
+fn newline_before_index(all: Array[Token], i: Int) -> Bool {
+  Array.get(all, i) match {
+    None -> False
+    Some(t) -> {
+      if t.kind == Newline || t.kind == NewlineCont {
+        True
+      } else if is_trivia(t.kind) {
+        newline_before_index(all, i - 1)
+      } else {
+        False
+      }
+    }
+  }
+}
+
+## A `|>` chain.
+fn is_pipe(node: Node) -> Bool {
+  node.kind == BinExpr && (bin_op(node) |> Option.map(|t| t.kind)) == Some(PipeGt)
+}
+
+## A lambda whose body is printed as a block, or a named argument whose value is one.
+fn is_lambda_arg(node: Node) -> Bool {
+  lam = if node.kind == LambdaExpr {
+    Some(node)
+  } else if node.kind == NamedArg {
+    List.find(children(node), |n| n.kind == LambdaExpr)
+  } else {
+    None
+  }
+  lam match {
+    None -> False
+    Some(l) -> List.find(children(l), |n| n.kind != ParamList) match {
+      None       -> False
+      Some(body) -> strip_one_line_blocks(body).kind == BlockExpr
+    }
+  }
+}
+
+## The body of an anonymous function as printed: a block written on one line with one expression
+## is replaced by that expression, repeatedly (`|x| { { x } }` is `|x| x`), so that formatting
+## twice gives the same result.
+fn strip_one_line_blocks(body: Node) -> Node {
+  if body.kind != BlockExpr {
+    body
+  } else {
+    single_line_expression(body) match {
+      Some(expr) -> strip_one_line_blocks(expr)
+      None       -> body
+    }
+  }
+}
+
+## The expression of a block written on one line with one statement that is not a binding.
+fn single_line_expression(block: Node) -> Option[Node] {
+  children(block) match {
+    [only] if only.kind != Binding && only.kind != Error -> {
+      broken = List.any(children_tokens(block), |t| {
+        t.kind == Newline || t.kind == NewlineCont || t.kind == Comment || t.kind == DocComment
+      })
+      if broken { None } else { Some(only) }
+    }
+    _ -> None
+  }
+}
+
+fn children_tokens(node: Node) -> List[Token] {
+  List.filter_map(node.trees, |tree| {
+    tree match {
+      Leaf(t) -> Some(t)
+      _       -> None
+    }
+  })
+}
+
+## Whether an anonymous function needs parentheses where it stands: as an operand.
+fn needs_parens(node: Node) -> Bool {
+  parent(node) match {
+    None -> False
+    Some(p) -> {
+      first = (List.head(children(p)) |> Option.map(|c| same(c, node))) == Some(True)
+      if p.kind == BinExpr || p.kind == PrefixExpr {
+        True
+      } else if (
+        p.kind == CallExpr || p.kind == FieldExpr || p.kind == MatchExpr || p.kind == EscapeExpr
+      ) {
+        first
+      } else {
+        False
+      }
+    }
+  }
+}
+
+## Whether a `|` of the type is outside any bracket inside it.
+fn pipe_outside_brackets(ty: Node) -> Bool {
+  pipe_outside(tokens(ty), 0)
+}
+
+fn pipe_outside(ts: List[Token], depth: Int) -> Bool {
+  ts match {
+    [] -> False
+    [t, ..rest] -> {
+      kind = t.kind
+      if kind == LParen || kind == LBrack || kind == LBrace {
+        pipe_outside(rest, depth + 1)
+      } else if kind == RParen || kind == RBrack || kind == RBrace {
+        pipe_outside(rest, depth - 1)
+      } else if kind == Pipe && depth == 0 {
+        True
+      } else {
+        pipe_outside(rest, depth)
+      }
+    }
+  }
+}
+
+## Whether a line break here continues the line by rule 2 of `[lex.continuation]`: the innermost
+## bracket around the node is `(`, `[` or an interpolation, not a block or arm list.
+fn inside_brackets(node: Node) -> Bool {
+  List.find(node.outer, |a| {
+    is_any(a.kind, [ArgList, ParenExpr, TupleExpr, ListExpr, Interp, BlockExpr, MatchArmList, Root])
+  }) match {
+    Some(a) -> is_any(a.kind, [ArgList, ParenExpr, TupleExpr, ListExpr, Interp])
+    None    -> False
+  }
+}

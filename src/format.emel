@@ -1,0 +1,158 @@
+## Formats a source. Follows `lib.rs` of the reference formatter (`emela-fmt`).
+##
+## Files with syntax errors are not formatted: the contents of an Error node do not follow the
+## grammar, so reprinting them could break the file. Graft knows only the parser's diagnostics
+## so far; the reference also refuses files with lexical errors and errors that validation finds.
+import Std.Array.{Array}
+import Std.Map.{Map}
+import Std.State.{State}
+import Cst
+import Doc
+import Grammar
+import Lexer
+import Parser
+import Printer
+import Sink
+import Source
+import Token.{Comment, DocComment, StringText, TripleQuote}
+
+pub const DEFAULT_WIDTH = 100
+
+pub enum Formatted {
+  Done(text: String)
+  ## The input has syntax errors.
+  SyntaxErrors
+  ## The output did not parse or lost a comment. A formatter bug, so the input is not rewritten.
+  Internal(message: String)
+} derive Eq, Show
+
+pub fn format(text: String) -> Formatted {
+  format_with_width(text, DEFAULT_WIDTH)
+}
+
+## `width` is a target for the display width of a line. Tokens that cannot fit (such as long
+## strings) exceed it.
+pub fn format_with_width(text: String, width: Int) -> Formatted {
+  src = Array.from_list(String.code_points(text))
+  built = parse(src)
+  if !List.is_empty(built.diagnostics) {
+    SyntaxErrors
+  } else {
+    root = Cst.root(built.tree)
+    (doc, printer) = State.run(Printer.new(src, root, width), || Printer.root(root))
+    left = Printer.remaining(printer)
+    if left != 0 {
+      Internal("#{left} comment(s) were not printed")
+    } else {
+      out = finish(Doc.render(doc, width))
+      verify(src, root, out) match {
+        Some(message) -> Internal(message)
+        None          -> Done(out)
+      }
+    }
+  }
+}
+
+fn parse(src: Array[Int]) -> Sink.Built {
+  tokens = Lexer.tokens(src)
+  Sink.build(src, Array.from_list(tokens), Parser.run(src, tokens, Grammar.source_file))
+}
+
+## Checks that formatting did not change the meaning: the output must parse without errors, and
+## its comments must match the input's. Returns what went wrong.
+##
+## The reference also compares the tokens, minus what formatting may change
+## (`normalized_tokens`). Graft does not yet.
+fn verify(src: Array[Int], before: Cst.Node, out: String) -> Option[String] {
+  out_src = Array.from_list(String.code_points(out))
+  after = parse(out_src)
+  after.diagnostics match {
+    [d, ..] -> Some("the output has a syntax error: #{d.message} at #{d.start}..#{d.end}")
+    [] -> {
+      if comment_texts(src, before) != comment_texts(out_src, Cst.root(after.tree)) {
+        Some("the output changed the comments")
+      } else {
+        None
+      }
+    }
+  }
+}
+
+## Comment texts, with trailing whitespace removed.
+fn comment_texts(src: Array[Int], root: Cst.Node) -> List[String] {
+  Cst.tokens(root)
+    |> List.filter(|t| t.kind == Comment || t.kind == DocComment)
+    |> List.map(|t| String.trim(Source.slice(src, t.start, t.end)))
+}
+
+## Strips trailing whitespace and ends the output with exactly one newline. Whitespace before a
+## newline inside a multiline string `"""` is part of the value, so it is kept.
+fn finish(rendered: String) -> String {
+  cs = Array.from_list(String.code_points(rendered))
+  in_string = List.fold(Lexer.tokens(cs), Map.empty(), |m, t| {
+    if t.kind == StringText || t.kind == TripleQuote {
+      List.fold(List.range(t.start, t.end), m, |acc, i| {
+        if Array.get(cs, i) == Some(0x0A) { Map.insert(acc, i, True) } else { acc }
+      })
+    } else {
+      m
+    }
+  })
+  lines = split_lines(cs, in_string, 0, 0, [])
+  body = drop_blank_tail(lines)
+  if List.is_empty(body) {
+    ""
+  } else {
+    String.concat(List.map(List.reverse(body), |l| "#{l}\n"))
+  }
+}
+
+## The lines of `cs` newest first, without their newlines, each trimmed at the end unless its
+## newline is inside a string.
+fn split_lines(
+  cs: Array[Int],
+  in_string: Map[Int, Bool],
+  start: Int,
+  i: Int,
+  acc: List[String],
+) -> List[String] {
+  Array.get(cs, i) match {
+    None -> if start < i || List.is_empty(acc) {
+      [trimmed(cs, start, i, False), ..acc]
+    } else {
+      acc
+    }
+    Some(0x0A) -> {
+      keep = Map.contains(in_string, i)
+      split_lines(cs, in_string, i + 1, i + 1, [trimmed(cs, start, i, keep), ..acc])
+    }
+    Some(_) -> split_lines(cs, in_string, start, i + 1, acc)
+  }
+}
+
+fn trimmed(cs: Array[Int], start: Int, end: Int, keep: Bool) -> String {
+  # A `\r` before the newline goes in either case.
+  e = if end > start && Array.get(cs, end - 1) == Some(0x0D) { end - 1 } else { end }
+  stop = if keep { e } else { trim_end_at(cs, start, e) }
+  Source.slice(cs, start, stop)
+}
+
+fn trim_end_at(cs: Array[Int], start: Int, end: Int) -> Int {
+  if end > start && is_space(Array.get(cs, end - 1)) {
+    trim_end_at(cs, start, end - 1)
+  } else {
+    end
+  }
+}
+
+fn is_space(c: Option[Int]) -> Bool {
+  c == Some(0x20) || c == Some(0x09) || c == Some(0x0D) || c == Some(0x0B) || c == Some(0x0C)
+}
+
+## Drops the empty lines at the end (the list is newest first).
+fn drop_blank_tail(lines: List[String]) -> List[String] {
+  lines match {
+    [last, ..rest] if last == "" -> drop_blank_tail(rest)
+    _                            -> lines
+  }
+}

@@ -8,4 +8,5 @@ publish = false
 [dependencies]
 # Keep the tag equal to `emela` in ../../Pome.toml (CI checks it).
 emela-syntax = { git = "https://github.com/emela-lang/emela", tag = "v0.28.2" }
+emela-fmt = { git = "https://github.com/emela-lang/emela", tag = "v0.28.2" }
 rowan = "0.17"

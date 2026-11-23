@@ -46,13 +46,18 @@ $ emela test                                         # unit and property tests (
 $ scripts/roundtrip.sh <emela-lang/emela checkout>   # M1 on the corpus, on js and native
 $ scripts/compare.sh tokens <emela-lang/emela checkout>  # tokens against the reference
 $ scripts/compare.sh tree <emela-lang/emela checkout>    # syntax trees against the reference
-$ scripts/fuzz.py <emela-lang/emela checkout> <out dir> # trees of broken corpus files
+$ scripts/compare.sh fmt <emela-lang/emela checkout>     # formatted output against the reference
+$ scripts/fuzz.py tree <emela-lang/emela checkout> <out dir> # trees of broken corpus files
+$ scripts/fuzz.py fmt <emela-lang/emela checkout> <out dir>  # fmt of reflowed files, any width
 $ emela run . -- parse <file>...                     # parses the files, to time the parser
 ```
 
 `tools/oracle` is a small Rust program that prints what the reference implementation
-(`emela-syntax` at the tag of the release in `Pome.toml`) makes of a file, in the format of
-`graft tokens` and `graft tree`. `scripts/compare.sh` builds it with cargo.
+(`emela-syntax` and `emela-fmt` at the tag of the release in `Pome.toml`) makes of a file, in the
+format of `graft tokens`, `graft tree` and `graft fmt`. `scripts/compare.sh` builds it with cargo.
+
+The scripts run the `emela` on `PATH`. Put the release in `Pome.toml` first if another version
+is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
 
 ## Status
 
@@ -61,4 +66,8 @@ $ emela run . -- parse <file>...                     # parses the files, to time
 - M2, parser: the tokens and the syntax trees, with the parser's diagnostics, of all 297 files
   equal the reference's. So do those of 4,394 inputs made by breaking corpus files at random.
   Lexing and parsing the corpus (441 KB) takes 0.29 s on native.
-- M2, fmt: not started.
+- M2, fmt: `graft fmt` gives byte for byte the output of `emela fmt` on every file the reference
+  formats (254 of 297), and refuses the same files for syntax errors, except 4 that only the
+  reference's validation rejects (`scripts/known-differences.txt`). So do 3,158 inputs made by
+  moving whitespace in corpus files, formatted at random widths from 10 to 140. Formatting the
+  largest file (18 KB) takes 54 ms on native.

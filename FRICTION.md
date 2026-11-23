@@ -139,9 +139,41 @@ fn paren_elements(count: Int) -> (Int, Bool) uses { State[Parser] } {
 
 対応: `st.set(f(st.get()))` と書き換えた．
 
-本来の形: 純粋な関数だけを受け取ると型に書く方法（`fn(Parser) -> Parser fails {} uses {}` のような形）が、仕様か診断の help で示されているとよい．
+その後、fmt の `Doc.column(f)` で同じ形に当たり、引数の型に `fails {} uses {}` と書けば純粋な関数だけを受け取れることがわかった．
 
-行き先: 我慢．診断に help を足す本体 issue にするかは、仕様を確かめてから決める．
+```emel
+pub fn column(f: fn(Int) -> Doc fails {} uses {}) -> Doc {
+  Column(f)
+}
+```
+
+型のフィールドに書いた `fn(Int) -> Doc` は純粋な関数の意味になり、引数に書いた同じ型は多相になる．同じ字面で意味が違うので、E0321 を見ても原因に気づきにくい．
+
+本来の形: E0321 と E0403 の help で `fails {} uses {}` を書くよう示す．
+
+行き先: 本体 issue（診断の help）を検討．
+
+### L8. モジュールで修飾して定数を参照できない
+
+やりたかったこと: `main` から `Format.DEFAULT_WIDTH` を参照する．
+
+起きたこと: `.` の後ろには小文字の名前か型名しか書けず、E0110（`expected lower name`）になった．関数は `Format.format(text)` と書けるのに、定数は import しないと使えない．
+
+```emel
+import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
+```
+
+行き先: proposal．L1 と同じく、名前の種類によって修飾できるかが変わる．
+
+### L9. 関数名と、同じモジュールの型のフィールド名が衝突する
+
+やりたかったこと: 構文木のノード型 `Node(children: ...)` と、ノードだけを返す関数 `children(node)` を同じモジュールに置く．
+
+起きたこと: E0334（`function children has the same name as a field of Node`）になった．フィールドを `trees` と `outer` に、printer の関数を `trailing_of`、`target_width`、`is_pending` に改名した．
+
+本来の形: `node.children` はフィールド、`children(node)` は関数と書き分けられるので、両方を許す．衝突の理由（メソッド呼び出しの解決）が仕様にあるなら、診断の help で示す．
+
+行き先: 本体 issue か proposal．仕様の該当箇所を確かめてから決める．
 
 ## std
 
@@ -196,6 +228,31 @@ handler Hd: Kv {
 
 行き先: 本体 issue（未提出）．Graft は reference の木に合わせる都合で、同じ箇所を検査なしで読んでいる．
 
+### T3. `emela fmt` が、`||` の連鎖をちょうど幅いっぱいに折り返すと internal error になる
+
+起きたこと: Graft の fmt を reference と幅を変えて突き合わせたら、reference の出力が構文エラーになって internal error を返す入力が見つかった．既定の幅 100 でも、次の正しいプログラムで起きる（`a` は 84 個か 85 個）．
+
+```emel
+fn f(x: Bool) -> Int {
+  if x || aaaa…aaaa || x {
+    1
+  } else {
+    2
+  }
+}
+```
+
+```console
+$ emela fmt --check or84.emel
+error: internal error: cannot format this file: the output has a syntax error: expected `{` at 29..30
+```
+
+`||` の連鎖が括弧の外で折り返すときは括弧で包む規則（`[fmt.wrap]`）がある．包むかどうかは、連鎖だけを描画してみて行頭が `||` になるかで決めている（`or_chain_in_parens`）．この試し描きには、条件の後ろに続く ` {` が入っていない．連鎖だけなら幅に収まり、` {` まで含めると収まらない長さのとき、括弧なしで折り返して、行頭の `||` が無名関数として読まれる．main（a9d27cf）でも同じ．
+
+本来の形: 試し描きに後続の幅を含めるか、実際に折り返したかで決める．
+
+行き先: 本体 issue（未提出）．Graft は reference に合わせて同じ出力を作り、同じく internal error にしている．
+
 ## Brix
 
 ### B1. 文字列の生成器と「候補から選ぶ」生成器がない
@@ -238,3 +295,11 @@ gen = Gen.list(Gen.int_between(0, List.length(PIECES) - 1)) |> Gen.map(source_of
 対応: spec はリリースタグで読む（README の Rules に追記済み）．本体には何も出さない．
 
 lexer にも `<-` を1トークンにする処理が残っていた．corpus に `<-` がないのでトークン列の比較では見つからず、M2 で token の一覧を見直したときに気づいて消した．
+
+### P2. 作業中に PATH の emela が main のビルドに切り替わった
+
+起きたこと: `~/.emela/bin/emela` の参照先が、作業の途中で v0.28.2 から main のビルド（`main-a9d27cf`）に変わった．`emela check` が、0.28.2 にない W0403（`use Args` は非推奨、`args <- Args` と書け）を出し始めて気づいた．
+
+対応: Graft の作業では `~/.emela/versions/v0.28.2` を PATH の先頭に置いた．CI は `setup-emela` が Pome.toml の版を入れるので影響しない．
+
+行き先: 我慢．手元でも Pome.toml の `emela` と違う版で動いていることに気づける仕組み（W0203 に近い警告）があるとよいが、Graft の側で `scripts/` が版を確かめる方が早い．

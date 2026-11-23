@@ -1,0 +1,63 @@
+import Doc.{append, concat, group, hardline, line, line_, nest, render, text}
+import Format.{Formatted, Done, SyntaxErrors, Internal, format, format_with_width}
+
+## The example of `pretty`'s documentation for `line_`.
+@test
+fn a_group_breaks_only_when_it_does_not_fit() {
+  doc = group(
+    concat(
+      [
+        text("("),
+        nest(concat([line_(), text("test"), line(), text("test")]), 2),
+        line_(),
+        text(")"),
+      ],
+    ),
+  )
+  assert render(doc, 5) == "(\n  test\n  test\n)"
+  assert render(doc, 100) == "(test test)"
+}
+
+@test
+fn a_hardline_takes_the_indentation_of_what_follows() {
+  doc = append(text("a"), nest(append(hardline(), text("b")), 4))
+  assert render(doc, 100) == "a\n    b"
+}
+
+@test
+fn wide_characters_count_two_columns() {
+  assert Doc.display_width("aあ😀") == 5
+}
+
+@test
+fn arms_get_their_arrows_aligned() {
+  src = "fn f() {\n  x match {\n    Some(value) -> value\n    None -> 0\n  }\n}\n"
+  assert format(src)
+    == Done("fn f() {\n  x match {\n    Some(value) -> value\n    None        -> 0\n  }\n}\n")
+}
+
+@test
+fn an_argument_list_breaks_one_per_line_with_a_trailing_comma() {
+  src = "fn f() { g(aaaa, bbbb, cccc) }\n"
+  assert format(src) == Done(src)
+  assert format_with_width(src, 20)
+    == Done("fn f() {\n  g(\n    aaaa,\n    bbbb,\n    cccc,\n  )\n}\n")
+}
+
+@test
+fn a_file_with_syntax_errors_is_not_formatted() {
+  assert format("fn f( {") == SyntaxErrors
+}
+
+## The reference formatter at v0.28.2 breaks this `||` chain without parentheses, and the line
+## starting with `||` reads as an anonymous function, so the output does not parse. Graft prints
+## the same and refuses it the same way (FRICTION.md T3).
+@test
+fn an_output_that_does_not_parse_is_an_internal_error() {
+  long = String.concat(List.map(List.range(0, 84), |_| "a"))
+  src = "fn f(x: Bool) -> Int {\n  if x || #{long} || x {\n    1\n  } else {\n    2\n  }\n}\n"
+  assert format(src) match {
+    Internal(_) -> True
+    _           -> False
+  }
+}
