@@ -1,0 +1,2 @@
+@export(js, "default", "fetch")
+pub fn serve(app: fn(Int) -> Int, x: Int) -> Int { app(x) }

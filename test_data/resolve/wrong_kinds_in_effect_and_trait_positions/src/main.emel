@@ -1,0 +1,23 @@
+type User(id: Int)
+effect Log {
+  fn info(msg: String) -> ()
+}
+effect Audit of Log
+handler Quiet: Log {
+  fn info(msg) { () }
+}
+fn helper() { 1 }
+
+fn f[Eff]() -> Int uses { Eff } {
+  with User { 1 }
+  with User by Quiet { 1 }
+  with Audit by User { 1 }
+  with Audit by Quiet { 1 }
+  use Eff
+  xs: List[Quiet] = []
+  1
+}
+
+trait Named: User {}
+impl User: User {}
+fn g[A: User](a: A) -> Int { 1 }

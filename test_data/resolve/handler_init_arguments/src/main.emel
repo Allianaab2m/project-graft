@@ -1,0 +1,22 @@
+pub effect Kv {
+  fn get(key: String) -> String
+}
+
+effect AuditKv of Kv
+
+const NAME: String = "KV"
+
+handler WorkerKv(binding: String): Kv {
+  init(binding: String, retries: Int) { WorkerKv(binding:) }
+  fn get(key) { self.binding }
+}
+
+layer AppLive {
+  WorkerKv(binding: NAME, retries: 3)
+}
+
+fn main() {
+  name = "KV"
+  with WorkerKv(binding: name, retries: 1) { (use Kv).get("a") }
+  with AppLive, AuditKv by WorkerKv(name, 2) { (use AuditKv).get("a") }
+}

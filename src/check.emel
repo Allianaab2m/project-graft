@@ -20,6 +20,7 @@ import Cst.{
 }
 import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, lookup, is_core}
 import Parse
+import Resolve
 import Sink
 import Source.{slice}
 import Syntax.{Diagnostic, Import, ImportList, Error}
@@ -164,7 +165,18 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
     _               -> []
   }
   imports = reads.map_values(|r| imports_of(r.src, r.parsed))
-  first.append(per_module).append(not_module).append(graph(map, imports))
+  graph_diagnostics = graph(map, imports)
+  # With an import cycle there is no order to check the modules in, so checking stops here.
+  checked = if graph_diagnostics.any(|d| d.code == "E0206") {
+    []
+  } else {
+    resolved = Resolve.resolve(map, reads.map_values(|r| (r.src, r.parsed.tree)))
+    resolved.diagnostics.map(|d| {
+      file = get(map, d.module).map(|m| m.file).or("")
+      Checked(if d.warning { "warning" } else { "error" }, d.code, file, Some((d.start, d.end)))
+    })
+  }
+  first.append(per_module).append(not_module).append(graph_diagnostics).append(checked)
 }
 
 fn normalize(path: String) -> String {

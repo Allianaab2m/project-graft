@@ -1,0 +1,16 @@
+error Timeout
+error Refused
+effect Log {
+  fn info(msg: String) -> ()
+}
+effect State[S] {
+  fn get() -> S
+}
+type Box[A](value: A)
+
+fn run[E, R](
+  f: fn(Int) -> Box[Int] fails E | Timeout uses { R, Log },
+  h: Handler[Timeout | Refused, { Log, State[Int] }],
+) -> Int fails E uses { R, State[Box[Int]] } {
+  1
+}

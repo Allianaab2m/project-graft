@@ -1,0 +1,51 @@
+import Lib
+type User(id: Int)
+effect Log {
+  fn info(msg: String) -> ()
+  fn info(code: Int) -> Int
+}
+effect Audit of Log
+effect State[S] {
+  fn get() -> S
+}
+handler Quiet: Audit {
+  fn info(msg) { () }
+}
+handler Pg(conn: Int): Log {
+  fn info(msg) { () }
+}
+enum Shape {
+  Dot
+}
+effect Spawn {
+  fn fork[T](x: T) -> T
+  fn join(x: T) -> Int
+}
+@intrinsic
+type Raw
+@intrinsic
+effect Hidden {}
+
+@entry(Lib.Thing.make)
+fn serve() { 1 }
+
+fn first[A](a: A) -> A { a }
+fn second(x: A) -> Int { 1 }
+fn conn(p: Pg) -> Int { 1 }
+
+impl User: Lib.Named {
+  fn name(self) {
+    f = |self| self
+    1
+  }
+}
+impl User: Lib.Thing {}
+
+fn effects(o: Option[Int], p: User) -> Int uses { State[Int], Audit } {
+  s = use State[Int]
+  Some(v) = o
+  q = Nope(id: 1, ..p)
+  r = Dot(id: 1, ..p)
+  with Audit by State[Int] { 1 }
+  1
+}

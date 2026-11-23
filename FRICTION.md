@@ -181,6 +181,16 @@ M3 の `src/check.emel` でも、`Modules.CORE`（core モジュールの表）�
 
 行き先: 我慢（仕様どおり）．
 
+### L10. import に別名を付けられない
+
+やりたかったこと: 名前解決のモジュールで、HIR の型 `LocalFn`、`TypeParam`、`ErrorSet` などと、同じ名前の構文ノードの種別（`Syntax.LocalFn` など）を両方使う．
+
+起きたこと: import の一覧には名前しか書けず（`[module.import]`）、`import Syntax.{LocalFn as LocalFnNode}` は構文エラーになる．構文ノードの側を import せず、使う箇所で `Syntax.LocalFn` と修飾した．
+
+本来の形: import の別名（`import Syntax.{LocalFn as LocalFnNode}`）．
+
+行き先: proposal．同じ名前を持つ2つのモジュールを1つのモジュールで使う場面は、HIR と構文木のように層を分けたプログラムで必ず起きる．
+
 ## std
 
 ### S1. String を位置で読めない
@@ -205,6 +215,16 @@ pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
 本来の形: `String.from_code_points(List[Int]) -> String`．または位置をバイトかコードポイントで指定する `String.slice`．
 
 行き先: 本体 issue（std への追加）．パーサーやテンプレート処理など、文字列を走査するプログラム全般で必要になる．
+
+### S2. Option に filter がない
+
+やりたかったこと: `scope.get(name)` の結果を、見つかった定義が trait か effect のときだけ残す．
+
+実際に書いたコード: `keep(o, f)` を自分で書いた．自分のモジュールの関数なので `o.keep(f)` とメソッドでは呼べず（`[type.rules]`）、`keep(scope.types.get(name).map(...), |d| ...)` と入れ子になる．
+
+本来の形: `Option.filter`．List にはある．
+
+行き先: 本体 issue（std への追加）．
 
 ## ツール
 

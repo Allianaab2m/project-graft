@@ -1,0 +1,36 @@
+type User(id: Int, name: String)
+
+type Pair[A, B](first: A, second: B)
+
+type Todo(
+  id:        Int,
+  title:     String,
+  completed: Bool,
+)
+
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+
+enum Tree[Item] {
+  Leaf
+  Node(Tree[Item], Item, Tree[Item])
+}
+
+type Config(port: Int)
+
+const MAX_RETRY = 3
+const DEFAULT_CONFIG = Config(port: 8080)
+
+fn make() -> (User, Pair[Int, String], Shape, ()) {
+  (User(id: 1, name: "a"), Pair(1, second: "b"), Circle(1.0), ())
+}
+
+fn retry(n: Int) -> Bool {
+  n match {
+    MAX_RETRY -> False
+    _         -> True
+  }
+}

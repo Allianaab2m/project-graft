@@ -1,0 +1,7 @@
+import Codec
+
+trait Codec {
+  fn encode(self) -> String
+}
+
+fn f() { Codec.encode() }

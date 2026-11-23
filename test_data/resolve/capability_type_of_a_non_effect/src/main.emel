@@ -1,0 +1,9 @@
+effect Db {
+  fn query(q: String) -> Int
+}
+
+handler PrimaryDb: Db {
+  fn query(q) { 1 }
+}
+
+fn f[A](a: use Int, b: use A, c: use PrimaryDb, d: use Missing) { () }

@@ -1,0 +1,69 @@
+import Effects.{Logger, Users, Clock, Config, User, NotFound}
+
+pub handler ConsoleLogger: Logger {
+  fn info(msg) { console_log(msg) }
+}
+
+@external(js, "console.log")
+fn console_log(msg: String) -> ()
+
+@external(js, "pg.connect")
+fn pg_connect(url: String) -> Connection
+
+@external(js, "pg.close")
+fn pg_close(conn: Connection) -> ()
+
+@external
+type Connection
+
+pub handler PostgresUsers(conn: Connection): Users {
+  init {
+    config = use Config
+    PostgresUsers(conn: pg_connect(config.db_url()))
+  }
+
+  release {
+    pg_close(self.conn)
+  }
+
+  fn find(id) { todo() }
+}
+
+pub handler EnvConfig: Config {
+  fn db_url() { "postgres://" }
+}
+
+pub handler JsClock: Clock {
+  suspend fn sleep(ms, resume) {
+    resume(())
+  }
+  fn now() { todo() }
+}
+
+pub layer AppLive {
+  EnvConfig
+  ConsoleLogger
+  JsClock
+  PostgresUsers
+}
+
+fn greet(id: Int) {
+  log   = use Logger
+  users = use Users
+
+  user = users.find(id) |> Option.or_fail(NotFound(id:))
+  log.info("hello #{user.name}")
+
+  (use Clock).sleep(1000)
+  user
+}
+
+fn main() {
+  with AppLive { greet(1) }
+  with AppLive, ConsoleLogger {
+    primary = use Logger
+    with ConsoleLogger {
+      primary.info("x")
+    }
+  }
+}

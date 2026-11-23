@@ -1,0 +1,13 @@
+pub effect Kv {
+  fn get(key: String) -> String
+}
+
+handler WorkerKv(binding: String): Kv {
+  init(binding: String) { WorkerKv(binding:) }
+  fn get(key) { binding }
+}
+
+fn main(base: Int) {
+  with WorkerKv(binding: "a", ..base) { (use Kv).get("a") }
+  with WorkerKv(binding: missing) { (use Kv).get("a") }
+}

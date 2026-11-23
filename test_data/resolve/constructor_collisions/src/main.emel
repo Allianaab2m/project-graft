@@ -1,0 +1,20 @@
+enum Color {
+  Red
+  Green
+}
+
+enum Light {
+  Red
+  Yellow
+}
+
+type Green(x: Int)
+
+enum Maybe[A] {
+  Some(A)
+  None
+}
+
+fn f() -> Maybe[Int] {
+  Some(1)
+}

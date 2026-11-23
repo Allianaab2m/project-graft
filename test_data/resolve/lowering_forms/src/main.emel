@@ -1,0 +1,60 @@
+type Point(x: Int, y: Int)
+const MAX: Int = 3
+
+fn ops(a: Int, b: Bool, f: Float) -> Bool {
+  c = a + a - a * a / a % a
+  d = a == a && a != a || a < a && a <= a && a > a && a >= a
+  e = !b
+  g = -f
+  h = a |> ops
+  assert b
+  i = 1_000 + 2
+  j = 2.5
+  k = ""
+  l = "plain"
+  m = "x #{a} y #{f}"
+  b
+}
+
+fn binding_patterns(p: Point, xs: List[Int], s: String, n: Int, o: Option[Int]) {
+  _ = p
+  Option.None = o
+  MAX = n
+  "s" = s
+  -1 = n
+  () = ()
+  Point(x:, y: _) = p
+  [first, ..rest] = xs
+  [only] = xs
+}
+
+fn match_patterns(n: Int, xs: List[Int], u: (), f: Float, p: Point, s: String) -> Int {
+  n match {
+    -1 -> 0
+    0 -> 1
+    MAX -> 2
+    _ -> 3
+  }
+  xs match {
+    [a, ..] -> a
+    [] -> 0
+  }
+  f match {
+    -1.5 -> 0
+    _ -> 1
+  }
+  u match {
+    () -> 0
+  }
+  p match {
+    Point(x:, ..) -> x
+  }
+  s match {
+    "a" -> 1
+    _ -> 2
+  }
+}
+
+fn update(p: Point) -> Point {
+  Point(x: 1, ..p)
+}

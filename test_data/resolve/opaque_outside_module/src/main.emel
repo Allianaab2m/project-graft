@@ -1,0 +1,12 @@
+import Email
+import Email.{Email, Raw}
+
+fn f(e: Email) {
+  a = Email(value: "x")
+  b = Email.Email(value: "y")
+  c = Raw("z")
+  Email(value:) = e
+  Email.make() match {
+    Email(value: v) -> v
+  }
+}

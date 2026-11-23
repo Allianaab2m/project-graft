@@ -1,0 +1,20 @@
+fn zip[A, B](xs: List[A], ys: List[B], from: Int) -> List[(A, B)] {
+  fn onto(xs: List[A], ys: List[B], acc: List[(A, B)]) -> List[(A, B)] {
+    x = from
+    onto(xs, ys, acc)
+  }
+  onto(xs, ys, [])
+}
+
+fn length(xs: List[Int]) -> Int {
+  # A parameter of the same name hides the local fn in its body.
+  fn go(go: Int) -> Int { go }
+  # A later binding hides the local fn.
+  go = 1
+  go
+}
+
+fn hides_top_level() -> Int {
+  fn length(n: Int) -> Int { n }
+  length(1)
+}

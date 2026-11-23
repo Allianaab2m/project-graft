@@ -1,0 +1,31 @@
+type User(id: Int)
+enum Shape {
+  Empty
+}
+error NotFound(id: Int)
+effect Logger {
+  fn info(msg: String) -> ()
+}
+handler Console: User {
+  fn info(msg) { self }
+}
+layer App { Logger, Console }
+
+fn f(x: Logger) -> Int fails User uses { Console } {
+  log = use User
+  with Logger { 1 }
+  fail Empty
+  y = 1 escape {
+    Empty -> 2
+  }
+  Logger.info("x")
+  z = Int
+  s = self
+  1
+}
+
+fn g(self) -> Self { 1 }
+
+impl User: Show {
+  fn display(self) { "" }
+}

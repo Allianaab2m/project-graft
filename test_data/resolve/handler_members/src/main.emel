@@ -1,0 +1,41 @@
+effect ReadFile {
+  fn read(max: Int) -> Int
+}
+
+effect Files {
+  suspend handler Open(path: String): ReadFile
+  fn count() -> Int
+}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+handler ConsoleLogger: Logger {
+  fn info(msg) { () }
+}
+
+handler SystemFiles: Files {
+  handler Open(path: String): ReadFile {
+    init(path: String) { Self(path:) }
+    fn read(max) { max }
+  }
+
+  fn count() { 0 }
+}
+
+handler TracedFiles: Files {
+  handler Open(inner: use ReadFile): ReadFile {
+    init(path: String) { Self(inner: Files.Open(path)) }
+    fn read(max) { self.inner.read(max) }
+  }
+
+  fn count() { 0 }
+}
+
+fn open_in(fs: use Files, path: String) -> Int {
+  with f = fs.Open(path), g = Files.Open("b"), log = ConsoleLogger {
+    log.info(path)
+    f.read(g.read(1))
+  }
+}

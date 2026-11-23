@@ -1,0 +1,40 @@
+effect Query {
+  fn query(sql: String) -> Int
+}
+
+effect Execute {
+  fn execute(sql: String) -> ()
+}
+
+effect State[S] {
+  fn get() -> S
+}
+
+effect Files {
+  handler Lock(path: String): Query + Execute
+}
+
+effect Pool {
+  fn size() -> Int
+}
+
+handler SystemTx(conn: Int): Query + Execute + State[Int] {
+  init(conn: Int) { SystemTx(conn:) }
+  fn query(sql) { self.conn }
+  fn execute(sql) { () }
+  fn get() { self.conn }
+}
+
+handler SystemFiles: Files + Pool {
+  handler Lock(path: String): Query + Execute {
+    init(path: String) { Self(path:) }
+    fn query(sql) { 0 }
+    fn execute(sql) { () }
+  }
+
+  fn size() { 1 }
+}
+
+fn copy(src: use Query, dst: use Query + Execute + State[Int]) -> () {
+  dst.execute(src.query(""))
+}

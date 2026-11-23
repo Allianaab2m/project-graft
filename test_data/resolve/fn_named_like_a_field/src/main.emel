@@ -1,0 +1,15 @@
+pub type Request(headers: List[String], url: String)
+
+pub error NotFound(id: Int)
+
+pub type Pair[A](left: A, right: A)
+
+pub fn headers(req: Request, name: String) -> List[String] { req.headers }
+
+fn url(n: Int) -> Int { n }
+
+fn other(name: String, req: Request) -> Int { 0 }
+
+fn id(e: NotFound) -> Int { e.id }
+
+fn left[A](p: Pair[A]) -> A { p.left }

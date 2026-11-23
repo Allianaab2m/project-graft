@@ -1,0 +1,10 @@
+type User(id: Int)
+error NotFound(id: Int)
+
+fn f() -> Int fails NotFound { fail NotFound(id: 1) }
+
+fn g() {
+  a = f() escape { _ -> 0 }
+  b = f() escape { e -> 0 }
+  c = f() escape { User(_) -> 0 }
+}

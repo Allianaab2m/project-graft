@@ -1,0 +1,4 @@
+pub fn open() { 1 }
+fn secret() { 2 }
+type Hidden(x: Int)
+pub type Shown(x: Int)

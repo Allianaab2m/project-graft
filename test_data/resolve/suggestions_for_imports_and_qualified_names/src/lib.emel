@@ -1,0 +1,2 @@
+import Util.{opener}
+pub fn open() { 1 }

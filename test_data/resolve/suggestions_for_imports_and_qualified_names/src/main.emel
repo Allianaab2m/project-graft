@@ -1,0 +1,5 @@
+import Lib.{opne, openr}
+
+fn f() {
+  Shw.show(1)
+}

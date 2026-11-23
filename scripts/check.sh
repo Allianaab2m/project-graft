@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # M3: compares the diagnostics of `graft check` and `emela check` (tools/oracle check) on what
 # the emela checkout writes to be checked (the test programs of emela-codegen-c and emela-cli, and
-# the projects of examples/ and tests/laws), and on the cases with errors in test_data/check.
+# the projects of examples/ and tests/laws), and on the cases with errors in test_data/check and
+# test_data/resolve.
 # Only the codes Graft reports so far are compared.
 # usage: scripts/check.sh <path to emela-lang/emela>
 set -euo pipefail
@@ -10,8 +11,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 oracle="$root/tools/oracle/target/release/graft-oracle"
 graft="$root/target/emela/native/main"
 core="$emela_repo/crates/emela-core/lib"
-# The codes Graft reports: syntax (E01xx), modules and the import graph (E0201 to E0210), files.
-implemented='^[a-z]*\[(E01[0-9][0-9]|E020[0-9]|E0210|E09[0-9][0-9])\]'
+# The codes Graft reports: syntax (E01xx), modules and the import graph (E0201 to E0210), name
+# resolution (E0211 to E0225, W0201, W0202, E0328, E0334), files (E09xx).
+implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|W020[12]|E0328|E0334|E09[0-9][0-9])\]'
 # Paths are printed as given (Graft) or relative to the current directory (the oracle), so the
 # cases of this repository are passed relative to its root.
 cd "$root"
@@ -28,6 +30,8 @@ while IFS= read -r unit; do units+=("$unit"); done < <(
   echo test_data/check/cycle/src/cee.emel
   echo test_data/check/proj
   echo test_data/check
+  # The inputs of the name resolution tests of emela-resolve (tests/resolve.rs).
+  for dir in test_data/resolve/*/; do echo "${dir%/}"; done
 )
 total=0
 failed=0

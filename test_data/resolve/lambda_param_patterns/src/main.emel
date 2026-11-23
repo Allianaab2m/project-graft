@@ -1,0 +1,3 @@
+fn f(xs: List[(Int, Int)]) -> Int {
+  List.fold(xs, from: 0, f: |acc, (a, _): (Int, Int)| acc + a)
+}

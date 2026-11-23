@@ -1,0 +1,17 @@
+type User(id: Int)
+error NotFound(id: Int)
+
+fn f(count: Int) -> Strng {
+  x = cout + 1
+  y = Usr(id: 1)
+  z = Lisst.map([], |a| a)
+  w = List.mapp([], |a| a)
+  v = Show.shw(1)
+  u = Undefined
+  x match {
+    Nothing -> 1
+    MISSING -> 2
+  }
+}
+
+fn g[A](a: B) -> A fails NotFonud uses { Loger } { a }

@@ -1,0 +1,16 @@
+import Email
+import Email.{Email, InvalidEmail}
+
+fn register(input: String) -> Email.Email fails InvalidEmail {
+  Email.parse(input)
+}
+
+fn show(email: Email) -> String {
+  Email.to_string(email)
+}
+
+fn safe(input: String) -> Option[Email] {
+  Some(Email.parse(input)) escape {
+    InvalidEmail(input: _) -> None
+  }
+}

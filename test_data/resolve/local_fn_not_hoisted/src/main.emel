@@ -1,0 +1,12 @@
+fn f() -> Int {
+  a = before(1)
+  fn even(n: Int) -> Bool { if n == 0 { True } else { odd(n - 1) } }
+  fn odd(n: Int) -> Bool { if n == 0 { False } else { even(n - 1) } }
+  fn before(n: Int) -> Int { later }
+  later = 1
+  inner = {
+    fn hidden() -> Int { 1 }
+    hidden()
+  }
+  hidden()
+}

@@ -1,0 +1,24 @@
+pub type User(id: Int, name: String)
+
+pub error NotFound(id: Int)
+
+pub effect Logger {
+  fn info(msg: String) -> ()
+}
+
+pub effect Users {
+  fn find(id: Int) -> Option[User]
+}
+
+pub effect Config {
+  fn db_url() -> String
+}
+
+pub effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+  fn now() -> Time.Instant
+}
+
+fn update[A, R: Immediate](x: A, f: fn(A) -> A uses { R }) -> A uses { R } {
+  f(x)
+}

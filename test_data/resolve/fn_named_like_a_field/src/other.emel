@@ -1,0 +1,3 @@
+import Main.{Request}
+
+fn headers(req: Request) -> List[String] { req.headers }

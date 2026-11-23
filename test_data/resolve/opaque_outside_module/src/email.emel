@@ -1,0 +1,9 @@
+pub opaque type Email(value: String)
+pub opaque enum Token {
+  Raw(String)
+}
+pub fn make() -> Email { Email(value: "") }
+fn inside(e: Email) -> String {
+  Email(value:) = e
+  value
+}

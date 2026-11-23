@@ -1,0 +1,418 @@
+## HIR: a tree in which every name points to a definition or a local. Type checking sees only
+## this. Follows `hir.rs` of the reference implementation.
+##
+## Definitions, locals, expressions, patterns and types live in tables for the whole program,
+## keyed by an Int id, so references across modules are plain ids. Every node has a position
+## (`Span`). Prelude definitions built in have no source, so their position is `None`.
+##
+## The variants of expressions, patterns and types start with E, P and T, so that they do not
+## clash with the syntax kinds of the same name.
+import Std.Map.{Map}
+
+## A range of a module's source. A module is one file.
+pub type Span(module: Int, start: Int, end: Int) derive Eq
+
+pub enum DefModule {
+  SourceModule(id: Int)
+  ## The Prelude built into the compiler (spec 15.1).
+  BuiltinPrelude
+} derive Eq
+
+pub enum DefKind {
+  FnKind
+  ## `type`. Its same-named constructor is a separate CtorKind.
+  TypeKind
+  EnumKind
+  ## The constructor of a `type`, an enum variant, or of a handler from its fields.
+  CtorKind
+  ## `error`: the error tag in the type namespace, its constructor in the constructor one.
+  ErrorKind
+  ConstKind
+  EffectKind
+  ## An effect operation.
+  OpKind
+  ## A handler member of an effect (`[effect.decl]`).
+  MemberKind
+  HandlerKind
+  LayerKind
+  TraitKind
+  TraitFnKind
+  ImplKind
+  ImplFnKind
+  TypeParamKind
+  ## `Int`, `String`, `List`, ...
+  BuiltinTypeKind
+} derive Eq, Show
+
+## The English name used in diagnostic messages.
+pub fn describe(kind: DefKind) -> String {
+  kind match {
+    FnKind          -> "function"
+    TypeKind        -> "type"
+    EnumKind        -> "enum"
+    CtorKind        -> "constructor"
+    ErrorKind       -> "error"
+    ConstKind       -> "constant"
+    EffectKind      -> "effect"
+    OpKind          -> "effect operation"
+    MemberKind      -> "handler member"
+    HandlerKind     -> "handler"
+    LayerKind       -> "layer"
+    TraitKind       -> "trait"
+    TraitFnKind     -> "trait function"
+    ImplKind        -> "impl"
+    ImplFnKind      -> "impl function"
+    TypeParamKind   -> "type parameter"
+    BuiltinTypeKind -> "type"
+  }
+}
+
+pub type DefData(
+  name: String,
+  kind: DefKind,
+  module: DefModule,
+  ## The enclosing definition: the enum of a variant, the effect of an operation, the declaration
+  ## a type parameter belongs to.
+  parent: Option[Int],
+  span: Option[Span],
+  is_pub: Bool,
+  is_opaque: Bool,
+)
+
+pub enum LocalKind {
+  ParamLocal
+  SelfLocal
+  LambdaParamLocal
+  ## The parameter in place of a pattern of a lambda (`|(a, b)| ...`). The body starts with a
+  ## binding of the pattern to it.
+  PatParamLocal
+  BindingLocal
+  LocalFnLocal
+  ArmBindingLocal
+} derive Eq
+
+pub type LocalData(name: String, kind: LocalKind, span: Span)
+
+pub enum Res {
+  ResDef(def: Int)
+  ResLocal(local: Int)
+  ## Already reported.
+  ResErr
+} derive Eq
+
+## A name of a label (named argument, field pattern) and where it is written.
+pub type Label(name: String, span: Span)
+
+pub type TypeRef(kind: TypeKind, span: Option[Span])
+
+pub enum TypeKind {
+  ## Named types and type parameters: `List[Int]`, `Email.Email`, `A`.
+  TPath(res: Res, args: List[Int])
+  TSelf
+  TUnit
+  TTuple(elems: List[Int])
+  TFn(params: List[Int], ret: Option[Int], fails: Option[ErrorSet], uses: Option[EffectSet])
+  ## `use E1 + ... + En`.
+  TCap(effects: List[EffectRef])
+  ## An error set written as a type argument (`Handler[NotFound | Timeout, R]`).
+  TErrorSet(set: ErrorSet)
+  ## A braced set written as a type argument (`Handler[E, { Db, Log }]`, `{}`).
+  TEffectSet(set: EffectSet)
+  TMissing
+}
+
+## The `fails` clause. Elements point to errors or type parameters.
+pub type ErrorSet(items: List[(Res, Span)], span: Span)
+
+## The `uses` clause. Elements point to effects or type parameters.
+pub type EffectSet(items: List[EffectRef], span: Span)
+
+## An effect with its type arguments (the `Int` of `State[Int]`).
+pub type EffectRef(res: Res, args: List[Int], span: Span)
+
+pub type Pat(kind: PatKind, span: Span)
+
+pub enum PatKind {
+  PWild
+  PBind(local: Int)
+  PLit(lit: Literal)
+  PConst(res: Res)
+  ## `args` is None without parentheses (`Empty`); `rest` is a `..`.
+  PCtor(res: Res, args: Option[List[PatArg]], rest: Bool)
+  PUnit
+  PTuple(elems: List[Int])
+  PList(elems: List[Int], rest: Option[ListRest])
+  PMissing
+}
+
+pub type PatArg(label: Option[Label], pat: Int)
+
+## `..rest` binds a name.
+pub type ListRest(binding: Option[Int], span: Span)
+
+pub enum Literal {
+  ## Digits with `_` removed. A pattern's literal may start with `-`.
+  LInt(text: String)
+  LFloat(text: String)
+  ## Without interpolation, escapes resolved.
+  LString(text: String)
+} derive Eq
+
+pub type Expr(kind: ExprKind, span: Span)
+
+pub enum BinaryOp {
+  OpAdd
+  OpSub
+  OpMul
+  OpDiv
+  OpRem
+  OpEq
+  OpNe
+  OpLt
+  OpLe
+  OpGt
+  OpGe
+  OpAnd
+  OpOr
+  ## `|>`.
+  OpPipe
+} derive Eq
+
+pub enum UnaryOp {
+  OpNot
+  OpNeg
+} derive Eq
+
+pub enum StrPart {
+  SText(text: String)
+  SInterp(expr: Int)
+}
+
+pub enum ExprKind {
+  EMissing
+  ELit(lit: Literal)
+  EInterpolated(parts: List[StrPart])
+  ## Locals, functions, consts, constructors, `Trait.f`, `Module.f`.
+  EPath(res: Res)
+  ## A field or capability operation `x.name`, looked up by type checking.
+  EField(base: Int, name: Label)
+  ECall(callee: Int, args: List[Arg])
+  EUnary(op: UnaryOp, operand: Int)
+  EBinary(op: BinaryOp, lhs: Int, rhs: Int)
+  EUnit
+  ETuple(elems: List[Int])
+  EList(elems: List[Int], rest: Option[Int])
+  EBlock(block: Block)
+  EIf(cond: Int, then_branch: Int, else_branch: Option[Int])
+  EMatch(scrutinee: Int, arms: List[Arm])
+  EEscape(expr: Int, arms: List[Arm])
+  EFail(expr: Int)
+  EAssert(expr: Int)
+  ## A record update `C(f: e, ..base)`; `fields` holds only named arguments.
+  EUpdate(ctor: Int, fields: List[Arg], base: Int)
+  ## `use X`, with the effect's type arguments.
+  EUse(target: Res, args: List[Int])
+  EWith(handlers: List[WithItem], body: Int)
+  ELambda(params: List[Param], body: Int)
+}
+
+## An item of `with`: a handler, a layer, or a label; with `by`, `res` is the label and `by` what
+## is plugged into it.
+pub type WithItem(
+  res: Res,
+  span: Span,
+  ## The name the item is bound to (`src = Files.Open(path)`).
+  bind: Option[Int],
+  ## For a handler member named through a label, the label.
+  label: Option[Int],
+  ## For a handler member of a capability (`fs.Open(path)`), the capability and the member.
+  cap: Option[(Int, Label)],
+  args: Option[SupplyArgs],
+  by: Option[(Res, Span)],
+  by_args: List[Int],
+  by_init_args: Option[SupplyArgs],
+)
+
+## The arguments of a handler's init written on an item of `with` or `layer`.
+pub type SupplyArgs(args: List[Arg], span: Span)
+
+## A call argument. `punned` for the shorthand `NotFound(id:)`.
+pub type Arg(label: Option[Label], value: Int, punned: Bool)
+
+## `tail` is the value of the last statement if it is an expression.
+pub type Block(stmts: List[Stmt], tail: Option[Int])
+
+pub enum Stmt {
+  SLet(pat: Int, ty: Option[Int], value: Int)
+  SLocalFn(local_fn: LocalFn)
+  SExpr(expr: Int)
+}
+
+## A local fn (`[fn.local]`).
+pub type LocalFn(local: Int, sig: FnSig, body: Int, span: Span)
+
+pub type Arm(pat: Int, guard: Option[Int], body: Int)
+
+pub type Param(local: Int, ty: Option[Int])
+
+pub type FnSig(
+  type_params: List[TypeParam],
+  params: List[Param],
+  ret: Option[Int],
+  fails: Option[ErrorSet],
+  uses: Option[EffectSet],
+  is_suspend: Bool,
+)
+
+## A type parameter with its constraints (traits or built-in constraints).
+pub type TypeParam(def: Int, bounds: List[(Res, Span)])
+
+## `key` is the argument of `@key("...")`.
+pub type FieldDef(name: String, ty: Int, span: Span, key: Option[String])
+
+pub enum Fields {
+  NoFields
+  NamedFields(fields: List[FieldDef])
+  PositionalFields(types: List[Int])
+}
+
+pub type FnItem(
+  sig: FnSig,
+  body: Option[Int],
+  is_external: Bool,
+  externals: List[ExternalAttr],
+  is_intrinsic: Bool,
+  exports: List[ExternalAttr],
+  entries: List[EntryAttr],
+)
+
+## One `@entry(T)` on a fn: what `T` names, if it is one name or path.
+pub type EntryAttr(adapter: Option[Res], span: Span)
+
+## The arguments of `@external(target, "a", "b")` or `@export(...)`.
+pub type ExternalAttr(target: String, args: List[String], span: Span)
+
+pub type TypeItem(
+  type_params: List[TypeParam],
+  ctor: Option[Int],
+  fields: Fields,
+  derives: List[(Res, Span)],
+  is_intrinsic: Bool,
+)
+
+pub type EnumItem(
+  type_params: List[TypeParam],
+  variants: List[Int],
+  derives: List[(Res, Span)],
+  tags: List[Option[String]],
+)
+
+pub type CtorItem(owner: Int, fields: Fields)
+
+pub type ErrorItem(fields: Fields, derives: List[(Res, Span)])
+
+pub type ConstItem(ty: Option[Int], value: Int)
+
+pub type EffectItem(
+  type_params: List[TypeParam],
+  ops: List[Int],
+  members: List[Int],
+  is_intrinsic: Bool,
+  label: Option[LabelOf],
+)
+
+## The `of Console default` of a label.
+pub type LabelOf(base: Res, span: Span, args: List[Int], default: Bool)
+
+pub type OpItem(sig: FnSig)
+
+pub type MemberItem(sig: FnSig, effects: List[EffectRef])
+
+pub type HandlerItem(
+  effects: List[EffectRef],
+  fields: List[FieldDef],
+  ctor: Option[Int],
+  init: Option[Int],
+  init_params: List[Param],
+  ## `release` and its implicit `self`.
+  release: Option[(Int, Int)],
+  ops: List[HandlerOp],
+  inner: List[Int],
+  ## For an inner handler, the handler member it implements.
+  member: Option[Res],
+)
+
+pub type HandlerOp(
+  name: Label,
+  op: Res,
+  is_suspend: Bool,
+  self_local: Int,
+  params: List[Param],
+  body: Option[Int],
+)
+
+pub type LayerItem(members: List[LayerMember])
+
+pub type LayerMember(res: Res, span: Span, args: Option[SupplyArgs])
+
+pub type TraitItem(supertraits: List[(Res, Span)], fns: List[Int])
+
+pub type ImplItem(
+  trait_ref: Res,
+  type_params: List[TypeParam],
+  self_ty: Option[Int],
+  malformed_head: Bool,
+  fns: List[ImplFn],
+)
+
+pub type ImplFn(def: Int, name: Label, trait_fn: Res, params: List[Param], body: Option[Int])
+
+pub enum Item {
+  IFn(item: FnItem)
+  IType(item: TypeItem)
+  IEnum(item: EnumItem)
+  ICtor(item: CtorItem)
+  IError(item: ErrorItem)
+  IConst(item: ConstItem)
+  IEffect(item: EffectItem)
+  IOp(item: OpItem)
+  IMember(item: MemberItem)
+  IHandler(item: HandlerItem)
+  ILayer(item: LayerItem)
+  ITrait(item: TraitItem)
+  ## With a body, the default implementation.
+  ITraitFn(item: FnItem)
+  IImpl(item: ImplItem)
+}
+
+## A module's definitions in source order, whether it is a bundled core module, and the traits
+## that can be written unqualified in it.
+pub type ModuleItems(name: List[String], items: List[Int], is_core: Bool, traits: List[Int])
+
+pub type Program(
+  defs: Map[Int, DefData],
+  items: Map[Int, Item],
+  locals: Map[Int, LocalData],
+  exprs: Map[Int, Expr],
+  pats: Map[Int, Pat],
+  types: Map[Int, TypeRef],
+  modules: Map[Int, ModuleItems],
+  ## The Prelude's definitions.
+  prelude: List[Int],
+  ## Paths to a handler member named through a label (`Audit.Open`) → the label.
+  member_labels: Map[Int, Int],
+)
+
+pub fn empty_program() -> Program {
+  Program(
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    [],
+    Map.empty(),
+  )
+}

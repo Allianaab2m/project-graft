@@ -1,0 +1,25 @@
+import Http
+
+@export(js, "add")
+@export(js, "default", "add")
+@export(c, "add")
+pub fn add(a: Int, b: Int) -> Int { a + b }
+
+@export(js, "default", "run")
+fn local(app: fn(Int) -> Int, x: Int) -> Int { app(x) }
+
+@entry(local)
+@entry(Http.serve)
+fn app(x: Int) -> Int { x }
+
+@entry(missing)
+fn unknown(x: Int) -> Int { x }
+
+@entry(Http.missing)
+fn unknown_member(x: Int) -> Int { x }
+
+@entry
+fn no_arg(x: Int) -> Int { x }
+
+@entry("serve")
+fn string_arg(x: Int) -> Int { x }

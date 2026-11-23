@@ -1,0 +1,14 @@
+type User(id: Int, id: Int)
+enum User { Admin }
+fn f() { 1 }
+fn f() { 2 }
+effect Log {
+  fn info() -> ()
+  fn info() -> ()
+}
+fn g[A, A](x: Int, x: Int) {
+  (y, y) = (1, 2)
+  (1, 2) match {
+    (z, z) -> z
+  }
+}

@@ -76,7 +76,9 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
      prints the same syntax, module and import graph diagnostics as `emela check` on every unit
      of the corpus and on the cases of `test_data/check` (`scripts/check.sh`).
   2. Name resolution: lowering the tree to HIR, where every name points to its definition
-     (E0211 to E0225, W0201, W0202).
+     (E0211 to E0225, W0201, W0202, E0328, E0334). Done: the same diagnostics as `emela check` on
+     the corpus and on the 39 inputs of the name resolution tests of emela-resolve, taken into
+     `test_data/resolve`.
   3. Type checking, from monomorphic expressions to polymorphism, effects and error sets (E03xx,
      E04xx).
 

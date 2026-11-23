@@ -1,0 +1,3550 @@
+## Name resolution: collects declarations, resolves imports, and lowers declaration contents to
+## HIR, where every name points to its definition. Follows `resolve.rs`, `lower.rs` and
+## `builtins.rs` of the reference implementation (emela-resolve), which call each other; modules
+## cannot, so both are here.
+##
+## Three phases:
+##
+## 1. Collect declarations: per module, register definitions in separate namespaces (types,
+##    constructors, values)
+## 2. Imports: once every module's declarations are in, bring the listed names and modules into
+##    scope
+## 3. Lower: turn declaration contents (types, expressions, patterns) into HIR
+##
+## The built-in modules of the reference are always empty in `emela check` (`NoBuiltins`), so they
+## are left out.
+import Std.Array.{Array}
+import Std.Map.{Map}
+import Std.State.{State}
+import Cst.{
+  Node,
+  Element,
+  NodeElement,
+  TokenElement,
+  child_token,
+  children,
+  children_with_tokens,
+  descendants,
+  parent,
+  tokens,
+}
+import Hir.{
+  Span,
+  DefModule,
+  SourceModule,
+  BuiltinPrelude,
+  DefKind,
+  FnKind,
+  TypeKind,
+  EnumKind,
+  CtorKind,
+  ErrorKind,
+  ConstKind,
+  EffectKind,
+  OpKind,
+  MemberKind,
+  HandlerKind,
+  LayerKind,
+  TraitKind,
+  TraitFnKind,
+  ImplKind,
+  ImplFnKind,
+  TypeParamKind,
+  BuiltinTypeKind,
+  DefData,
+  LocalKind,
+  ParamLocal,
+  SelfLocal,
+  LambdaParamLocal,
+  PatParamLocal,
+  BindingLocal,
+  LocalFnLocal,
+  ArmBindingLocal,
+  LocalData,
+  Res,
+  ResDef,
+  ResLocal,
+  ResErr,
+  Label,
+  TypeRef,
+  TPath,
+  TSelf,
+  TUnit,
+  TTuple,
+  TFn,
+  TCap,
+  TErrorSet,
+  TEffectSet,
+  TMissing,
+  ErrorSet,
+  EffectSet,
+  EffectRef,
+  Pat,
+  PatKind,
+  PWild,
+  PBind,
+  PLit,
+  PConst,
+  PCtor,
+  PUnit,
+  PTuple,
+  PList,
+  PMissing,
+  PatArg,
+  ListRest,
+  Literal,
+  LInt,
+  LFloat,
+  LString,
+  Expr,
+  ExprKind,
+  BinaryOp,
+  OpAdd,
+  OpSub,
+  OpMul,
+  OpDiv,
+  OpRem,
+  OpEq,
+  OpNe,
+  OpLt,
+  OpLe,
+  OpGt,
+  OpGe,
+  OpAnd,
+  OpOr,
+  OpPipe,
+  OpNot,
+  OpNeg,
+  StrPart,
+  SText,
+  SInterp,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  WithItem,
+  SupplyArgs,
+  Arg,
+  Block,
+  Stmt,
+  SLet,
+  SLocalFn,
+  SExpr,
+  LocalFn,
+  Arm,
+  Param,
+  FnSig,
+  TypeParam,
+  FieldDef,
+  Fields,
+  NoFields,
+  NamedFields,
+  PositionalFields,
+  FnItem,
+  EntryAttr,
+  ExternalAttr,
+  TypeItem,
+  EnumItem,
+  CtorItem,
+  ErrorItem,
+  ConstItem,
+  EffectItem,
+  LabelOf,
+  OpItem,
+  MemberItem,
+  HandlerItem,
+  HandlerOp,
+  LayerItem,
+  LayerMember,
+  TraitItem,
+  ImplItem,
+  ImplFn,
+  Item,
+  IFn,
+  IType,
+  IEnum,
+  ICtor,
+  IError,
+  IConst,
+  IEffect,
+  IOp,
+  IMember,
+  IHandler,
+  ILayer,
+  ITrait,
+  ITraitFn,
+  IImpl,
+  ModuleItems,
+  Program,
+  describe,
+  empty_program,
+}
+import Modules.{ModuleMap, display, get, lookup, is_core}
+import Source.{slice}
+import Syntax.{
+  NodeKind,
+  Root,
+  Import,
+  ImportList,
+  Annotation,
+  AnnotArgList,
+  AnnotArg,
+  AnnotPath,
+  FnDecl,
+  TypeDecl,
+  ErrorDecl,
+  EnumDecl,
+  FieldList,
+  Field,
+  VariantList,
+  Variant,
+  TupleFieldList,
+  DeriveClause,
+  ConstDecl,
+  EffectDecl,
+  OpSig,
+  EffectLabel,
+  MemberSig,
+  HandlerDecl,
+  HandlerEffect,
+  HandlerInit,
+  HandlerRelease,
+  LayerDecl,
+  TraitDecl,
+  ImplDecl,
+  ImplType,
+  ItemList,
+  TypeParamList,
+  Path,
+  PathType,
+  TypeArgList,
+  TypeVar,
+  SelfType,
+  UnitType,
+  TupleType,
+  ParenType,
+  FnType,
+  CapType,
+  ParamTypeList,
+  RetType,
+  FailsClause,
+  UsesClause,
+  Interp,
+  WildcardPat,
+  IdentPat,
+  LiteralPat,
+  ConstPat,
+  VariantPat,
+  PatArgList,
+  FieldPat,
+  UnitPat,
+  TuplePat,
+  ListPat,
+  RestPat,
+  NameRef,
+  PathExpr,
+  UnderscoreExpr,
+  UnitExpr,
+  ParenExpr,
+  TupleExpr,
+  ListExpr,
+  RestExpr,
+  CallExpr,
+  ArgList,
+  NamedArg,
+  SpreadArg,
+  FieldExpr,
+  PrefixExpr,
+  BinExpr,
+  UseExpr,
+  FailExpr,
+  AssertExpr,
+  BlockExpr,
+  Binding,
+  IfExpr,
+  MatchExpr,
+  MatchArmList,
+  MatchArm,
+  MatchGuard,
+  WithExpr,
+  WithBy,
+  Supply,
+  WithBind,
+  CapMember,
+  EscapeExpr,
+  LambdaExpr,
+  ParamList,
+  Tree,
+}
+import Token.{
+  Kind,
+  Token,
+  is_trivia,
+  LowerName,
+  TypeName,
+  UpperName,
+  SelfKw,
+  SelfTypeKw,
+  IntLit,
+  FloatLit,
+  StringText,
+  TripleQuote,
+  Minus,
+  Bang,
+  Colon,
+  Plus,
+  Star,
+  Slash,
+  Percent,
+  Eq2,
+  Neq,
+  Lt,
+  LtEq,
+  Gt,
+  GtEq,
+  Amp2,
+  Pipe2,
+  PipeGt,
+  PubKw,
+  OpaqueKw,
+  SuspendKw,
+}
+
+# ---------------------------------------------------------------------------------------------
+# State
+
+## The namespaces of a module (`[module.resolution]`). Module names are kept apart, in
+## `Scope.modules`.
+enum Ns {
+  ## Type names: type, enum, error, effect, handler, layer, trait.
+  NsType
+  ## Type names in expressions and patterns: constructors, variants, errors, handlers with fields.
+  NsCtor
+  ## Lowercase and uppercase names: fn and const.
+  NsValue
+} derive Eq
+
+const NAMESPACES = [NsType, NsCtor, NsValue]
+
+## A name in a scope: the definition (or module), the range of its name, and whether an import
+## brought it in (then other modules do not see it).
+type Entry(target: Int, range: Option[(Int, Int)], imported: Bool)
+
+type Scope(
+  types: Map[String, Entry],
+  ctors: Map[String, Entry],
+  values: Map[String, Entry],
+  modules: Map[String, Entry],
+)
+
+## A diagnostic of name resolution, in a module.
+pub type Diag(module: Int, start: Int, end: Int, code: String, warning: Bool, message: String)
+
+## A declaration handed to the lowering phase.
+type Pending(module: Int, def: Int, item: Node, children: List[Int], ctor: Option[Int])
+
+## What the name left of `.` resolves to.
+enum DotLeft {
+  LeftModule(module: Int)
+  LeftTrait(def: Int)
+  ## An effect, whose handler members are named after `.`, and where its name is written.
+  LeftEffect(def: Int, start: Int, end: Int)
+  ## A module and an effect of the same name (`State`).
+  LeftModuleOrEffect(module: Int, def: Int, start: Int, end: Int)
+}
+
+pub type Resolver(
+  map: ModuleMap,
+  srcs: Map[Int, Array[Int]],
+  program: Program,
+  next_def: Int,
+  next_local: Int,
+  next_expr: Int,
+  next_pat: Int,
+  next_type: Int,
+  scopes: Map[Int, Scope],
+  prelude_types: Map[String, Int],
+  prelude_ctors: Map[String, Int],
+  prelude_values: Map[String, Int],
+  ## Trait functions and effect operations, by their owner.
+  members: Map[Int, List[Int]],
+  ## Effects declared as labels (`effect AuditLog of Console`).
+  labels: Map[Int, Bool],
+  ## The inner handlers of each handler, with their constructors, in declaration order.
+  inner_handlers: Map[Int, List[(Int, Option[Int])]],
+  ## Newest first.
+  diagnostics: List[Diag],
+  # The lowering of one declaration
+  module: Int,
+  ## Innermost first. Rebinding overwrites the name in the same scope.
+  locals: List[Map[String, Int]],
+  type_params: List[Map[String, Int]],
+  ## Whether `Self` may be written (inside traits and impls).
+  self_type: Bool,
+  ## The handler being lowered and its constructor, if it has one.
+  in_handler: Option[(Int, Option[Int])],
+  ## Looking up a type in a type argument position of a named type.
+  type_arg: Bool,
+  ## The type parameters written on the local fns being lowered (E0150).
+  ignored_type_params: List[String],
+  ## The label through which the last handler member was named (`Audit.Open`).
+  member_label: Option[Int],
+  ## The names bound by the pattern or parameter list being lowered, newest first.
+  binder: List[(String, Int)],
+)
+
+## `o` if its value satisfies `f`.
+fn keep[A](o: Option[A], f: fn(A) -> Bool) -> Option[A] {
+  o match {
+    Some(x) if f(x) -> o
+    _               -> None
+  }
+}
+
+fn st() -> Resolver uses { State[Resolver] } {
+  (use State[Resolver]).get()
+}
+
+fn upd(f: fn(Resolver) -> Resolver) -> () uses { State[Resolver] } {
+  s = use State[Resolver]
+  s.set(f(s.get()))
+}
+
+fn upd_program(f: fn(Program) -> Program) -> () uses { State[Resolver] } {
+  upd(|r| Resolver(program: f(r.program), ..r))
+}
+
+const NO_DEF = DefData("", FnKind, BuiltinPrelude, None, None, False, False)
+
+fn def_of(id: Int) -> DefData uses { State[Resolver] } {
+  st().program.defs.get(id).or(NO_DEF)
+}
+
+fn kind_of(id: Int) -> DefKind uses { State[Resolver] } {
+  def_of(id).kind
+}
+
+fn set_def(id: Int, data: DefData) -> () uses { State[Resolver] } {
+  upd_program(|p| Program(defs: p.defs.insert(id, data), ..p))
+}
+
+fn set_item(id: Int, item: Item) -> () uses { State[Resolver] } {
+  upd_program(|p| Program(items: p.items.insert(id, item), ..p))
+}
+
+fn item_of(id: Int) -> Option[Item] uses { State[Resolver] } {
+  st().program.items.get(id)
+}
+
+fn src_of(module: Int) -> Array[Int] uses { State[Resolver] } {
+  st().srcs.get(module).or(Array.empty())
+}
+
+fn text_of(t: Token) -> String uses { State[Resolver] } {
+  slice(src_of(st().module), t.start, t.end)
+}
+
+fn node_text(n: Node) -> String uses { State[Resolver] } {
+  slice(src_of(st().module), n.start, n.end)
+}
+
+fn span(start: Int, end: Int) -> Span uses { State[Resolver] } {
+  Span(st().module, start, end)
+}
+
+fn node_span(n: Node) -> Span uses { State[Resolver] } {
+  span(n.start, n.end)
+}
+
+fn report_in(module: Int, start: Int, end: Int, code: String, message: String) -> ()
+  uses { State[Resolver] } {
+  warning = code.starts_with("W")
+  upd(|r| {
+    Resolver(diagnostics: [Diag(module, start, end, code, warning, message), ..r.diagnostics], ..r)
+  })
+}
+
+fn report(start: Int, end: Int, code: String, message: String) -> () uses { State[Resolver] } {
+  report_in(st().module, start, end, code, message)
+}
+
+fn report_token(t: Token, code: String, message: String) -> () uses { State[Resolver] } {
+  report(t.start, t.end, code, message)
+}
+
+fn report_node(n: Node, code: String, message: String) -> () uses { State[Resolver] } {
+  report(n.start, n.end, code, message)
+}
+
+fn alloc_def(
+  module: Int,
+  name: String,
+  start: Int,
+  end: Int,
+  kind: DefKind,
+  parent: Option[Int],
+) -> Int uses { State[Resolver] } {
+  (is_pub, is_opaque) = parent match {
+    Some(p) if kind == CtorKind -> {
+      d = def_of(p)
+      (d.is_pub, d.is_opaque)
+    }
+    _ -> (False, False)
+  }
+  id = st().next_def
+  data = DefData(
+    name,
+    kind,
+    SourceModule(module),
+    parent,
+    Some(Span(module, start, end)),
+    is_pub,
+    is_opaque,
+  )
+  upd(|r| Resolver(next_def: id + 1, ..r))
+  set_def(id, data)
+  id
+}
+
+fn alloc_local(name: String, kind: LocalKind, start: Int, end: Int) -> Int
+  uses { State[Resolver] } {
+  id = st().next_local
+  data = LocalData(name, kind, span(start, end))
+  upd(|r| {
+    Resolver(
+      next_local: id + 1,
+      program: Program(locals: r.program.locals.insert(id, data), ..r.program),
+      ..r,
+    )
+  })
+  id
+}
+
+fn alloc_expr(kind: ExprKind, start: Int, end: Int) -> Int uses { State[Resolver] } {
+  id = st().next_expr
+  e = Expr(kind, span(start, end))
+  upd(
+    |r| Resolver(
+      next_expr: id + 1,
+      program: Program(exprs: r.program.exprs.insert(id, e), ..r.program),
+      ..r,
+    ),
+  )
+  id
+}
+
+fn alloc_pat(kind: PatKind, start: Int, end: Int) -> Int uses { State[Resolver] } {
+  id = st().next_pat
+  p = Pat(kind, span(start, end))
+  upd(
+    |r| Resolver(
+      next_pat: id + 1,
+      program: Program(pats: r.program.pats.insert(id, p), ..r.program),
+      ..r,
+    ),
+  )
+  id
+}
+
+fn alloc_type(kind: Hir.TypeKind, start: Int, end: Int) -> Int uses { State[Resolver] } {
+  id = st().next_type
+  t = TypeRef(kind, Some(span(start, end)))
+  upd(
+    |r| Resolver(
+      next_type: id + 1,
+      program: Program(types: r.program.types.insert(id, t), ..r.program),
+      ..r,
+    ),
+  )
+  id
+}
+
+fn scope_of(module: Int) -> Scope uses { State[Resolver] } {
+  st().scopes.get(module).or(Scope(Map.empty(), Map.empty(), Map.empty(), Map.empty()))
+}
+
+fn ns_map(scope: Scope, ns: Ns) -> Map[String, Entry] {
+  ns match {
+    NsType  -> scope.types
+    NsCtor  -> scope.ctors
+    NsValue -> scope.values
+  }
+}
+
+fn with_ns(scope: Scope, ns: Ns, names: Map[String, Entry]) -> Scope {
+  ns match {
+    NsType  -> Scope(types: names, ..scope)
+    NsCtor  -> Scope(ctors: names, ..scope)
+    NsValue -> Scope(values: names, ..scope)
+  }
+}
+
+fn set_scope(module: Int, scope: Scope) -> () uses { State[Resolver] } {
+  upd(|r| Resolver(scopes: r.scopes.insert(module, scope), ..r))
+}
+
+fn scope_get(module: Int, ns: Ns, name: String) -> Option[Entry] uses { State[Resolver] } {
+  ns_map(scope_of(module), ns).get(name)
+}
+
+fn prelude_map(ns: Ns) -> Map[String, Int] uses { State[Resolver] } {
+  r = st()
+  ns match {
+    NsType  -> r.prelude_types
+    NsCtor  -> r.prelude_ctors
+    NsValue -> r.prelude_values
+  }
+}
+
+## If the namespace already has the name, reports a duplicate and keeps the earlier one.
+## Re-importing the same definition is not a duplicate.
+fn insert_name(module: Int, ns: Ns, name: String, entry: Entry) -> () uses { State[Resolver] } {
+  scope = scope_of(module)
+  ns_map(scope, ns).get(name) match {
+    Some(first) -> {
+      if first.target != entry.target {
+        entry.range match {
+          Some((start, end)) -> report_in(module, start, end, "E0213", "`#{name}` is defined twice")
+          None               -> ()
+        }
+      }
+    }
+    None -> set_scope(module, with_ns(scope, ns, ns_map(scope, ns).insert(name, entry)))
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Syntax helpers (the accessors of the reference's `ast` module)
+
+fn child_kind(n: Node, kind: NodeKind) -> Option[Node] {
+  children(n).find(|c| c.kind == kind)
+}
+
+fn children_of(n: Node, kind: NodeKind) -> List[Node] {
+  children(n).filter(|c| c.kind == kind)
+}
+
+fn child_tokens(n: Node) -> List[Token] {
+  children_with_tokens(n).filter_map(|e| {
+    e match {
+      TokenElement(t) -> Some(t)
+      NodeElement(_)  -> None
+    }
+  })
+}
+
+fn has_token(n: Node, kind: Kind) -> Bool {
+  child_token(n, kind).is_some()
+}
+
+## The name of a declaration: its first lower, type or upper name token.
+fn decl_name(n: Node) -> Option[Token] {
+  child_tokens(n).find(|t| t.kind == LowerName || t.kind == TypeName || t.kind == UpperName)
+}
+
+## The items of a declaration body (`ITEM_LIST`) of `kind`.
+fn body_items(n: Node, kind: NodeKind) -> List[Node] {
+  child_kind(n, ItemList).map(|list| children_of(list, kind)).or([])
+}
+
+## The block of an item of a declaration body (`init { ... }`).
+fn item_block(n: Node, kind: NodeKind) -> Option[Node] {
+  child_kind(n, ItemList).and_then(|list| child_kind(list, kind)).and_then(
+    |it| child_kind(it, BlockExpr),
+  )
+}
+
+fn annotations(n: Node) -> List[Node] {
+  children_of(n, Annotation)
+}
+
+fn annotation_name(a: Node) -> Option[String] uses { State[Resolver] } {
+  child_token(a, LowerName).map(text_of)
+}
+
+fn has_annotation(n: Node, name: String) -> Bool uses { State[Resolver] } {
+  annotations(n).any(|a| annotation_name(a) == Some(name))
+}
+
+fn annotation_args(a: Node) -> List[Node] {
+  child_kind(a, AnnotArgList).map(children).or([])
+}
+
+## The type name tokens of a path.
+fn segments(path: Node) -> List[Token] {
+  child_tokens(path).filter(|t| t.kind == TypeName)
+}
+
+fn is_expr(kind: NodeKind) -> Bool {
+  [
+    Syntax.Literal,
+    Syntax.String,
+    NameRef,
+    PathExpr,
+    UnderscoreExpr,
+    UnitExpr,
+    ParenExpr,
+    TupleExpr,
+    ListExpr,
+    CallExpr,
+    FieldExpr,
+    PrefixExpr,
+    BinExpr,
+    UseExpr,
+    FailExpr,
+    AssertExpr,
+    BlockExpr,
+    IfExpr,
+    MatchExpr,
+    WithExpr,
+    EscapeExpr,
+    LambdaExpr,
+  ].any(|k| k == kind)
+}
+
+## The reference's `Expr::cast`, which also takes `..expr`.
+fn casts_to_expr(kind: NodeKind) -> Bool {
+  is_expr(kind) || kind == RestExpr
+}
+
+fn is_pat(kind: NodeKind) -> Bool {
+  [WildcardPat, IdentPat, LiteralPat, ConstPat, VariantPat, UnitPat, TuplePat, ListPat].any(|k| {
+    k == kind
+  })
+}
+
+# ---------------------------------------------------------------------------------------------
+# The built-in Prelude (`builtins.rs`)
+
+## Definitions of the Prelude without source. The bundled `prelude.emel` overrides the names it
+## defines (`use_core_prelude`).
+fn build_prelude() -> () uses { State[Resolver] } {
+  add = |name, kind, parent| {
+    id = st().next_def
+    data = DefData(name, kind, BuiltinPrelude, parent, None, True, False)
+    upd(|r| Resolver(next_def: id + 1, ..r))
+    set_def(id, data)
+    if parent.is_none() || kind == CtorKind {
+      upd_program(|p| Program(prelude: p.prelude.append([id]), ..p))
+    }
+    id
+  }
+  ["Int", "Int64", "Float", "String", "Never", "List"].each(|n| {
+    add(n, BuiltinTypeKind, None)
+    ()
+  })
+  enum_of = |name: String, variants: List[String]| {
+    e = add(name, EnumKind, None)
+    vs = variants.map(|v| add(v, CtorKind, Some(e)))
+    vs.each(|v| set_item(v, ICtor(CtorItem(e, NoFields))))
+    (e, vs)
+  }
+  (b, bvs) = enum_of("Bool", ["True", "False"])
+  set_item(b, IEnum(EnumItem([], bvs, [], [])))
+  option = add("Option", EnumKind, None)
+  a = add("A", TypeParamKind, Some(option))
+  some = add("Some", CtorKind, Some(option))
+  none = add("None", CtorKind, Some(option))
+  a_ty = st().next_type
+  upd(|r| {
+    Resolver(
+      next_type: a_ty + 1,
+      program: Program(
+        types: r.program.types.insert(a_ty, TypeRef(TPath(ResDef(a), []), None)),
+        ..r.program,
+      ),
+      ..r,
+    )
+  })
+  set_item(none, ICtor(CtorItem(option, NoFields)))
+  set_item(option, IEnum(EnumItem([TypeParam(a, [])], [some, none], [], [])))
+  set_item(some, ICtor(CtorItem(option, PositionalFields([a_ty]))))
+  (o, ovs) = enum_of("Ordering", ["Less", "Equal", "Greater"])
+  set_item(o, IEnum(EnumItem([], ovs, [], [])))
+  [("Eq", ["eq"]), ("Ord", ["compare"]), ("Show", ["show"]), ("Immediate", [])].each(|(name, fns)| {
+    t = add(name, TraitKind, None)
+    ids = fns.map(|f| add(f, TraitFnKind, Some(t)))
+    set_item(t, ITrait(TraitItem([], ids)))
+  })
+  ["Async", "ProcessHost", "PageHost"].each(|name| {
+    e = add(name, EffectKind, None)
+    set_item(e, IEffect(EffectItem([], [], [], False, None)))
+  })
+  ["panic", "todo", "dbg", "inspect"].each(|name| {
+    add(name, FnKind, None)
+    ()
+  })
+  # The Prelude by namespace, and the trait functions by trait.
+  r = st()
+  r.program.prelude.each(|id| {
+    d = def_of(id)
+    ns = d.kind match {
+      CtorKind -> NsCtor
+      FnKind   -> NsValue
+      _        -> NsType
+    }
+    set_prelude(ns, d.name, id)
+  })
+  members = r.program.defs.fold(Map.empty(), |m, id, d| {
+    (d.kind, d.parent) match {
+      (TraitFnKind, Some(p)) -> m.insert(p, m.get(p).or([]).append([id]))
+      _                      -> m
+    }
+  })
+  upd(|r2| Resolver(members:, ..r2))
+}
+
+fn set_prelude(ns: Ns, name: String, id: Int) -> () uses { State[Resolver] } {
+  upd(|r| {
+    ns match {
+      NsType  -> Resolver(prelude_types: r.prelude_types.insert(name, id), ..r)
+      NsCtor  -> Resolver(prelude_ctors: r.prelude_ctors.insert(name, id), ..r)
+      NsValue -> Resolver(prelude_values: r.prelude_values.insert(name, id), ..r)
+    }
+  })
+}
+
+## If the bundled core has a `Prelude`, its pub definitions override the Prelude names.
+fn use_core_prelude() -> () uses { State[Resolver] } {
+  core_module("Prelude") match {
+    None -> ()
+    Some(prelude) -> {
+      NAMESPACES.each(|ns| {
+        ns_map(scope_of(prelude), ns).fold([], |acc, name, e| {
+          if !e.imported && def_of(e.target).is_pub { acc.append([(name, e.target)]) } else { acc }
+        }).each(|(name, def)| {
+          old = prelude_map(ns).get(name)
+          set_prelude(ns, name, def)
+          upd_program(|p| {
+            kept = old.map(|o| p.prelude.filter(|d| d != o)).or(p.prelude)
+            Program(prelude: if kept.any(|d| d == def) { kept } else { kept.append([def]) }, ..p)
+          })
+        })
+      })
+    }
+  }
+}
+
+## A single-segment bundled core module. Can be written left of `.` without an import.
+fn core_module(name: String) -> Option[Int] uses { State[Resolver] } {
+  m = st().map
+  keep(lookup(m, [name]), |id| is_core(m, id))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Collecting declarations
+
+fn collect(module: Int, root: Node) -> List[Pending] uses { State[Resolver] } {
+  upd(|r| Resolver(module:, ..r))
+  (pending, _) = children(root).fold(([], 0), |(acc, impls), item| {
+    kind = decl_kind(item.kind)
+    kind match {
+      None -> (acc, impls)
+      Some(k) -> {
+        if k != FnKind {
+          # A built-in effect (`Scope`) and a built-in type (`Bytes`) are marked `@intrinsic`.
+          allowed = k == EffectKind || (k == TypeKind && child_kind(item, FieldList).is_none())
+          check_intrinsic(module, item, allowed)
+        }
+        name_token = if item.kind == FnDecl {
+          child_token(item, LowerName)
+        } else if item.kind == ConstDecl {
+          child_token(item, UpperName)
+        } else {
+          decl_name(item)
+        }
+        named = name_token match {
+          Some(t)               -> Some((text_of(t), t.start, t.end, impls))
+          None if k == ImplKind -> Some(("impl##{impls + 1}", item.start, item.end, impls + 1))
+          None                  -> None
+        }
+        named match {
+          # A declaration whose name could not be read already has a syntax diagnostic.
+          None -> (acc, impls)
+          Some((name, start, end, count)) -> {
+            p = collect_one(module, item, k, name, start, end)
+            (acc.append([p]), count)
+          }
+        }
+      }
+    }
+  })
+  pending
+}
+
+fn decl_kind(kind: NodeKind) -> Option[DefKind] {
+  [
+    (FnDecl, FnKind),
+    (TypeDecl, TypeKind),
+    (EnumDecl, EnumKind),
+    (ErrorDecl, ErrorKind),
+    (ConstDecl, ConstKind),
+    (EffectDecl, EffectKind),
+    (HandlerDecl, HandlerKind),
+    (LayerDecl, LayerKind),
+    (TraitDecl, TraitKind),
+    (ImplDecl, ImplKind),
+  ].find(|(n, _)| n == kind).map(|(_, k)| k)
+}
+
+fn collect_one(
+  module: Int,
+  item: Node,
+  kind: DefKind,
+  name: String,
+  start: Int,
+  end: Int,
+) -> Pending
+  uses { State[Resolver] } {
+  def = alloc_def(module, name, start, end, kind, None)
+  d = def_of(def)
+  set_def(def, DefData(is_pub: has_token(item, PubKw), is_opaque: has_token(item, OpaqueKw), ..d))
+  upd_program(|p| {
+    m = p.modules.get(module).or(ModuleItems([], [], False, []))
+    Program(modules: p.modules.insert(module, ModuleItems(items: m.items.append([def]), ..m)), ..p)
+  })
+  entry = Entry(def, Some((start, end)), False)
+  kind match {
+    FnKind    -> insert_name(module, NsValue, name, entry)
+    ConstKind -> insert_name(module, NsValue, name, entry)
+    ErrorKind -> {
+      insert_name(module, NsType, name, entry)
+      insert_name(module, NsCtor, name, entry)
+    }
+    ImplKind  -> ()
+    _         -> insert_name(module, NsType, name, entry)
+  }
+  ctor = if (
+    (kind == TypeKind && child_kind(item, FieldList).is_some())
+      || (kind == HandlerKind
+        && (child_kind(item, FieldList).is_some() || item_block(item, HandlerInit).is_some()))
+  ) {
+    # A handler without fields still needs a constructor for its value if it has `init`.
+    Some(define_ctor(module, def, name, start, end))
+  } else {
+    None
+  }
+  children_defs = if kind == EnumKind {
+    variants = child_kind(item, VariantList).map(|l| children_of(l, Variant)).or([])
+    variants.filter_map(|v| {
+      decl_name(v).map(|t| {
+        vname = text_of(t)
+        id = alloc_def(module, vname, t.start, t.end, CtorKind, Some(def))
+        insert_name(module, NsCtor, vname, Entry(id, Some((t.start, t.end)), False))
+        id
+      })
+    })
+  } else if kind == EffectKind {
+    if child_kind(item, EffectLabel).is_some() {
+      upd(|r| Resolver(labels: r.labels.insert(def, True), ..r))
+    }
+    ops = body_items(item, OpSig).filter_map(|op| child_token(op, LowerName))
+    members = body_items(item, MemberSig).filter_map(|m| child_token(m, TypeName))
+    define_members(module, def, OpKind, ops).append(
+      define_members(module, def, MemberKind, members),
+    )
+  } else if kind == TraitKind {
+    define_members(
+      module,
+      def,
+      TraitFnKind,
+      body_items(item, FnDecl).filter_map(|f| child_token(f, LowerName)),
+    )
+  } else {
+    []
+  }
+  if kind == HandlerKind { collect_inner_handlers(module, def, item) }
+  if kind == EffectKind || kind == TraitKind {
+    upd(|r| Resolver(members: r.members.insert(def, children_defs), ..r))
+  }
+  Pending(module, def, item, children_defs, ctor)
+}
+
+## `@intrinsic` is allowed only on fns without a body, on effects and on types without fields, in
+## the bundled core sources.
+fn check_intrinsic(module: Int, node: Node, allowed: Bool) -> () uses { State[Resolver] } {
+  annotations(node).find(|a| annotation_name(a) == Some("intrinsic")) match {
+    None -> ()
+    Some(a) -> {
+      if !allowed {
+        report_in(
+          module,
+          a.start,
+          a.end,
+          "E0225",
+          "`@intrinsic` can only be used on a function without a body",
+        )
+      } else if !is_core(st().map, module) {
+        report_in(
+          module,
+          a.start,
+          a.end,
+          "E0224",
+          "`@intrinsic` can only be used in the bundled core sources",
+        )
+      }
+    }
+  }
+}
+
+## The inner handlers of a handler, recursively. They are not put in any scope.
+fn collect_inner_handlers(module: Int, outer: Int, h: Node) -> () uses { State[Resolver] } {
+  inner = body_items(h, HandlerDecl).filter_map(|it| {
+    decl_name(it).map(|t| {
+      name = text_of(t)
+      def = alloc_def(module, name, t.start, t.end, HandlerKind, Some(outer))
+      ctor = if child_kind(it, FieldList).is_some() || item_block(it, HandlerInit).is_some() {
+        Some(alloc_def(module, name, t.start, t.end, CtorKind, Some(def)))
+      } else {
+        None
+      }
+      collect_inner_handlers(module, def, it)
+      (def, ctor)
+    })
+  })
+  if !inner.is_empty() {
+    upd(|r| Resolver(inner_handlers: r.inner_handlers.insert(outer, inner), ..r))
+  }
+}
+
+## The same-named constructor of a type or handler.
+fn define_ctor(module: Int, owner: Int, name: String, start: Int, end: Int) -> Int
+  uses { State[Resolver] } {
+  ctor = alloc_def(module, name, start, end, CtorKind, Some(owner))
+  insert_name(module, NsCtor, name, Entry(ctor, Some((start, end)), False))
+  ctor
+}
+
+## Effect operations and trait functions. Names may not repeat within a declaration.
+fn define_members(module: Int, parent: Int, kind: DefKind, names: List[Token]) -> List[Int]
+  uses { State[Resolver] } {
+  (defs, _) = names.fold(([], Map.empty()), |(defs, seen), t| {
+    name = text_of(t)
+    seen.get(name) match {
+      Some(_) -> {
+        report_in(module, t.start, t.end, "E0213", "`#{name}` is defined twice")
+        (defs, seen)
+      }
+      None -> (
+        defs.append([alloc_def(module, name, t.start, t.end, kind, Some(parent))]),
+        seen.insert(name, True),
+      )
+    }
+  })
+  defs
+}
+
+# ---------------------------------------------------------------------------------------------
+# Imports
+
+fn imports(module: Int, root: Node) -> () uses { State[Resolver] } {
+  upd(|r| Resolver(module:, ..r))
+  children_of(root, Import).each(|import_node| {
+    child_kind(import_node, Path) match {
+      None -> ()
+      Some(path) -> {
+        segs = segments(path)
+        segs.last() match {
+          None -> ()
+          Some(last) -> {
+            name = segs.map(text_of)
+            # The import graph has already reported undefined modules.
+            lookup(st().map, name) match {
+              None -> ()
+              Some(target) -> {
+                alias = text_of(last)
+                scope = scope_of(module)
+                scope.modules.get(alias) match {
+                  Some(first) if first.target != target -> {
+                    report_token(last, "E0213", "`#{alias}` is defined twice")
+                  }
+                  Some(_) -> ()
+                  None -> {
+                    entry = Entry(target, Some((last.start, last.end)), True)
+                    set_scope(module, Scope(modules: scope.modules.insert(alias, entry), ..scope))
+                  }
+                }
+                imported = child_kind(import_node, ImportList).map(child_tokens).or([]).filter(|t| {
+                  t.kind == LowerName || t.kind == TypeName || t.kind == UpperName
+                })
+                imported.each(|t| import_name(module, target, name, t))
+              }
+            }
+          }
+        }
+      }
+    }
+  })
+}
+
+## The `x` of `import A.B.{x}`. Brings in the pub definitions from every namespace.
+fn import_name(module: Int, target: Int, target_name: List[String], t: Token) -> ()
+  uses { State[Resolver] } {
+  name = text_of(t)
+  found = NAMESPACES.filter_map(|ns| {
+    keep(scope_get(target, ns, name), |e: Entry| !e.imported).map(|e| (ns, e.target))
+  })
+  if found.is_empty() {
+    report_token(t, "E0212", "module `#{display(target_name)}` has no `#{name}`")
+  } else {
+    public = found.filter(|(_, def)| def_of(def).is_pub)
+    if public.is_empty() {
+      report_token(t, "E0214", "`#{name}` is private to module `#{display(target_name)}`")
+    } else {
+      public.each(
+        |(ns, def)| insert_name(module, ns, name, Entry(def, Some((t.start, t.end)), True)),
+      )
+    }
+  }
+}
+
+## Warns if module definitions or imports hide Prelude names.
+fn warn_prelude_shadowing(module: Int) -> () uses { State[Resolver] } {
+  shadowing = NAMESPACES.flat_map(|ns| {
+    prelude = prelude_map(ns)
+    ns_map(scope_of(module), ns).fold([], |acc, name, e| {
+      (prelude.contains(name), e.range) match {
+        (True, Some((start, end))) -> acc.append([(start, end, name)])
+        _                          -> acc
+      }
+    })
+  })
+  # A definition hiding both a type and a constructor (type, error) is reported once.
+  sorted = shadowing.sort_by(|(s1, e1, _), (s2, e2, _)| Ord.compare((s1, e1), (s2, e2)))
+  dedup(sorted).each(|(start, end, name)| {
+    report_in(module, start, end, "W0202", "`#{name}` shadows the prelude's `#{name}`")
+  })
+}
+
+fn dedup(xs: List[(Int, Int, String)]) -> List[(Int, Int, String)] {
+  xs.fold([], |acc, x| if acc.head() == Some(x) { acc } else { [x, ..acc] }).reverse()
+}
+
+## Looks in the module's namespaces and the Prelude. Locals and type parameters are checked first
+## by the caller.
+fn lookup_name(module: Int, ns: Ns, name: String) -> Option[Int] uses { State[Resolver] } {
+  scope_get(module, ns, name).map(|e| e.target) match {
+    Some(def) -> Some(def)
+    None      -> prelude_map(ns).get(name)
+  }
+}
+
+## The traits that can be written unqualified in `module`, by definition.
+fn visible_traits(module: Int) -> List[Int] uses { State[Resolver] } {
+  names = ns_map(scope_of(module), NsType).fold([], |acc, n, _| acc.append([n])).append(
+    prelude_map(NsType).fold([], |acc, n, _| acc.append([n])),
+  )
+  traits = names.filter_map(|n| lookup_name(module, NsType, n)).filter(|d| kind_of(d) == TraitKind)
+  traits.sort_by(|a, b| Ord.compare(a, b)).fold(
+    [],
+    |acc, d| if acc.head() == Some(d) { acc } else { [d, ..acc] },
+  ).reverse()
+}
+
+fn dot_left_def(def: Int, start: Int, end: Int) -> DotLeft uses { State[Resolver] } {
+  if kind_of(def) == EffectKind { LeftEffect(def, start, end) } else { LeftTrait(def) }
+}
+
+## Looks up a type name left of `.`: a module (imported, or a single-segment core module), a trait
+## or an effect. A module and a trait both found is ambiguous (E0218).
+fn lookup_dot_left(module: Int, name: String, start: Int, end: Int) -> Option[DotLeft]
+  uses { State[Resolver] } {
+  scope = scope_of(module)
+  as_module = scope.modules.get(name).map(|e| e.target)
+  as_trait = keep(scope.types.get(name).map(|e| e.target), |d| {
+    k = kind_of(d)
+    k == TraitKind || k == EffectKind
+  })
+  found = (as_module, as_trait) match {
+    (Some(m), Some(e)) if kind_of(e) == EffectKind -> Some(
+      Some(LeftModuleOrEffect(m, e, start, end)),
+    )
+    (Some(_), Some(_)) -> {
+      report_in(module, start, end, "E0218", "`#{name}` is both a module and a trait")
+      Some(None)
+    }
+    (Some(m), None) -> Some(Some(LeftModule(m)))
+    (None, Some(t)) -> Some(Some(dot_left_def(t, start, end)))
+    (None, None) -> {
+      core_module(name) match {
+        Some(core) -> Some(Some(LeftModule(core)))
+        None -> keep(prelude_map(NsType).get(name), |d| kind_of(d) == TraitKind).map(
+          |d| Some(LeftTrait(d)),
+        )
+      }
+    }
+  }
+  found match {
+    Some(result) -> result
+    None -> {
+      lookup_name(module, NsType, name) match {
+        Some(def) -> report_in(
+          module,
+          start,
+          end,
+          "E0217",
+          "expected a module or trait, found #{describe(kind_of(def))} `#{name}`",
+        )
+        None -> report_in(
+          module,
+          start,
+          end,
+          "E0211",
+          "cannot find module or trait `#{name}` in this scope",
+        )
+      }
+      None
+    }
+  }
+}
+
+## A definition of `target` in namespace `ns`. A non-pub one from another module is reported, then
+## still returned so resolution can continue.
+fn module_member(
+  module: Int,
+  target: Int,
+  ns: Ns,
+  name: String,
+  start: Int,
+  end: Int,
+) -> Option[Int]
+  uses { State[Resolver] } {
+  module_name = get(st().map, target).map(|d| display(d.name)).or("")
+  keep(scope_get(target, ns, name), |e: Entry| !e.imported).map(|e| e.target) match {
+    Some(def) -> {
+      if target != module && !def_of(def).is_pub {
+        report_in(module, start, end, "E0214", "`#{name}` is private to module `#{module_name}`")
+      }
+      Some(def)
+    }
+    None -> {
+      report_in(module, start, end, "E0212", "module `#{module_name}` has no `#{name}`")
+      None
+    }
+  }
+}
+
+## If a bundled core module `X` has a pub type `X` of the same name, returns it (`Map[K, V]`).
+fn eponymous_type(name: String) -> Option[Int] uses { State[Resolver] } {
+  core_module(name).and_then(|core| {
+    keep(scope_get(core, NsType, name), |e: Entry| !e.imported && def_of(e.target).is_pub).map(
+      |e| e.target,
+    )
+  })
+}
+
+fn member(owner: Int, name: String) -> Option[Int] uses { State[Resolver] } {
+  st().members.get(owner).or([]).find(|d| def_of(d).name == name)
+}
+
+fn def_module_name(def: Int) -> String uses { State[Resolver] } {
+  def_of(def).module match {
+    SourceModule(m) -> get(st().map, m).map(|d| display(d.name)).or("")
+    BuiltinPrelude  -> "Prelude"
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering: scopes
+
+fn push_scope() -> () uses { State[Resolver] } {
+  upd(|r| Resolver(locals: [Map.empty(), ..r.locals], ..r))
+}
+
+fn pop_scope() -> () uses { State[Resolver] } {
+  upd(|r| Resolver(locals: r.locals.tail(), ..r))
+}
+
+## Starts a binder for a pattern or parameter list; returns the outer one to restore.
+fn start_binder() -> List[(String, Int)] uses { State[Resolver] } {
+  outer = st().binder
+  upd(|r| Resolver(binder: [], ..r))
+  outer
+}
+
+## Ends the binder, restoring `outer`, and returns the names it bound, oldest first.
+fn end_binder(outer: List[(String, Int)]) -> List[(String, Int)] uses { State[Resolver] } {
+  bound = st().binder.reverse()
+  upd(|r| Resolver(binder: outer, ..r))
+  bound
+}
+
+## The newer of two same-named bindings is the visible one (spec 6.3).
+fn bind_all(names: List[(String, Int)]) -> () uses { State[Resolver] } {
+  if st().locals.is_empty() { push_scope() }
+  upd(|r| {
+    r.locals match {
+      [scope, ..outer] -> Resolver(
+        locals: [names.fold(scope, |m, (n, l)| m.insert(n, l)), ..outer],
+        ..r,
+      )
+      [] -> r
+    }
+  })
+}
+
+## Binds `name` in the current binder; binding it twice is E0220.
+fn bind(name: String, kind: LocalKind, start: Int, end: Int) -> Int uses { State[Resolver] } {
+  if st().binder.any(|(n, _)| n == name) {
+    report(start, end, "E0220", "`#{name}` is bound more than once")
+  }
+  local = alloc_local(name, kind, start, end)
+  upd(|r| Resolver(binder: [(name, local), ..r.binder], ..r))
+  local
+}
+
+fn lookup_local(name: String) -> Option[Int] uses { State[Resolver] } {
+  st().locals |> find_map_first(name)
+}
+
+fn lookup_type_param(name: String) -> Option[Int] uses { State[Resolver] } {
+  st().type_params |> find_map_first(name)
+}
+
+## The first map of `scopes` (innermost first) with `name`.
+fn find_map_first(scopes: List[Map[String, Int]], name: String) -> Option[Int] {
+  scopes match {
+    [] -> None
+    [s, ..rest] -> s.get(name) match {
+      Some(x) -> Some(x)
+      None    -> find_map_first(rest, name)
+    }
+  }
+}
+
+fn pop_type_params() -> () uses { State[Resolver] } {
+  upd(|r| Resolver(type_params: r.type_params.tail(), ..r))
+}
+
+fn type_params(owner: Int, list: Option[Node]) -> List[TypeParam] uses { State[Resolver] } {
+  (params, _) = type_params_in(owner, list, False)
+  params
+}
+
+## Reads `[A: Ord, Item]` and pushes a type parameter scope; the caller pops it. In an impl head a
+## repeated name or the name of a type makes the head malformed (E0328), not E0213 or W0201; the
+## second value tells whether it is.
+fn type_params_in(owner: Int, list: Option[Node], impl_head: Bool) -> (List[TypeParam], Bool)
+  uses { State[Resolver] } {
+  upd(|r| Resolver(type_params: [Map.empty(), ..r.type_params], ..r))
+  list match {
+    None -> ([], False)
+    Some(l) -> {
+      (params, malformed, _) = children_of(l, Syntax.TypeParam).fold(
+        ([], False, Map.empty()),
+        |(acc, bad, seen), param| {
+          child_tokens(param).find(|t| t.kind == UpperName || t.kind == TypeName) match {
+            None -> (acc, bad, seen)
+            Some(t) -> {
+              name = text_of(t)
+              repeated = seen.contains(name)
+              if repeated && !impl_head {
+                report_token(t, "E0213", "`#{name}` is defined twice")
+                (acc, bad, seen)
+              } else {
+                shadows = t.kind == TypeName
+                  && (
+                    lookup_name(st().module, NsType, name).is_some()
+                      || lookup_type_param(name).is_some()
+                  )
+                if shadows && !impl_head {
+                  report_token(t, "W0201", "type parameter `#{name}` shadows the type `#{name}`")
+                }
+                def = alloc_def(st().module, name, t.start, t.end, TypeParamKind, Some(owner))
+                upd(|r| {
+                  r.type_params match {
+                    [s, ..outer] -> Resolver(type_params: [s.insert(name, def), ..outer], ..r)
+                    []           -> r
+                  }
+                })
+                (
+                  acc.append([(def, param)]),
+                  bad || repeated || (shadows && impl_head),
+                  seen.insert(name, True),
+                )
+              }
+            }
+          }
+        },
+      )
+      # Constraints are looked up after every type parameter is in scope.
+      lowered = params.map(|(def, param)| {
+        bounds = children_of(param, Path).map(|p| (resolve_type_ns(p, ExpectTrait), node_span(p)))
+        TypeParam(def, bounds)
+      })
+      (lowered, malformed)
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering: declarations
+
+fn lower_item(p: Pending) -> () uses { State[Resolver] } {
+  upd(|r| {
+    Resolver(
+      module: p.module,
+      locals: [],
+      type_params: [],
+      self_type: False,
+      in_handler: None,
+      type_arg: False,
+      ignored_type_params: [],
+      member_label: None,
+      binder: [],
+      ..r,
+    )
+  })
+  item = p.item
+  kind = item.kind
+  lowered = if kind == FnDecl {
+    check_intrinsic(p.module, item, child_kind(item, BlockExpr).is_none())
+    Some(IFn(fn_item(p.def, item)))
+  } else if kind == TypeDecl {
+    Some(type_item(p.def, p.ctor, item))
+  } else if kind == EnumDecl {
+    Some(enum_item(p.def, p.children, item))
+  } else if kind == ErrorDecl {
+    fields = named_fields(child_kind(item, FieldList))
+    derives = derives_of(child_kind(item, DeriveClause))
+    Some(IError(ErrorItem(fields.map(NamedFields).or(NoFields), derives)))
+  } else if kind == ConstDecl {
+    ty = if has_token(item, Colon) {
+      children(item).find(|n| n.kind != Annotation).map(lower_type)
+    } else {
+      None
+    }
+    value = opt_expr(children(item).filter(|n| casts_to_expr(n.kind)).last(), item.start, item.end)
+    Some(IConst(ConstItem(ty, value)))
+  } else if kind == EffectDecl {
+    Some(effect_item(p.def, p.children, item))
+  } else if kind == HandlerDecl {
+    Some(handler_item(p.def, p.ctor, item))
+  } else if kind == LayerDecl {
+    members = body_items_supplies(item).filter_map(|s| {
+      supply_path(s).map(|path| {
+        res = resolve_type_ns(path, ExpectHandlerOrLayer)
+        args = supply_args(s, res)
+        LayerMember(res, node_span(path), args)
+      })
+    })
+    Some(ILayer(LayerItem(members)))
+  } else if kind == TraitDecl {
+    Some(trait_item(p.children, item))
+  } else if kind == ImplDecl {
+    Some(impl_item(p.def, item))
+  } else {
+    None
+  }
+  lowered match {
+    Some(it) -> set_item(p.def, it)
+    None     -> ()
+  }
+}
+
+## The supplies of a layer body: a Path or a Supply.
+fn body_items_supplies(n: Node) -> List[Node] {
+  child_kind(n, ItemList).map(|l| children(l).filter(|c| c.kind == Path || c.kind == Supply)).or([])
+}
+
+fn supply_path(s: Node) -> Option[Node] {
+  if s.kind == Path { Some(s) } else { child_kind(s, Path) }
+}
+
+fn fn_item(def: Int, f: Node) -> FnItem uses { State[Resolver] } {
+  tps = type_params(def, child_kind(f, TypeParamList))
+  push_scope()
+  params = params_of(child_kind(f, ParamList), ParamLocal)
+  sig = signature(f, tps, params, has_token(f, SuspendKw))
+  body = child_kind(f, BlockExpr).map(lower_expr)
+  pop_scope()
+  pop_type_params()
+  entries = annotations(f).filter(|a| annotation_name(a) == Some("entry")).map(|a| {
+    EntryAttr(entry_adapter(a), node_span(a))
+  })
+  FnItem(
+    sig,
+    body,
+    has_annotation(f, "external"),
+    attrs(f, "external"),
+    has_annotation(f, "intrinsic"),
+    attrs(f, "export"),
+    entries,
+  )
+}
+
+## What the argument of `@entry(T)` names, looked up as a value. None if the argument is not one
+## name or path.
+fn entry_adapter(a: Node) -> Option[Res] uses { State[Resolver] } {
+  annotation_args(a).filter(|n| n.kind == AnnotArg) match {
+    [arg] -> {
+      child_kind(arg, AnnotPath) match {
+        Some(path) -> {
+          toks = child_tokens(path).filter(|t| t.kind == TypeName || t.kind == LowerName)
+          toks.last() match {
+            None -> None
+            Some(last) -> {
+              if last.kind != LowerName {
+                Some(ResErr)
+              } else {
+                name = text_of(last)
+                prefix = toks.take(toks.length() - 1)
+                res = resolve_prefix(prefix) match {
+                  Some(left) -> member_of_left(left, NsValue, name, last.start, last.end).map(
+                    ResDef,
+                  ).or(ResErr)
+                  None -> ResErr
+                }
+                Some(res)
+              }
+            }
+          }
+        }
+        None -> {
+          (child_tokens(arg).filter(|t| !is_trivia(t.kind)), children(arg)) match {
+            ([name], []) if name.kind == LowerName -> Some(
+              value(text_of(name), name.start, name.end, LowerName),
+            )
+            _ -> None
+          }
+        }
+      }
+    }
+    _ -> None
+  }
+}
+
+## `-> T fails E uses { R }` of a fn, operation or local fn.
+fn signature(n: Node, tps: List[TypeParam], params: List[Param], is_suspend: Bool) -> FnSig
+  uses { State[Resolver] } {
+  ret = child_kind(n, RetType).and_then(|r| children(r).head()).map(lower_type)
+  fails = child_kind(n, FailsClause).map(error_set)
+  uses = child_kind(n, UsesClause).map(effect_set)
+  FnSig(tps, params, ret, fails, uses, is_suspend)
+}
+
+## The parameters of a param list, added to the current scope.
+fn params_of(list: Option[Node], kind: LocalKind) -> List[Param] uses { State[Resolver] } {
+  list match {
+    None -> []
+    Some(l) -> {
+      outer = start_binder()
+      params = children_of(l, Syntax.Param).filter_map(|param| {
+        named = child_token(param, LowerName) match {
+          Some(t) -> Some((text_of(t), t.start, t.end, kind))
+          None -> child_token(param, SelfKw).map(|t| {
+            # `self` of impls and traits; elsewhere it is reported here.
+            if !st().self_type {
+              report_token(t, "E0219", "`self` can only be used in impls and traits")
+            }
+            ("self", t.start, t.end, SelfLocal)
+          })
+        }
+        named.map(|(name, start, end, k)| {
+          ty = param_type(param).map(lower_type)
+          local = bind(name, k, start, end)
+          Param(local, ty)
+        })
+      })
+      bind_all(end_binder(outer))
+      params
+    }
+  }
+}
+
+## The type of a parameter: the first node after `:`.
+fn param_type(param: Node) -> Option[Node] {
+  children_with_tokens(param).fold((False, None), |(after, found), e| {
+    (found, e) match {
+      (Some(_), _)            -> (after, found)
+      (None, TokenElement(t)) -> (after || t.kind == Colon, None)
+      (None, NodeElement(n))  -> if after { (after, Some(n)) } else { (after, None) }
+    }
+  }) match {
+    (_, f) -> f
+  }
+}
+
+## The pattern of a lambda parameter: the first node before `:`, when it has no name.
+fn param_pattern(param: Node) -> Option[Node] {
+  if has_token(param, LowerName) || has_token(param, SelfKw) {
+    None
+  } else {
+    children_with_tokens(param).fold((False, None), |(stop, found), e| {
+      (stop, found, e) match {
+        (True, _, _)               -> (stop, found)
+        (_, Some(_), _)            -> (stop, found)
+        (_, None, TokenElement(t)) -> (t.kind == Colon, None)
+        (_, None, NodeElement(n))  -> (stop, Some(n))
+      }
+    }) match {
+      (_, f) -> f
+    }
+  }
+}
+
+## Parameters of a lambda. A pattern in place of a name becomes a hidden parameter and a binding
+## `pattern = parameter` at the head of the body (spec 6.1). The names of all parameters share one
+## binder (E0220).
+fn lambda_params(list: Option[Node]) -> (List[Param], List[Stmt]) uses { State[Resolver] } {
+  list match {
+    None -> ([], [])
+    Some(l) -> {
+      outer = start_binder()
+      (params, lets) = children_of(l, Syntax.Param).fold(([], []), |(ps, ls), param| {
+        ty = param_type(param).map(lower_type)
+        child_token(param, LowerName) match {
+          Some(t) -> {
+            local = bind(text_of(t), LambdaParamLocal, t.start, t.end)
+            (ps.append([Param(local, ty)]), ls)
+          }
+          None -> child_token(param, SelfKw) match {
+            Some(t) -> {
+              if !st().self_type {
+                report_token(t, "E0219", "`self` can only be used in impls and traits")
+              }
+              local = bind("self", SelfLocal, t.start, t.end)
+              (ps.append([Param(local, ty)]), ls)
+            }
+            None -> param_pattern(param) match {
+              None -> (ps, ls)
+              Some(node) -> {
+                pat = lower_pat(node)
+                local = alloc_local(node_text(node), PatParamLocal, node.start, node.end)
+                v = alloc_expr(EPath(ResLocal(local)), node.start, node.end)
+                (ps.append([Param(local, ty)]), ls.append([SLet(pat, None, v)]))
+              }
+            }
+          }
+        }
+      })
+      bind_all(end_binder(outer))
+      (params, lets)
+    }
+  }
+}
+
+fn named_fields(list: Option[Node]) -> Option[List[FieldDef]] uses { State[Resolver] } {
+  list.map(|l| {
+    (fields, _) = children_of(l, Field).fold(([], Map.empty()), |(acc, seen), field| {
+      child_token(field, LowerName) match {
+        None -> (acc, seen)
+        Some(t) -> {
+          name = text_of(t)
+          if seen.contains(name) { report_token(t, "E0213", "`#{name}` is defined twice") }
+          ty = children(field).find(|n| n.kind != Annotation) match {
+            Some(tn) -> lower_type(tn)
+            None     -> alloc_type(TMissing, t.start, t.end)
+          }
+          (
+            acc.append([FieldDef(name, ty, span(t.start, t.end), string_attr(field, "key"))]),
+            seen.insert(name, True),
+          )
+        }
+      }
+    })
+    fields
+  })
+}
+
+fn derives_of(clause: Option[Node]) -> List[(Res, Span)] uses { State[Resolver] } {
+  clause.map(|c| children_of(c, Path).map(|p| (resolve_type_ns(p, ExpectTrait), node_span(p)))).or(
+    [],
+  )
+}
+
+fn type_item(def: Int, ctor: Option[Int], t: Node) -> Item uses { State[Resolver] } {
+  tps = type_params(def, child_kind(t, TypeParamList))
+  fields = named_fields(child_kind(t, FieldList)).map(NamedFields).or(NoFields)
+  derives = derives_of(child_kind(t, DeriveClause))
+  pop_type_params()
+  ctor |> each_option(|c| set_item(c, ICtor(CtorItem(def, fields))))
+  # Outside the bundled sources, `@intrinsic` is E0224 and the type stays a user type.
+  IType(
+    TypeItem(
+      tps,
+      ctor,
+      fields,
+      derives,
+      has_annotation(t, "intrinsic") && is_core(st().map, st().module),
+    ),
+  )
+}
+
+fn each_option[A](o: Option[A], f: fn(A) -> ()) -> () {
+  o match {
+    Some(x) -> f(x)
+    None    -> ()
+  }
+}
+
+fn enum_item(def: Int, variants: List[Int], e: Node) -> Item uses { State[Resolver] } {
+  tps = type_params(def, child_kind(e, TypeParamList))
+  # Variants with unreadable names were skipped during collection.
+  syntax_variants = child_kind(e, VariantList).map(|l| children_of(l, Variant)).or([]).filter(
+    |v| decl_name(v).is_some(),
+  )
+  tags = syntax_variants.map(|v| string_attr(v, "tag"))
+  variants.zip(syntax_variants).each(|(variant, syntax)| {
+    fields = named_fields(child_kind(syntax, FieldList)) match {
+      Some(fs) -> NamedFields(fs)
+      None -> {
+        tys = child_kind(syntax, TupleFieldList).map(children).or([])
+        if tys.is_empty() { NoFields } else { PositionalFields(tys.map(lower_type)) }
+      }
+    }
+    set_item(variant, ICtor(CtorItem(def, fields)))
+  })
+  derives = derives_of(child_kind(e, DeriveClause))
+  pop_type_params()
+  IEnum(EnumItem(tps, variants, derives, tags))
+}
+
+fn effect_item(def: Int, children_defs: List[Int], e: Node) -> Item uses { State[Resolver] } {
+  # An effect's type parameters (spec 8.1) are usable in its operation signatures.
+  tps = type_params(def, child_kind(e, TypeParamList))
+  members = children_defs.filter(|d| kind_of(d) == MemberKind)
+  ops = children_defs.filter(|d| kind_of(d) != MemberKind)
+  body_items(e, MemberSig).each(|m| {
+    child_token(m, TypeName) |> each_option(|name| {
+      members.find(|d| {
+        data = def_of(d)
+        data.name == text_of(name)
+          && data.span.map(|s| (s.start, s.end)) == Some((name.start, name.end))
+      }) |> each_option(|mdef| {
+        push_scope()
+        params = params_of(child_kind(m, ParamList), ParamLocal)
+        sig = signature(m, [], params, has_token(m, SuspendKw))
+        pop_scope()
+        effects = handler_effects(children_of(m, HandlerEffect))
+        set_item(mdef, IMember(MemberItem(sig, effects)))
+      })
+    })
+  })
+  body_items(e, OpSig).each(|op| {
+    child_token(op, LowerName) |> each_option(|name| {
+      ops.find(|d| {
+        data = def_of(d)
+        data.name == text_of(name)
+          && data.span.map(|s| (s.start, s.end)) == Some((name.start, name.end))
+      }) |> each_option(|odef| {
+        op_params = type_params(odef, child_kind(op, TypeParamList))
+        push_scope()
+        params = params_of(child_kind(op, ParamList), ParamLocal)
+        sig = signature(op, op_params, params, has_token(op, SuspendKw))
+        pop_type_params()
+        pop_scope()
+        set_item(odef, IOp(OpItem(sig)))
+      })
+    })
+  })
+  pop_type_params()
+  label = child_kind(e, EffectLabel).map(|l| {
+    base = child_kind(l, Path).map(|p| resolve_type_ns(p, ExpectEffect)).or(ResErr)
+    s = node_span(l)
+    args = type_arg_list(child_kind(l, TypeArgList))
+    default = child_tokens(l).any(|t| t.kind == LowerName && text_of(t) == "default")
+    LabelOf(base, s, args, default)
+  })
+  IEffect(
+    EffectItem(
+      tps,
+      ops,
+      members,
+      has_annotation(e, "intrinsic") && is_core(st().map, st().module),
+      label,
+    ),
+  )
+}
+
+fn handler_item(def: Int, ctor: Option[Int], h: Node) -> Item uses { State[Resolver] } {
+  outer = st().in_handler
+  upd(|r| Resolver(in_handler: Some((def, ctor)), ..r))
+  item = handler_body(def, ctor, h)
+  upd(|r| Resolver(in_handler: outer, ..r))
+  item
+}
+
+## The inner handlers of `def`, lowered as handlers of their own. Each implements the handler
+## member of the outer handler's effect with its name.
+fn inner_handlers(def: Int, effects: List[EffectRef], h: Node) -> List[Int]
+  uses { State[Resolver] } {
+  inner = st().inner_handlers.get(def).or([])
+  decls = body_items(h, HandlerDecl).filter(|it| decl_name(it).is_some())
+  inner.zip(decls).map(|((inner_def, inner_ctor), decl)| {
+    d = def_of(inner_def)
+    (start, end) = d.span.map(|s| (s.start, s.end)).or((0, 0))
+    m = member_of_effects(effects, d.name, start, end, True)
+    handler_item(inner_def, inner_ctor, decl) match {
+      IHandler(it) -> set_item(inner_def, IHandler(HandlerItem(member: Some(m), ..it)))
+      _            -> ()
+    }
+    inner_def
+  })
+}
+
+fn handler_body(def: Int, ctor: Option[Int], h: Node) -> Item uses { State[Resolver] } {
+  fields = named_fields(child_kind(h, FieldList))
+  ctor |> each_option(|c| set_item(c, ICtor(CtorItem(def, fields.map(NamedFields).or(NoFields)))))
+  effects = handler_effects(children_of(h, HandlerEffect))
+  # `init` builds the handler value; its parameters are in scope in its body only.
+  (init_params, init) = item_block(h, HandlerInit) match {
+    Some(b) -> {
+      push_scope()
+      ps = params_of(
+        child_kind(h, ItemList).and_then(|l| child_kind(l, HandlerInit)).and_then(
+          |i| child_kind(i, ParamList),
+        ),
+        ParamLocal,
+      )
+      body = lower_expr(b)
+      pop_scope()
+      (ps, Some(body))
+    }
+    None -> ([], None)
+  }
+  release = item_block(h, HandlerRelease).map(|b| {
+    push_scope()
+    local = implicit_self(def)
+    body = lower_expr(b)
+    pop_scope()
+    (local, body)
+  })
+  ops = body_items(h, FnDecl).filter_map(|f| {
+    child_token(f, LowerName).map(|t| {
+      name = text_of(t)
+      op = member_of_effects(effects, name, t.start, t.end, False)
+      check_intrinsic(st().module, f, False)
+      push_scope()
+      self_local = implicit_self(def)
+      push_scope()
+      params = params_of(child_kind(f, ParamList), ParamLocal)
+      body = child_kind(f, BlockExpr).map(lower_expr)
+      pop_scope()
+      pop_scope()
+      HandlerOp(
+        Label(name, span(t.start, t.end)),
+        op,
+        has_token(f, SuspendKw),
+        self_local,
+        params,
+        body,
+      )
+    })
+  })
+  inner = inner_handlers(def, effects, h)
+  IHandler(HandlerItem(effects, fields.or([]), ctor, init, init_params, release, ops, inner, None))
+}
+
+## The implicit `self` of handler operations and `release`, located at the handler's name.
+fn implicit_self(owner: Int) -> Int uses { State[Resolver] } {
+  (start, end) = def_of(owner).span.map(|s| (s.start, s.end)).or((0, 0))
+  local = alloc_local("self", SelfLocal, start, end)
+  upd(|r| {
+    r.locals match {
+      [s, ..outer] -> Resolver(locals: [s.insert("self", local), ..outer], ..r)
+      []           -> r
+    }
+  })
+  local
+}
+
+## The effects after the `:` of a handler or a handler member.
+fn handler_effects(effects: List[Node]) -> List[EffectRef] uses { State[Resolver] } {
+  effects.map(|e| {
+    res = child_kind(e, Path).map(|p| resolve_type_ns(p, ExpectEffect)).or(ResErr)
+    args = type_arg_list(child_kind(e, TypeArgList))
+    EffectRef(res, args, node_span(e))
+  })
+}
+
+## The operation (or, with `members`, the handler member) `name` that a handler implements, looked
+## up in each of its effects in order. Not found is E0212. Nothing is reported when an effect did
+## not resolve or is a label.
+fn member_of_effects(
+  effects: List[EffectRef],
+  name: String,
+  start: Int,
+  end: Int,
+  members: Bool,
+) -> Res
+  uses { State[Resolver] } {
+  wanted = |d: Int| if members { kind_of(d) == MemberKind } else { kind_of(d) != MemberKind }
+  owners = effects.map(|e| {
+    e.res match {
+      ResDef(d) if !st().labels.contains(d) -> Some(d)
+      _                                     -> None
+    }
+  })
+  if owners.any(|o| o.is_none()) {
+    ResErr
+  } else {
+    defs = owners.filter_map(|o| o)
+    defs |> find_map_option(|e| keep(member(e, name), wanted)) match {
+      Some(d) -> ResDef(d)
+      None -> {
+        if !defs.is_empty() {
+          owner = String.join(defs.map(|e| def_of(e).name), " + ")
+          report(start, end, "E0212", "effect `#{owner}` has no `#{name}`")
+        }
+        ResErr
+      }
+    }
+  }
+}
+
+fn find_map_option[A, B](xs: List[A], f: fn(A) -> Option[B]) -> Option[B] {
+  xs match {
+    [] -> None
+    [x, ..rest] -> f(x) match {
+      Some(y) -> Some(y)
+      None    -> find_map_option(rest, f)
+    }
+  }
+}
+
+## A member of a trait. Reports if not found.
+fn member_of(owner: Res, name: String, start: Int, end: Int) -> Res uses { State[Resolver] } {
+  owner match {
+    ResDef(o) -> member(o, name) match {
+      Some(d) -> ResDef(d)
+      None -> {
+        data = def_of(o)
+        report(start, end, "E0212", "#{describe(data.kind)} `#{data.name}` has no `#{name}`")
+        ResErr
+      }
+    }
+    _ -> ResErr
+  }
+}
+
+fn trait_item(fns: List[Int], t: Node) -> Item uses { State[Resolver] } {
+  supertraits = children_of(t, Path).map(|p| (resolve_type_ns(p, ExpectTrait), node_span(p)))
+  upd(|r| Resolver(self_type: True, ..r))
+  body_items(t, FnDecl).each(|f| {
+    child_token(f, LowerName) |> each_option(|name| {
+      fns.find(|d| def_of(d).span.map(|s| (s.start, s.end)) == Some((name.start, name.end)))
+        |> each_option(|def| {
+          check_intrinsic(st().module, f, False)
+          set_item(def, ITraitFn(fn_item(def, f)))
+        })
+    })
+  })
+  upd(|r| Resolver(self_type: False, ..r))
+  ITrait(TraitItem(supertraits, fns))
+}
+
+fn impl_item(def: Int, i: Node) -> Item uses { State[Resolver] } {
+  trait_ref = child_kind(i, Path).map(|p| resolve_type_ns(p, ExpectTrait)).or(ResErr)
+  self_ty_node = child_kind(i, ImplType)
+  # `impl Map[K: Eq, V: Eq]: Eq` declares `K` and `V` for the impl (spec 10.2).
+  (tps, malformed) = type_params_in(
+    def,
+    self_ty_node.and_then(|n| child_kind(n, TypeParamList)),
+    True,
+  )
+  if malformed {
+    self_ty_node |> each_option(|n| {
+      head = String.join(
+        node_text(n).split(" ").flat_map(|w| w.split("\n")).filter(|w| w != ""),
+        " ",
+      )
+      report_node(n, "E0328", "`#{head}` is not a type name with distinct type parameters")
+    })
+  }
+  # The type is the name applied to its own type parameters (`Map[K, V]`).
+  self_ty = self_ty_node.map(|node| {
+    res = child_kind(node, Path).map(|p| resolve_type_ns(p, ExpectType)).or(ResErr)
+    args = tps.map(|param| {
+      (s, e) = def_of(param.def).span.map(|sp| (sp.start, sp.end)).or((node.start, node.end))
+      alloc_type(TPath(ResDef(param.def), []), s, e)
+    })
+    alloc_type(TPath(res, args), node.start, node.end)
+  })
+  upd(|r| Resolver(self_type: True, ..r))
+  (fns, _) = body_items(i, FnDecl).fold(([], Map.empty()), |(acc, seen), f| {
+    child_token(f, LowerName) match {
+      None -> (acc, seen)
+      Some(t) -> {
+        name = text_of(t)
+        # Like a trait's functions, an impl's cannot repeat a name (E0213).
+        if seen.contains(name) { report_token(t, "E0213", "`#{name}` is defined twice") }
+        trait_fn = member_of(trait_ref, name, t.start, t.end)
+        check_intrinsic(st().module, f, False)
+        fn_def = alloc_def(st().module, name, t.start, t.end, ImplFnKind, Some(def))
+        push_scope()
+        params = params_of(child_kind(f, ParamList), ParamLocal)
+        body = child_kind(f, BlockExpr).map(lower_expr)
+        pop_scope()
+        (
+          acc.append([ImplFn(fn_def, Label(name, span(t.start, t.end)), trait_fn, params, body)]),
+          seen.insert(name, True),
+        )
+      }
+    }
+  })
+  upd(|r| Resolver(self_type: False, ..r))
+  pop_type_params()
+  IImpl(ImplItem(trait_ref, tps, self_ty, malformed, fns))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering: types and paths
+
+## Where a name was looked up.
+enum Expected {
+  ExpectValue
+  ExpectConstructor
+  ExpectType
+  ExpectTypeParam
+  ExpectModuleOrTrait
+  ExpectEffect
+  ExpectHandlerOrLayer
+  ExpectWithItem
+  ExpectLabel
+  ExpectHandlerOrEffect
+  ExpectError
+  ExpectTrait
+  ExpectConst
+} derive Eq
+
+fn expected_text(e: Expected) -> String {
+  e match {
+    ExpectValue           -> "value"
+    ExpectConstructor     -> "constructor"
+    ExpectType            -> "type"
+    ExpectTypeParam       -> "type parameter"
+    ExpectModuleOrTrait   -> "module or trait"
+    ExpectEffect          -> "effect"
+    ExpectHandlerOrLayer  -> "handler or layer"
+    ExpectWithItem        -> "handler, layer or label"
+    ExpectLabel           -> "label"
+    ExpectHandlerOrEffect -> "handler or effect"
+    ExpectError           -> "error"
+    ExpectTrait           -> "trait"
+    ExpectConst           -> "constant"
+  }
+}
+
+fn lower_type(n: Node) -> Int uses { State[Resolver] } {
+  type_arg = st().type_arg
+  upd(|r| Resolver(type_arg: False, ..r))
+  k = n.kind
+  if k == ParenType {
+    # The parentheses of `(fn(A) -> B)` do not change the type.
+    children(n).head().map(lower_type) |> or_else_alloc(n)
+  } else {
+    kind = if k == PathType {
+      res = child_kind(n, Path) match {
+        Some(path) -> {
+          upd(|r| Resolver(type_arg:, ..r))
+          r = resolve_type_ns(path, ExpectType)
+          upd(|r2| Resolver(type_arg: False, ..r2))
+          r
+        }
+        None -> ResErr
+      }
+      args = child_kind(n, TypeArgList).map(|list| {
+        children(list).map(|t| {
+          upd(|r| Resolver(type_arg: True, ..r))
+          lower_type(t)
+        })
+      }).or([])
+      TPath(res, args)
+    } else if k == TypeVar {
+      TPath(type_var(n), [])
+    } else if k == SelfType {
+      if st().self_type {
+        TSelf
+      } else {
+        report_node(n, "E0219", "`Self` can only be used in traits and impls")
+        TMissing
+      }
+    } else if k == UnitType {
+      TUnit
+    } else if k == Syntax.ErrorSet {
+      TErrorSet(ErrorSet(set_node_items(n, ExpectError), node_span(n)))
+    } else if k == Syntax.EffectSet {
+      TEffectSet(EffectSet(effect_set_items(n), node_span(n)))
+    } else if k == TupleType {
+      TTuple(children(n).map(lower_type))
+    } else if k == FnType {
+      params = child_kind(n, ParamTypeList).map(|l| children(l).map(lower_type)).or([])
+      ret = child_kind(n, RetType).and_then(|r| children(r).head()).map(lower_type)
+      fails = child_kind(n, FailsClause).map(error_set)
+      uses = child_kind(n, UsesClause).map(effect_set)
+      TFn(params, ret, fails, uses)
+    } else if k == CapType {
+      # `use E1 + ... + En`: each effect is read as in an effect set.
+      effects = effect_set_items(n)
+      vars = children_of(n, TypeVar)
+      ok = effects.fold(!effects.is_empty(), |ok, e| {
+        e.res match {
+          ResDef(d) if kind_of(d) == TypeParamKind -> {
+            name = def_of(d).name
+            v = vars.find(|v| v.start <= e.span.start && e.span.end <= v.end)
+            (s, en) = v.map(|v| (v.start, v.end)).or((n.start, n.end))
+            report(s, en, "E0217", "expected an effect, found type parameter `#{name}`")
+            False
+          }
+          _ -> ok
+        }
+      })
+      if ok { TCap(effects) } else { TMissing }
+    } else {
+      TMissing
+    }
+    alloc_type(kind, n.start, n.end)
+  }
+}
+
+fn or_else_alloc(o: Option[Int], n: Node) -> Int uses { State[Resolver] } {
+  o match {
+    Some(t) -> t
+    None    -> alloc_type(TMissing, n.start, n.end)
+  }
+}
+
+## Uppercase names in type positions. Only type parameters are looked up.
+fn type_var(n: Node) -> Res uses { State[Resolver] } {
+  child_token(n, UpperName) match {
+    None -> ResErr
+    Some(t) -> {
+      name = text_of(t)
+      lookup_type_param(name) match {
+        Some(d) -> ResDef(d)
+        None -> {
+          if !st().ignored_type_params.any(|i| i == name) {
+            report_token(t, "E0211", "cannot find type parameter `#{name}` in this scope")
+          }
+          ResErr
+        }
+      }
+    }
+  }
+}
+
+## The ERROR_SET inside a FAILS_CLAUSE.
+fn error_set(clause: Node) -> ErrorSet uses { State[Resolver] } {
+  items = children(clause).find(|n| n.kind == Syntax.ErrorSet || n.kind == Syntax.EffectSet).map(
+    |set| {
+      set_node_items(set, ExpectError)
+    },
+  ).or([])
+  ErrorSet(items, node_span(clause))
+}
+
+fn effect_set(clause: Node) -> EffectSet uses { State[Resolver] } {
+  items = child_kind(clause, Syntax.EffectSet).map(effect_set_items).or([])
+  EffectSet(items, node_span(clause))
+}
+
+## Elements of an EFFECT_SET (or a CAP_TYPE). An effect with type arguments is a PATH_TYPE.
+fn effect_set_items(set: Node) -> List[EffectRef] uses { State[Resolver] } {
+  children(set).filter_map(|n| {
+    found = if n.kind == Path {
+      Some((resolve_type_ns(n, ExpectEffect), []))
+    } else if n.kind == PathType {
+      child_kind(n, Path).map(|p| {
+        res = resolve_type_ns(p, ExpectEffect)
+        (res, type_arg_list(child_kind(n, TypeArgList)))
+      })
+    } else if n.kind == TypeVar {
+      Some((type_var(n), []))
+    } else {
+      None
+    }
+    found.map(|(res, args)| EffectRef(res, args, node_span(n)))
+  })
+}
+
+## Types in a TYPE_ARG_LIST. Empty if there is no list.
+fn type_arg_list(list: Option[Node]) -> List[Int] uses { State[Resolver] } {
+  list.map(|l| children(l).map(lower_type)).or([])
+}
+
+## Elements of an ERROR_SET or EFFECT_SET.
+fn set_node_items(set: Node, expected: Expected) -> List[(Res, Span)] uses { State[Resolver] } {
+  children(set).filter_map(|n| {
+    res = if n.kind == Path {
+      Some(resolve_type_ns(n, expected))
+    } else if n.kind == TypeVar {
+      Some(type_var(n))
+    } else {
+      None
+    }
+    res.map(|r| (r, node_span(n)))
+  })
+}
+
+## Looks up a path in the type namespace and checks its kind. A single segment is looked up as a
+## type parameter, then a module definition, then the Prelude, then a core module's eponymous type;
+## `A.B` is the pub type of module `A`.
+fn resolve_type_ns(path: Node, expected: Expected) -> Res uses { State[Resolver] } {
+  segs = segments(path)
+  segs.last() match {
+    None -> ResErr
+    Some(last) -> {
+      name = text_of(last)
+      prefix = segs.take(segs.length() - 1)
+      found = if prefix.is_empty() {
+        lookup_type_param(name) match {
+          Some(d) -> Some(d)
+          None -> lookup_name(st().module, NsType, name) match {
+            Some(d) -> Some(d)
+            None -> eponymous_type(name) match {
+              Some(d) -> Some(d)
+              None -> {
+                undefined_type(name, last.start, last.end, expected)
+                None
+              }
+            }
+          }
+        }
+      } else {
+        resolve_prefix(prefix).and_then(
+          |left| member_of_left(left, NsType, name, last.start, last.end),
+        )
+      }
+      found match {
+        None      -> ResErr
+        Some(def) -> check_kind(def, name, last, path, expected)
+      }
+    }
+  }
+}
+
+fn check_kind(def: Int, name: String, last: Token, path: Node, expected: Expected) -> Res
+  uses { State[Resolver] } {
+  kind = kind_of(def)
+  fits = expected match {
+    ExpectType -> (
+      [TypeKind, EnumKind, ErrorKind, BuiltinTypeKind, TypeParamKind].any(|k| k == kind)
+        || (st().type_arg && kind == EffectKind)
+    )
+    ExpectEffect          -> kind == EffectKind || kind == TypeParamKind
+    ExpectError           -> kind == ErrorKind || kind == TypeParamKind
+    ExpectHandlerOrLayer  -> kind == HandlerKind || kind == LayerKind || kind == MemberKind
+    ExpectWithItem        -> [HandlerKind, LayerKind, EffectKind, MemberKind].any(|k| k == kind)
+    ExpectLabel           -> kind == EffectKind
+    ExpectHandlerOrEffect -> kind == HandlerKind || kind == EffectKind
+    ExpectTrait           -> kind == TraitKind
+    _                     -> True
+  }
+  # `use X` cannot take a type parameter.
+  fits_use = fits && !(expected == ExpectEffect && kind == TypeParamKind && path_in_use_expr(path))
+  if !fits_use && expected == ExpectType && kind == EffectKind {
+    report_token(last, "E0221", "effect `#{name}` cannot be used as a type")
+    ResErr
+  } else if !fits_use {
+    report_token(
+      last,
+      "E0217",
+      "expected #{expected_text(expected)}, found #{describe(kind)} `#{name}`",
+    )
+    ResErr
+  } else {
+    ResDef(def)
+  }
+}
+
+## Whether the path names the effect of `use X` or of the type `use X`.
+fn path_in_use_expr(path: Node) -> Bool {
+  parent(path) match {
+    Some(p) if p.kind == UseExpr || p.kind == CapType -> True
+    Some(p) if p.kind == PathType -> parent(p).map(|g| g.kind == CapType) == Some(True)
+    _                             -> False
+  }
+}
+
+fn undefined_type(name: String, start: Int, end: Int, expected: Expected) -> ()
+  uses { State[Resolver] } {
+  # A module name in a type position (the `Email` of spec 4.4).
+  if scope_of(st().module).modules.contains(name) {
+    report(start, end, "E0217", "expected #{expected_text(expected)}, found module `#{name}`")
+  } else {
+    report(start, end, "E0211", "cannot find #{expected_text(expected)} `#{name}` in this scope")
+  }
+}
+
+## The `A.B` of `A.B.f`. The first segment is looked up as left of `.`, the rest as traits or
+## effects inside the module.
+fn resolve_prefix(prefix: List[Token]) -> Option[DotLeft] uses { State[Resolver] } {
+  prefix match {
+    [] -> None
+    [first, ..rest] -> {
+      lookup_dot_left(st().module, text_of(first), first.start, first.end).and_then(|left| {
+        prefix_rest(left, rest)
+      })
+    }
+  }
+}
+
+fn prefix_rest(left: DotLeft, rest: List[Token]) -> Option[DotLeft] uses { State[Resolver] } {
+  rest match {
+    [] -> Some(left)
+    [seg, ..more] -> {
+      name = text_of(seg)
+      member_of_left(left, NsType, name, seg.start, seg.end).and_then(|def| {
+        k = kind_of(def)
+        if k != TraitKind && k != EffectKind {
+          report_token(seg, "E0217", "expected module or trait, found #{describe(k)} `#{name}`")
+          None
+        } else {
+          prefix_rest(dot_left_def(def, seg.start, seg.end), more)
+        }
+      })
+    }
+  }
+}
+
+## A name inside the left of `.`: a definition in namespace `ns` of a module, a function of a
+## trait, or a handler member of an effect.
+fn member_of_left(left: DotLeft, ns: Ns, name: String, start: Int, end: Int) -> Option[Int]
+  uses { State[Resolver] } {
+  module = st().module
+  left match {
+    LeftModule(m) -> module_member(module, m, ns, name, start, end)
+    LeftModuleOrEffect(m, e, _, _) -> {
+      found = if ns != NsValue { keep(member(e, name), |d| kind_of(d) == MemberKind) } else { None }
+      found match {
+        Some(d) -> Some(d)
+        None    -> module_member(module, m, ns, name, start, end)
+      }
+    }
+    LeftTrait(t) -> {
+      found = if ns == NsValue { member(t, name) } else { None }
+      if found.is_none() {
+        report(start, end, "E0212", "trait `#{def_of(t).name}` has no `#{name}`")
+      }
+      found
+    }
+    # Only handler members are named on an effect; its operations are called through a
+    # capability.
+    LeftEffect(e, es, ee) -> {
+      if ns == NsValue {
+        report(es, ee, "E0217", "expected module or trait, found effect `#{def_of(e).name}`")
+        None
+      } else {
+        # A label has the handler members of its base.
+        owner = label_base(e).or(e)
+        found = keep(member(owner, name), |d| kind_of(d) == MemberKind)
+        if found.is_some() && owner != e {
+          upd(|r| Resolver(member_label: Some(e), ..r))
+        }
+        if found.is_none() {
+          report(start, end, "E0212", "effect `#{def_of(e).name}` has no `#{name}`")
+        }
+        found
+      }
+    }
+  }
+}
+
+## The effect a label stands for, once the label is lowered.
+fn label_base(e_def: Int) -> Option[Int] uses { State[Resolver] } {
+  item_of(e_def) match {
+    Some(IEffect(e)) -> e.label match {
+      Some(l) -> l.base match {
+        ResDef(b) -> Some(b)
+        _         -> None
+      }
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering: expressions
+
+fn opt_expr(n: Option[Node], start: Int, end: Int) -> Int uses { State[Resolver] } {
+  n match {
+    Some(e) -> lower_expr(e)
+    None    -> alloc_expr(EMissing, start, end)
+  }
+}
+
+## The `nth` expression child of `n`, or Missing.
+fn child_expr(n: Node, nth: Int) -> Int uses { State[Resolver] } {
+  opt_expr(children(n).filter(|c| is_expr(c.kind)).get(nth), n.start, n.end)
+}
+
+fn lower_expr(n: Node) -> Int uses { State[Resolver] } {
+  k = n.kind
+  if k == PathExpr {
+    child_kind(n, Path) match {
+      Some(path) -> {
+        upd(|r| Resolver(member_label: None, ..r))
+        res = ctor_path(path, False)
+        id = alloc_expr(EPath(res), n.start, n.end)
+        st().member_label |> each_option(|label| {
+          upd(
+            |r| Resolver(
+              member_label: None,
+              program: Program(
+                member_labels: r.program.member_labels.insert(id, label),
+                ..r.program,
+              ),
+              ..r,
+            ),
+          )
+        })
+        id
+      }
+      None -> alloc_expr(EMissing, n.start, n.end)
+    }
+  } else if k == ParenExpr {
+    opt_expr(children(n).find(|c| is_expr(c.kind)), n.start, n.end)
+  } else {
+    kind = expr_kind(n)
+    alloc_expr(kind, n.start, n.end)
+  }
+}
+
+fn expr_kind(n: Node) -> ExprKind uses { State[Resolver] } {
+  k = n.kind
+  if k == Syntax.Literal {
+    tokens(n).head() match {
+      Some(t) if t.kind == IntLit   -> ELit(LInt(without_underscores(text_of(t))))
+      Some(t) if t.kind == FloatLit -> ELit(LFloat(without_underscores(text_of(t))))
+      _                             -> EMissing
+    }
+  } else if k == Syntax.String {
+    string_expr(n)
+  } else if k == NameRef {
+    EPath(name_ref(n))
+  } else if k == UnitExpr {
+    EUnit
+  } else if k == TupleExpr {
+    ETuple(children(n).filter(|c| is_expr(c.kind)).map(lower_expr))
+  } else if k == ListExpr {
+    (elems, rest) = children(n).fold(([], None), |(es, rest), c| {
+      if c.kind == RestExpr {
+        (es, children(c).find(|x| is_expr(x.kind)).map(lower_expr))
+      } else if is_expr(c.kind) {
+        (es.append([lower_expr(c)]), rest)
+      } else {
+        (es, rest)
+      }
+    })
+    EList(elems, rest)
+  } else if k == CallExpr {
+    call(n)
+  } else if k == FieldExpr {
+    field(n)
+  } else if k == PrefixExpr {
+    op = if tokens(n).head().map(|t| t.kind) == Some(Bang) { OpNot } else { OpNeg }
+    EUnary(op, child_expr(n, 0))
+  } else if k == BinExpr {
+    binary(n)
+  } else if k == UseExpr {
+    target = child_kind(n, Path).map(|p| resolve_type_ns(p, ExpectEffect)).or(ResErr)
+    EUse(target, type_arg_list(child_kind(n, TypeArgList)))
+  } else if k == FailExpr {
+    EFail(child_expr(n, 0))
+  } else if k == AssertExpr {
+    EAssert(child_expr(n, 0))
+  } else if k == BlockExpr {
+    push_scope()
+    block = block_body(n)
+    pop_scope()
+    EBlock(block)
+  } else if k == IfExpr {
+    parts = children(n).filter(|c| is_expr(c.kind))
+    cond = opt_expr(parts.get(0), n.start, n.end)
+    then_branch = opt_expr(parts.get(1), n.start, n.end)
+    else_branch = parts.get(2).map(lower_expr)
+    EIf(cond, then_branch, else_branch)
+  } else if k == MatchExpr {
+    scrutinee = child_expr(n, 0)
+    EMatch(scrutinee, arms(n, False))
+  } else if k == EscapeExpr {
+    target = child_expr(n, 0)
+    EEscape(target, arms(n, True))
+  } else if k == WithExpr {
+    with_expr(n)
+  } else if k == LambdaExpr {
+    lambda(n)
+  } else {
+    EMissing
+  }
+}
+
+fn without_underscores(s: String) -> String {
+  String.concat(s.split("_"))
+}
+
+fn with_expr(n: Node) -> ExprKind uses { State[Resolver] } {
+  items = children(n).filter_map(with_item)
+  # A bound name is in scope in the body only; the arguments of the items are evaluated outside.
+  push_scope()
+  outer = start_binder()
+  handlers = items.map(|(item, bound)| {
+    bound match {
+      Some((name, start, end)) -> WithItem(bind: Some(bind(name, BindingLocal, start, end)), ..item)
+      None                     -> item
+    }
+  })
+  bind_all(end_binder(outer))
+  body = child_expr(n, 0)
+  pop_scope()
+  EWith(handlers, body)
+}
+
+## `|p| body` is `|t| { p = t; body }`. A body that is not a block is put in one.
+fn lambda(n: Node) -> ExprKind uses { State[Resolver] } {
+  push_scope()
+  (params, lets) = lambda_params(child_kind(n, ParamList))
+  body = child_expr(n, 0)
+  pop_scope()
+  if lets.is_empty() {
+    ELambda(params, body)
+  } else {
+    e = st().program.exprs.get(body)
+    e match {
+      Some(Expr(EBlock(b), sp)) -> {
+        upd_program(
+          |p| Program(
+            exprs: p.exprs.insert(body, Expr(EBlock(Block(lets.append(b.stmts), b.tail)), sp)),
+            ..p,
+          ),
+        )
+        ELambda(params, body)
+      }
+      Some(Expr(_, sp)) -> ELambda(
+        params,
+        alloc_expr(EBlock(Block(lets, Some(body))), sp.start, sp.end),
+      )
+      None -> ELambda(params, body)
+    }
+  }
+}
+
+fn block_body(n: Node) -> Block uses { State[Resolver] } {
+  stmts = children(n).filter(|c| c.kind == Binding || c.kind == Syntax.LocalFn || is_expr(c.kind))
+  count = stmts.length()
+  (lowered, tail) = stmts.enumerate().fold(([], None), |(acc, tail), (i, c)| {
+    if c.kind == Binding {
+      (acc.append([binding(c)]), tail)
+    } else if c.kind == Syntax.LocalFn {
+      (acc.append([local_fn(c)]), tail)
+    } else {
+      e = lower_expr(c)
+      if i + 1 == count { (acc, Some(e)) } else { (acc.append([SExpr(e)]), tail) }
+    }
+  })
+  Block(lowered, tail)
+}
+
+## `pat: ty = value`. The right side is resolved first, so `count = count + 1` works.
+fn binding(n: Node) -> Stmt uses { State[Resolver] } {
+  kids = children(n)
+  typed = has_token(n, Colon)
+  ty = if typed { kids.get(1).map(lower_type) } else { None }
+  value_node = kids.get(if typed { 2 } else { 1 })
+  value = opt_expr(keep(value_node, |v| casts_to_expr(v.kind)), n.start, n.end)
+  outer = start_binder()
+  pat = keep(kids.head(), |l| casts_to_expr(l.kind)) match {
+    Some(lhs) -> expr_pat(lhs)
+    None      -> alloc_pat(PMissing, n.start, n.end)
+  }
+  bind_all(end_binder(outer))
+  SLet(pat, ty, value)
+}
+
+## A local fn. Its name is bound in the block's scope before the body is resolved, so the body can
+## call it; the parameters are in a scope of their own, inside it.
+fn local_fn(n: Node) -> Stmt uses { State[Resolver] } {
+  (name, start, end) = child_token(n, LowerName).map(|t| (text_of(t), t.start, t.end)).or(
+    ("", n.start, n.end),
+  )
+  local = alloc_local(name, LocalFnLocal, start, end)
+  if name != "" { bind_all([(name, local)]) }
+  saved = st().ignored_type_params
+  written = children_of(n, TypeParamList).flat_map(tokens).filter(|t| t.kind == UpperName).map(
+    text_of,
+  )
+  upd(|r| Resolver(ignored_type_params: r.ignored_type_params.append(written), ..r))
+  push_scope()
+  params = params_of(child_kind(n, ParamList), ParamLocal)
+  sig = signature(n, [], params, False)
+  body = opt_expr(child_kind(n, BlockExpr), n.start, n.end)
+  pop_scope()
+  upd(|r| Resolver(ignored_type_params: saved, ..r))
+  SLocalFn(LocalFn(local, sig, body, span(n.start, n.end)))
+}
+
+## Arms of match and escape. Each arm has its own scope; pattern names are visible in the guard
+## and body.
+fn arms(n: Node, is_escape: Bool) -> List[Arm] uses { State[Resolver] } {
+  child_kind(n, MatchArmList).map(|list| {
+    children_of(list, MatchArm).map(|a| {
+      push_scope()
+      outer = start_binder()
+      pat = children(a).find(|c| is_pat(c.kind)) match {
+        Some(p) -> {
+          id = lower_pat(p)
+          if is_escape { check_escape_pat(id) }
+          id
+        }
+        None -> alloc_pat(PMissing, a.start, a.end)
+      }
+      names = end_binder(outer)
+      names.each(|(_, local)| {
+        upd_program(|pr| {
+          l = pr.locals.get(local)
+          l.map(
+            |d| Program(
+              locals: pr.locals.insert(local, LocalData(kind: ArmBindingLocal, ..d)),
+              ..pr,
+            ),
+          ).or(pr)
+        })
+      })
+      bind_all(names)
+      guard = child_kind(a, MatchGuard).map(|g| child_expr(g, 0))
+      body = child_expr(a, 0)
+      pop_scope()
+      Arm(pat, guard, body)
+    })
+  }).or([])
+}
+
+fn string_expr(n: Node) -> ExprKind uses { State[Resolver] } {
+  parts = children_with_tokens(n).fold([], |acc, e| {
+    e match {
+      TokenElement(t) if t.kind == StringText -> {
+        text = string_text(n, t)
+        acc match {
+          [SText(prev), ..rest] -> [SText("#{prev}#{text}"), ..rest]
+          _                     -> [SText(text), ..acc]
+        }
+      }
+      NodeElement(i) if i.kind == Interp -> [SInterp(child_expr(i, 0)), ..acc]
+      _                                  -> acc
+    }
+  }).reverse()
+  parts match {
+    []         -> ELit(LString(""))
+    [SText(t)] -> ELit(LString(t))
+    _          -> EInterpolated(parts)
+  }
+}
+
+## Lowercase and uppercase names in expressions, and `self` and `Self`.
+fn name_ref(n: Node) -> Res uses { State[Resolver] } {
+  tokens(n).head() match {
+    Some(t) -> value(text_of(t), t.start, t.end, t.kind)
+    None    -> ResErr
+  }
+}
+
+fn value(name: String, start: Int, end: Int, kind: Kind) -> Res uses { State[Resolver] } {
+  if kind == SelfKw {
+    lookup_local("self") match {
+      Some(l) -> ResLocal(l)
+      None -> {
+        report(start, end, "E0219", "`self` can only be used in impls, traits and handlers")
+        ResErr
+      }
+    }
+  } else if kind == SelfTypeKw {
+    # `Self` as an expression is the constructor of the enclosing handler.
+    st().in_handler match {
+      Some((_, Some(ctor))) -> ResDef(ctor)
+      Some((_, None))       -> ResErr
+      None -> {
+        report(start, end, "E0219", "`Self` as a value can only be used in a handler")
+        ResErr
+      }
+    }
+  } else {
+    lookup_local(name) match {
+      Some(l) -> ResLocal(l)
+      None -> lookup_name(st().module, NsValue, name) match {
+        Some(d) -> ResDef(d)
+        None -> {
+          # Uppercase-name type parameters are usable only in type positions (spec 2.3).
+          lookup_type_param(name) match {
+            Some(d) -> report(
+              start,
+              end,
+              "E0217",
+              "expected value, found #{describe(kind_of(d))} `#{name}`",
+            )
+            None -> report(start, end, "E0211", "cannot find value `#{name}` in this scope")
+          }
+          ResErr
+        }
+      }
+    }
+  }
+}
+
+## A type-name path in an expression or pattern; looks up a constructor. Using an opaque type's
+## constructor outside its module is reported.
+fn ctor_path(path: Node, in_pattern: Bool) -> Res uses { State[Resolver] } {
+  segs = segments(path)
+  segs.last() match {
+    None -> ResErr
+    Some(last) -> {
+      name = text_of(last)
+      prefix = segs.take(segs.length() - 1)
+      found = if prefix.is_empty() {
+        lookup_name(st().module, NsCtor, name) match {
+          Some(d) -> Some(d)
+          None -> {
+            undefined_ctor(name, last.start, last.end)
+            None
+          }
+        }
+      } else {
+        resolve_prefix(prefix).and_then(
+          |left| member_of_left(left, NsCtor, name, last.start, last.end),
+        )
+      }
+      found match {
+        None -> ResErr
+        Some(def) -> {
+          d = def_of(def)
+          if d.is_opaque && d.module != SourceModule(st().module) {
+            m = def_module_name(def)
+            if in_pattern {
+              report_token(
+                last,
+                "E0216",
+                "the constructor of opaque type `#{name}` cannot be matched outside `#{m}`",
+              )
+            } else {
+              report_token(
+                last,
+                "E0215",
+                "opaque type `#{name}` cannot be constructed outside `#{m}`",
+              )
+            }
+          }
+          ResDef(def)
+        }
+      }
+    }
+  }
+}
+
+fn undefined_ctor(name: String, start: Int, end: Int) -> () uses { State[Resolver] } {
+  # A type, effect or module name written as a value.
+  module = st().module
+  found = lookup_name(module, NsType, name) match {
+    Some(d) -> Some(describe(kind_of(d)))
+    None -> if lookup_type_param(name).is_some() {
+      Some("type parameter")
+    } else if scope_of(module).modules.contains(name) {
+      Some("module")
+    } else {
+      None
+    }
+  }
+  found match {
+    Some(f) -> report(start, end, "E0217", "expected constructor, found #{f} `#{name}`")
+    None    -> report(start, end, "E0211", "cannot find constructor `#{name}` in this scope")
+  }
+}
+
+fn call(n: Node) -> ExprKind uses { State[Resolver] } {
+  callee = child_expr(n, 0)
+  (args, spread) = child_kind(n, ArgList).map(arg_list).or(([], None))
+  spread match {
+    None -> ECall(callee, args)
+    Some(base) -> {
+      # `Self` constructs a handler with its fields only.
+      callee_node = children(n).find(|c| is_expr(c.kind))
+      is_self = callee_node.map(
+        |c| c.kind == NameRef && tokens(c).head().map(|t| t.kind) == Some(SelfTypeKw),
+      )
+        == Some(True)
+      if st().in_handler.is_some() && is_self {
+        sp = expr_span(callee)
+        report(sp.start, sp.end, "E0222", "`Self` cannot be the target of a record update")
+      }
+      update(callee, args, base)
+    }
+  }
+}
+
+fn expr_span(id: Int) -> Span uses { State[Resolver] } {
+  st().program.exprs.get(id).map(|e| e.span).or(Span(0, 0, 0))
+}
+
+## The arguments of an ARG_LIST, and the expression after a trailing `..`.
+fn arg_list(list: Node) -> (List[Arg], Option[Int]) uses { State[Resolver] } {
+  children(list).fold(([], None), |(args, spread), a| {
+    if a.kind == SpreadArg {
+      # A `..` without an expression is already reported by the syntax checks.
+      (args, children(a).find(|c| is_expr(c.kind)).map(lower_expr) |> or_option(spread))
+    } else if a.kind == NamedArg {
+      child_token(a, LowerName) match {
+        None -> (args, spread)
+        Some(t) -> {
+          name = text_of(t)
+          label = Label(name, span(t.start, t.end))
+          # `NotFound(id:)` is short for `id: id`.
+          (v, punned) = children(a).find(|c| is_expr(c.kind)) match {
+            Some(e) -> (lower_expr(e), False)
+            None -> (
+              alloc_expr(EPath(value(name, t.start, t.end, LowerName)), t.start, t.end),
+              True,
+            )
+          }
+          (args.append([Arg(Some(label), v, punned)]), spread)
+        }
+      }
+    } else if is_expr(a.kind) {
+      (args.append([Arg(None, lower_expr(a), False)]), spread)
+    } else {
+      (args, spread)
+    }
+  })
+}
+
+fn or_option[A](o: Option[A], other: Option[A]) -> Option[A] {
+  o match {
+    Some(_) -> o
+    None    -> other
+  }
+}
+
+## An item of `with`, with the name it is bound to.
+fn with_item(c: Node) -> Option[(WithItem, Option[(String, Int, Int)])] uses { State[Resolver] } {
+  if c.kind == WithBind {
+    bound = child_token(c, LowerName).map(|t| (text_of(t), t.start, t.end))
+    children(c).find(|x| x.kind == WithBy || x.kind == Path || x.kind == Supply).and_then(
+      with_item,
+    ).map(|(item, _)| {
+      (item, bound)
+    })
+  } else if c.kind == WithBy {
+    supplies = children(c).filter(|x| x.kind == Path || x.kind == Supply)
+    supplies.head().map(|label| {
+      res = supply_path(label).map(|p| resolve_type_ns(p, ExpectLabel)).or(ResErr)
+      args = supply_args(label, res)
+      (by, by_init_args) = supplies.get(1).and_then(|s| {
+        supply_path(s).map(|p| {
+          r = resolve_type_ns(p, ExpectHandlerOrEffect)
+          init_args = supply_args(s, r)
+          (Some((r, node_span(p))), init_args)
+        })
+      }).or((None, None))
+      by_args = type_arg_list(child_kind(c, TypeArgList))
+      item = WithItem(
+        res,
+        node_span(c),
+        None,
+        None,
+        None,
+        args,
+        Some(by.or((ResErr, node_span(c)))),
+        by_args,
+        by_init_args,
+      )
+      (item, None)
+    })
+  } else if c.kind == Path || c.kind == Supply {
+    cap = child_kind(c, CapMember).and_then(
+      |m| child_token(m, LowerName).map(|t| (t, child_token(m, TypeName))),
+    )
+    cap match {
+      # `fs.Open(path)`: the member is looked up in the capability's effect by type checking.
+      Some((cap_token, member_token)) -> {
+        name = text_of(cap_token)
+        res = value(name, cap_token.start, cap_token.end, LowerName)
+        cap_expr = alloc_expr(EPath(res), cap_token.start, cap_token.end)
+        member_token.map(|m| {
+          label = Label(text_of(m), span(m.start, m.end))
+          args = supply_args(c, ResErr)
+          (
+            WithItem(
+              ResErr,
+              node_span(c),
+              None,
+              None,
+              Some((cap_expr, label)),
+              args,
+              None,
+              [],
+              None,
+            ),
+            None,
+          )
+        })
+      }
+      None -> supply_path(c).map(|p| {
+        upd(|r| Resolver(member_label: None, ..r))
+        res = resolve_type_ns(p, ExpectWithItem)
+        label = st().member_label
+        upd(|r| Resolver(member_label: None, ..r))
+        args = supply_args(c, res)
+        (WithItem(res, node_span(p), None, label, None, args, None, [], None), None)
+      })
+    }
+  } else {
+    None
+  }
+}
+
+## The arguments of init written on an item of `with` or `layer`. They call init, so a trailing
+## `..` (a record update) is E0222.
+fn supply_args(s: Node, res: Res) -> Option[SupplyArgs] uses { State[Resolver] } {
+  child_kind(s, ArgList).map(|list| {
+    (args, spread) = arg_list(list)
+    spread |> each_option(|base| {
+      sp = expr_span(base)
+      found = res match {
+        ResDef(d) -> describe(kind_of(d))
+        _         -> "expression"
+      }
+      report(sp.start, sp.end, "E0222", "a #{found} cannot be updated")
+    })
+    SupplyArgs(args, node_span(list))
+  })
+}
+
+## A record update `C(f: e, ..base)`. `C` must have a single constructor (a type, an error, or a
+## handler with fields), and changed fields are given by name.
+fn update(ctor: Int, args: List[Arg], base: Int) -> ExprKind uses { State[Resolver] } {
+  e = st().program.exprs.get(ctor)
+  sp = expr_span(ctor)
+  target = e.map(|x| x.kind) match {
+    Some(EPath(ResDef(d))) -> Some(d)
+    Some(EPath(ResErr))    -> None
+    Some(EMissing)         -> None
+    Some(EPath(ResLocal(l))) -> {
+      report(sp.start, sp.end, "E0222", "a local variable cannot be updated")
+      None
+    }
+    _ -> {
+      report(sp.start, sp.end, "E0222", "an expression cannot be updated")
+      None
+    }
+  }
+  target |> each_option(|d| {
+    data = def_of(d)
+    single = (
+      data.kind == ErrorKind
+        || (data.kind == CtorKind
+          && data.parent.map(|p| {
+            pk = kind_of(p)
+            pk == TypeKind || pk == HandlerKind
+          })
+            == Some(True))
+    )
+    if !single {
+      found = (data.kind, data.parent) match {
+        (CtorKind, Some(p)) if kind_of(p) == EnumKind -> "enum variant"
+        (k, _)                                        -> describe(k)
+      }
+      report(sp.start, sp.end, "E0222", "#{found} `#{data.name}` cannot be updated")
+    }
+  })
+  args.filter(|a| a.label.is_none()).each(|a| {
+    s = expr_span(a.value)
+    report(s.start, s.end, "E0223", "the fields of a record update are given by name")
+  })
+  EUpdate(ctor, args.filter(|a| a.label.is_some()), base)
+}
+
+## `x.name` is a field or a capability operation; `Module.f` and `Trait.f` are static references.
+fn field(n: Node) -> ExprKind uses { State[Resolver] } {
+  # A type name after `.` is a handler member of a capability (`fs.Open`).
+  name_token = child_tokens(n).find(|t| t.kind == LowerName || t.kind == TypeName)
+  base = children(n).find(|c| is_expr(c.kind))
+  name_token match {
+    None -> {
+      # `x.` without a name. The syntax diagnostic is already out.
+      base |> each_option(|b| {
+        lower_expr(b)
+        ()
+      })
+      EMissing
+    }
+    Some(t) -> {
+      name = text_of(t)
+      static_path = base match {
+        Some(b) if b.kind == PathExpr -> child_kind(b, Path)
+        _                             -> None
+      }
+      static_path match {
+        Some(path) -> {
+          res = resolve_prefix(segments(path)) match {
+            Some(left) -> member_of_left(left, NsValue, name, t.start, t.end).map(ResDef).or(ResErr)
+            None       -> ResErr
+          }
+          EPath(res)
+        }
+        None -> {
+          b = opt_expr(base, n.start, n.end)
+          EField(b, Label(name, span(t.start, t.end)))
+        }
+      }
+    }
+  }
+}
+
+fn binary(n: Node) -> ExprKind uses { State[Resolver] } {
+  lhs = child_expr(n, 0)
+  rhs = child_expr(n, 1)
+  ops = [
+    (Plus, OpAdd),
+    (Minus, OpSub),
+    (Star, OpMul),
+    (Slash, OpDiv),
+    (Percent, OpRem),
+    (Eq2, OpEq),
+    (Neq, OpNe),
+    (Lt, OpLt),
+    (LtEq, OpLe),
+    (Gt, OpGt),
+    (GtEq, OpGe),
+    (Amp2, OpAnd),
+    (Pipe2, OpOr),
+    (PipeGt, OpPipe),
+  ]
+  op = find_map_option(
+    child_tokens(n),
+    |t: Token| ops.find(|(k, _)| k == t.kind).map(|(_, o)| o),
+  ).or(OpAdd)
+  EBinary(op, lhs, rhs)
+}
+
+## The top-level pattern of an escape arm is an error constructor (spec 7.3).
+fn check_escape_pat(pat: Int) -> () uses { State[Resolver] } {
+  st().program.pats.get(pat) match {
+    Some(Pat(PCtor(ResDef(d), _, _), sp)) -> {
+      data = def_of(d)
+      if data.kind != ErrorKind {
+        report(
+          sp.start,
+          sp.end,
+          "E0217",
+          "expected error, found #{describe(data.kind)} `#{data.name}`",
+        )
+      }
+    }
+    _ -> ()
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering: patterns
+
+fn lower_pat(n: Node) -> Int uses { State[Resolver] } {
+  k = n.kind
+  kind = if k == WildcardPat {
+    PWild
+  } else if k == IdentPat {
+    child_token(n, LowerName).map(|t| PBind(bind(text_of(t), BindingLocal, t.start, t.end))).or(
+      PMissing,
+    )
+  } else if k == ConstPat {
+    child_token(n, UpperName).map(|t| PConst(const_ref(t))).or(PMissing)
+  } else if k == LiteralPat {
+    pat_literal(n)
+  } else if k == VariantPat {
+    res = child_kind(n, Path).map(|p| ctor_path(p, True)).or(ResErr)
+    (args, rest) = child_kind(n, PatArgList).map(|list| {
+      (args, rest) = children(list).fold(([], False), |(acc, rest), a| {
+        if a.kind == RestPat {
+          (acc, True)
+        } else if a.kind == FieldPat {
+          child_token(a, LowerName) match {
+            None    -> (acc, rest)
+            Some(t) -> (acc.append([field_pat(t, children(a).find(|c| is_pat(c.kind)))]), rest)
+          }
+        } else if is_pat(a.kind) {
+          (acc.append([PatArg(None, lower_pat(a))]), rest)
+        } else {
+          (acc, rest)
+        }
+      })
+      (Some(args), rest)
+    }).or((None, False))
+    PCtor(res, args, rest)
+  } else if k == UnitPat {
+    PUnit
+  } else if k == TuplePat {
+    PTuple(children(n).filter(|c| is_pat(c.kind)).map(lower_pat))
+  } else if k == ListPat {
+    (elems, rest) = children(n).fold(([], None), |(es, rest), c| {
+      if c.kind == RestPat {
+        binding = child_token(c, LowerName).map(|t| bind(text_of(t), BindingLocal, t.start, t.end))
+        (es, Some(ListRest(binding, node_span(c))))
+      } else if is_pat(c.kind) {
+        (es.append([lower_pat(c)]), rest)
+      } else {
+        (es, rest)
+      }
+    })
+    PList(elems, rest)
+  } else {
+    PMissing
+  }
+  alloc_pat(kind, n.start, n.end)
+}
+
+## `name: pat`, or `name:` (which binds `name`).
+fn field_pat(label: Token, inner: Option[Node]) -> PatArg uses { State[Resolver] } {
+  name = text_of(label)
+  pat = inner match {
+    Some(p) -> lower_pat(p)
+    None    -> punned_pat(name, label.start, label.end)
+  }
+  PatArg(Some(Label(name, span(label.start, label.end))), pat)
+}
+
+fn punned_pat(name: String, start: Int, end: Int) -> Int uses { State[Resolver] } {
+  local = bind(name, BindingLocal, start, end)
+  alloc_pat(PBind(local), start, end)
+}
+
+fn const_ref(t: Token) -> Res uses { State[Resolver] } {
+  name = text_of(t)
+  res = value(name, t.start, t.end, UpperName)
+  res match {
+    ResDef(d) if kind_of(d) != ConstKind -> {
+      report_token(t, "E0217", "expected constant, found #{describe(kind_of(d))} `#{name}`")
+      ResErr
+    }
+    _ -> res
+  }
+}
+
+## The left side of a binding was parsed as an expression; it is reinterpreted as a pattern.
+fn expr_pat(n: Node) -> Int uses { State[Resolver] } {
+  k = n.kind
+  if k == ParenExpr {
+    children(n).find(|c| is_expr(c.kind)) match {
+      Some(inner) -> expr_pat(inner)
+      None        -> alloc_pat(PMissing, n.start, n.end)
+    }
+  } else {
+    kind = if k == UnderscoreExpr {
+      PWild
+    } else if k == NameRef {
+      tokens(n).head() match {
+        Some(t) if t.kind == LowerName -> PBind(bind(text_of(t), BindingLocal, t.start, t.end))
+        Some(t) if t.kind == UpperName -> PConst(const_ref(t))
+        _                              -> PMissing
+      }
+    } else if k == Syntax.Literal || k == Syntax.String {
+      e = lower_expr(n)
+      st().program.exprs.get(e) match {
+        Some(Expr(ELit(lit), _)) -> PLit(lit)
+        _                        -> PMissing
+      }
+    } else if k == PrefixExpr {
+      pat_literal(n)
+    } else if k == UnitExpr {
+      PUnit
+    } else if k == PathExpr {
+      child_kind(n, Path).map(|p| PCtor(ctor_path(p, True), None, False)).or(PMissing)
+    } else if k == CallExpr {
+      callee = keep(children(n).find(|c| is_expr(c.kind)), |c| c.kind == PathExpr)
+      res = callee.and_then(|c| child_kind(c, Path)).map(|p| ctor_path(p, True)).or(ResErr)
+      (args, rest) = child_kind(n, ArgList).map(|list| {
+        children(list).fold(([], False), |(acc, rest), a| {
+          if a.kind == SpreadArg {
+            (acc, True)
+          } else if a.kind == NamedArg {
+            child_token(a, LowerName) match {
+              None -> (acc, rest)
+              Some(t) -> {
+                name = text_of(t)
+                pat = children(a).find(|c| is_expr(c.kind)) match {
+                  Some(inner) -> expr_pat(inner)
+                  None        -> punned_pat(name, t.start, t.end)
+                }
+                (acc.append([PatArg(Some(Label(name, span(t.start, t.end))), pat)]), rest)
+              }
+            }
+          } else if is_expr(a.kind) {
+            (acc.append([PatArg(None, expr_pat(a))]), rest)
+          } else {
+            (acc, rest)
+          }
+        })
+      }).or(([], False))
+      PCtor(res, Some(args), rest)
+    } else if k == TupleExpr {
+      PTuple(children(n).filter(|c| is_expr(c.kind)).map(expr_pat))
+    } else if k == ListExpr {
+      (elems, rest) = children(n).fold(([], None), |(es, rest), c| {
+        if c.kind == RestExpr {
+          binding = children(c).find(|x| x.kind == NameRef).and_then(|x| tokens(x).head()).and_then(
+            |t| {
+              if t.kind == LowerName {
+                Some(bind(text_of(t), BindingLocal, t.start, t.end))
+              } else {
+                None
+              }
+            },
+          )
+          (es, Some(ListRest(binding, node_span(c))))
+        } else if is_expr(c.kind) {
+          (es.append([expr_pat(c)]), rest)
+        } else {
+          (es, rest)
+        }
+      })
+      PList(elems, rest)
+    } else {
+      PMissing
+    }
+    alloc_pat(kind, n.start, n.end)
+  }
+}
+
+fn pat_literal(n: Node) -> PatKind uses { State[Resolver] } {
+  negative = has_token(n, Minus)
+  tokens(n).find(|t| t.kind == IntLit || t.kind == FloatLit) match {
+    Some(t) -> {
+      digits = without_underscores(text_of(t))
+      text = if negative { "-#{digits}" } else { digits }
+      if t.kind == IntLit { PLit(LInt(text)) } else { PLit(LFloat(text)) }
+    }
+    None -> {
+      strings = descendants(n).filter(|d| d.kind == Syntax.String)
+      PLit(
+        LString(
+          String.concat(
+            strings.flat_map(|s| {
+              child_tokens(s).filter(|t| t.kind == StringText).map(|t| string_text(s, t))
+            }),
+          ),
+        ),
+      )
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Attributes and string values
+
+## The arguments of an fn's `@external(target, "a", "b")` or `@export(...)`. Malformed ones are
+## left out (the parser reported them).
+fn attrs(f: Node, attr: String) -> List[ExternalAttr] uses { State[Resolver] } {
+  annotations(f).filter(|a| annotation_name(a) == Some(attr)).filter_map(|a| {
+    annotation_args(a) match {
+      [] -> None
+      [first, ..rest] -> {
+        target = if children(first).is_empty() { child_token(first, LowerName) } else { None }
+        target.map(|t| {
+          args = rest.filter(
+            |arg| !child_tokens(arg).any(|x| x.kind == LowerName || x.kind == Colon),
+          ).filter_map(|arg| {
+            child_kind(arg, Syntax.String).map(|lit| {
+              String.concat(
+                descendants(lit).filter(|d| d.kind == Syntax.String).flat_map(|s| {
+                  child_tokens(s).filter(|x| x.kind == StringText).map(|x| string_text(s, x))
+                }),
+              )
+            })
+          })
+          ExternalAttr(text_of(t), args, node_span(a))
+        })
+      }
+    }
+  })
+}
+
+## The value of `@key("...")` or `@tag("...")`: its one argument when it is a string literal
+## without interpolation.
+fn string_attr(n: Node, attr: String) -> Option[String] uses { State[Resolver] } {
+  annotations(n).find(|a| annotation_name(a) == Some(attr)).and_then(|a| {
+    annotation_args(a) match {
+      [arg] if !child_tokens(arg).any(|t| t.kind == LowerName || t.kind == Colon) -> {
+        children(arg) match {
+          [s] if s.kind == Syntax.String && children(s).is_empty() -> {
+            Some(
+              String.concat(
+                child_tokens(s).filter(|t| t.kind == StringText).map(|t| string_text(s, t)),
+              ),
+            )
+          }
+          _ -> None
+        }
+      }
+      _ -> None
+    }
+  })
+}
+
+## The value of a STRING_TEXT token of `string`. In a multiline string the newline after the
+## opening `"""` and the one before the closing one are dropped, and the closing line's indentation
+## is removed from each line; then escapes are resolved.
+fn string_text(string: Node, t: Token) -> String uses { State[Resolver] } {
+  raw = text_of(t)
+  all = children_with_tokens(string)
+  multiline = all.head() match {
+    Some(TokenElement(first)) -> first.kind == TripleQuote
+    _                         -> False
+  }
+  if !multiline {
+    unescape(raw)
+  } else {
+    index = all.enumerate().find(
+      |(_, e)| e match {
+        TokenElement(x) -> x == t
+        NodeElement(_)  -> False
+      },
+    ).map(|(i, _)| i).or(0)
+    is_quote = |e: Option[Element]| e match {
+      Some(TokenElement(x)) -> x.kind == TripleQuote
+      _                     -> False
+    }
+    first = is_quote(if index == 0 { None } else { all.get(index - 1) })
+    last = is_quote(all.get(index + 1))
+    indent = all.last() match {
+      Some(TokenElement(close)) if close.kind == TripleQuote -> {
+        q = text_of(close)
+        String.concat(
+          q.code_points().take(q.code_points().length() - 3).filter_map(String.from_code_point),
+        )
+      }
+      _ -> ""
+    }
+    trimmed_start = if first { strip_leading_newline(raw) } else { raw }
+    text = if last { strip_trailing_newline(trimmed_start) } else { trimmed_start }
+    lines = text.split("\n").enumerate().map(|(i, line)| {
+      if i == 0 && !first {
+        line
+      } else if line.starts_with(indent) {
+        String.concat(
+          line.code_points().drop(indent.code_points().length()).filter_map(String.from_code_point),
+        )
+      } else if line.trim() == "" {
+        String.concat(drop_while_blank(line.code_points()).filter_map(String.from_code_point))
+      } else {
+        line
+      }
+    })
+    unescape(String.join(lines, "\n"))
+  }
+}
+
+fn drop_while_blank(cs: List[Int]) -> List[Int] {
+  cs match {
+    [c, ..rest] if c == 0x20 || c == 0x09 -> drop_while_blank(rest)
+    _                                     -> cs
+  }
+}
+
+fn strip_leading_newline(s: String) -> String {
+  cs = s.code_points()
+  rest = cs match {
+    [0x0D, 0x0A, ..r] -> r
+    [0x0A, ..r]       -> r
+    _                 -> cs
+  }
+  String.concat(rest.filter_map(String.from_code_point))
+}
+
+fn strip_trailing_newline(s: String) -> String {
+  cs = s.code_points().reverse()
+  rest = cs match {
+    [0x0A, 0x0D, ..r] -> r
+    [0x0A, ..r]       -> r
+    _                 -> cs
+  }
+  String.concat(rest.reverse().filter_map(String.from_code_point))
+}
+
+## Resolves `\" \\ \n \t \r \# \u{...}`. Invalid escapes are kept as they are.
+fn unescape(text: String) -> String {
+  String.concat(unescape_onto(text.code_points(), []).reverse().filter_map(String.from_code_point))
+}
+
+fn unescape_onto(cs: List[Int], acc: List[Int]) -> List[Int] {
+  cs match {
+    []                   -> acc
+    [0x5C, 0x6E, ..rest] -> unescape_onto(rest, [0x0A, ..acc])
+    [0x5C, 0x74, ..rest] -> unescape_onto(rest, [0x09, ..acc])
+    [0x5C, 0x72, ..rest] -> unescape_onto(rest, [0x0D, ..acc])
+    [0x5C, 0x22, ..rest] -> unescape_onto(rest, [0x22, ..acc])
+    [0x5C, 0x5C, ..rest] -> unescape_onto(rest, [0x5C, ..acc])
+    [0x5C, 0x23, ..rest] -> unescape_onto(rest, [0x23, ..acc])
+    [0x5C, 0x75, 0x7B, ..rest] -> {
+      digits = take_while_hex(rest)
+      after = rest.drop(digits.length())
+      (digits, after) match {
+        (ds, [0x7D, ..r]) if !ds.is_empty() && ds.length() <= 6 -> {
+          v = ds.fold(0, |n, d| n * 16 + hex_digit(d))
+          if (v >= 0xD800 && v <= 0xDFFF) || v > 0x10FFFF {
+            unescape_onto(rest, [0x75, 0x5C, ..acc])
+          } else {
+            unescape_onto(r, [v, ..acc])
+          }
+        }
+        _ -> unescape_onto(rest, [0x75, 0x5C, ..acc])
+      }
+    }
+    [c, ..rest]          -> unescape_onto(rest, [c, ..acc])
+  }
+}
+
+fn take_while_hex(cs: List[Int]) -> List[Int] {
+  cs match {
+    [c, ..rest] if is_hex_digit(c) -> [c, ..take_while_hex(rest)]
+    _                              -> []
+  }
+}
+
+fn is_hex_digit(c: Int) -> Bool {
+  (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
+}
+
+fn hex_digit(c: Int) -> Int {
+  if c <= 0x39 { c - 0x30 } else if c >= 0x61 { c - 0x61 + 10 } else { c - 0x41 + 10 }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The whole program
+
+## Reports an fn of the module of a type, whose first parameter has that type at its head and
+## whose name is a field of that type (E0334).
+fn check_fn_field_names() -> () uses { State[Resolver] } {
+  p = st().program
+  p.items.fold([], |acc, def, item| {
+    item match {
+      IFn(f) -> {
+        d = def_of(def)
+        (d.module, d.span, f.sig.params.head().and_then(|x| x.ty)) match {
+          (SourceModule(module), Some(sp), Some(ty)) -> {
+            p.types.get(ty).map(|t| t.kind) match {
+              Some(TPath(ResDef(ty_def), _)) if def_of(ty_def).module == d.module -> {
+                fields = fields_of(ty_def)
+                if fields.any(|fd| fd.name == d.name) {
+                  acc.append([(module, sp, d.name, def_of(ty_def).name)])
+                } else {
+                  acc
+                }
+              }
+              _ -> acc
+            }
+          }
+          _ -> acc
+        }
+      }
+      _ -> acc
+    }
+  }).each(|(module, sp, name, ty)| {
+    report_in(
+      module,
+      sp.start,
+      sp.end,
+      "E0334",
+      "function `#{name}` has the name of a field of `#{ty}`",
+    )
+  })
+}
+
+fn fields_of(def: Int) -> List[FieldDef] uses { State[Resolver] } {
+  named = |f: Fields| f match {
+    NamedFields(fs) -> fs
+    _               -> []
+  }
+  item_of(def) match {
+    Some(IType(t))  -> named(t.fields)
+    Some(IError(e)) -> named(e.fields)
+    Some(IHandler(h)) -> h.ctor.and_then(item_of) match {
+      Some(ICtor(c)) -> named(c.fields)
+      _              -> []
+    }
+    _               -> []
+  }
+}
+
+## The result of name resolution: the program and the diagnostics, ordered by module and by
+## position within a module (ties keep the order they were found in).
+pub type Resolved(program: Program, diagnostics: List[Diag])
+
+## Resolves the modules of `map` whose trees are in `trees` (the others count as empty).
+pub fn resolve(map: ModuleMap, trees: Map[Int, (Array[Int], Tree)]) -> Resolved {
+  count = map.modules.length()
+  start = Resolver(
+    map:,
+    srcs: trees.map_values(|(src, _)| src),
+    program: empty_program(),
+    next_def: 0,
+    next_local: 0,
+    next_expr: 0,
+    next_pat: 0,
+    next_type: 0,
+    scopes: Map.empty(),
+    prelude_types: Map.empty(),
+    prelude_ctors: Map.empty(),
+    prelude_values: Map.empty(),
+    members: Map.empty(),
+    labels: Map.empty(),
+    inner_handlers: Map.empty(),
+    diagnostics: [],
+    module: 0,
+    locals: [],
+    type_params: [],
+    self_type: False,
+    in_handler: None,
+    type_arg: False,
+    ignored_type_params: [],
+    member_label: None,
+    binder: [],
+  )
+  (_, done) = State.run(start, || {
+    build_prelude()
+    roots = trees.map_values(|(_, tree)| Cst.root(tree))
+    pending = List.range(0, count).flat_map(|module| {
+      name = get(map, module).map(|d| d.name).or([])
+      upd_program(
+        |p| Program(
+          modules: p.modules.insert(module, ModuleItems(name, [], is_core(map, module), [])),
+          ..p,
+        ),
+      )
+      roots.get(module).map(|root| collect(module, root)).or([])
+    })
+    use_core_prelude()
+    List.range(0, count).each(|module| {
+      roots.get(module) |> each_option(|root| imports(module, root))
+      if !is_core(map, module) { warn_prelude_shadowing(module) }
+    })
+    List.range(0, count).each(|module| {
+      traits = visible_traits(module)
+      upd_program(|p| {
+        m = p.modules.get(module).or(ModuleItems([], [], False, []))
+        Program(modules: p.modules.insert(module, ModuleItems(traits:, ..m)), ..p)
+      })
+    })
+    # Labels first: `L.Open` names a handler member of the base of the label L.
+    is_label = |p: Pending| p.item.kind == EffectDecl && child_kind(p.item, EffectLabel).is_some()
+    pending.filter(is_label).append(pending.filter(|p| !is_label(p))).each(lower_item)
+    check_fn_field_names()
+  })
+  diagnostics = done.diagnostics.reverse().sort_by(|a, b| {
+    Ord.compare((a.module, a.start, a.end), (b.module, b.start, b.end))
+  })
+  Resolved(done.program, diagnostics)
+}

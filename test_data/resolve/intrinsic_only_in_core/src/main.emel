@@ -1,0 +1,11 @@
+@intrinsic
+fn length(s: String) -> Int
+
+@intrinsic
+type Handle(id: Int)
+
+@intrinsic
+pub opaque type Raw
+
+@intrinsic
+fn with_body() -> Int { 1 }

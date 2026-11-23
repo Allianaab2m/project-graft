@@ -1,0 +1,19 @@
+effect Query {
+  fn query(sql: String) -> Int
+}
+
+effect Execute {
+  fn execute(sql: String) -> ()
+}
+
+handler SystemTx: Query + Execute {
+  fn query(sql) { 0 }
+  fn execute(sql) { () }
+  fn quer(sql) { 0 }
+
+  handler Open(path: String): Query {
+    init(path: String) { Self(path:) }
+  }
+}
+
+fn f(x: use Query + Int) { () }

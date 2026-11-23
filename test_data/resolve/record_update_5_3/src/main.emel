@@ -1,0 +1,31 @@
+type User(id: Int, name: String)
+error NotFound(id: Int, detail: String)
+enum Shape {
+  Circle(radius: Float)
+}
+effect Counter {
+  fn get() -> Int
+}
+handler Fixed(value: Int): Counter {
+  init { Fixed(value: 0) }
+  fn get() {
+    next = Fixed(value: 1, ..self)
+    next.value
+  }
+}
+
+fn rename(user: User) -> User {
+  User(name: "b", ..user)
+}
+
+fn retag(e: NotFound) -> NotFound {
+  NotFound(detail: "x", ..e)
+}
+
+fn bad(user: User, shape: Shape) {
+  a = Circle(radius: 1.0, ..shape)
+  b = rename(name: "c", ..user)
+  c = User("c", ..user)
+  d = user(name: "c", ..user)
+  d
+}

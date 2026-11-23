@@ -1,0 +1,5 @@
+type Item(id: Int)
+
+fn first[Item, A](xs: List[Item]) -> Option[Item] { todo() }
+
+type Box[String](value: String)

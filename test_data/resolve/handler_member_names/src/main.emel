@@ -1,0 +1,16 @@
+effect ReadFile {
+  fn read(max: Int) -> Int
+}
+
+effect Files {
+  handler Open(path: String): ReadFile
+}
+
+fn f() -> Int {
+  with x = Files.Opn("a") { x.read(1) }
+}
+
+fn g() -> Int {
+  with x = Files.Open("a") { 0 }
+  x
+}

@@ -1,0 +1,8 @@
+import Lib
+import Lib.{open, secret, Hidden, Shown, Missing}
+
+fn f() {
+  Lib.secret()
+  Lib.open()
+  Lib.nothing()
+}

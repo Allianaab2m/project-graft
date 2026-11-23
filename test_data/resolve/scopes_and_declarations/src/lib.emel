@@ -1,0 +1,2 @@
+pub trait Named {}
+pub type Thing(x: Int)

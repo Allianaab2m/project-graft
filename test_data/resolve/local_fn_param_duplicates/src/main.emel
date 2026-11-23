@@ -1,0 +1,4 @@
+fn f() -> Int {
+  fn go(x: Int, x: Int) -> Int { x }
+  go(1, 2)
+}
