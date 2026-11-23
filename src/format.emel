@@ -1,18 +1,17 @@
 ## Formats a source. Follows `lib.rs` of the reference formatter (`emela-fmt`).
 ##
 ## Files with syntax errors are not formatted: the contents of an Error node do not follow the
-## grammar, so reprinting them could break the file. Graft knows only the parser's diagnostics
-## so far; the reference also refuses files with lexical errors and errors that validation finds.
+## grammar, so reprinting them could break the file. The old effect clause (E0147) and the old form
+## of an anonymous function (E0148) are not syntax errors here: the printer writes them in their
+## new forms (`[fmt.signature]`, `[fmt.closure]`).
 import Std.Array.{Array}
 import Std.Map.{Map}
 import Std.State.{State}
 import Cst
 import Doc
-import Grammar
 import Lexer
-import Parser
+import Parse
 import Printer
-import Sink
 import Source
 import Token.{Comment, DocComment, StringText, TripleQuote}
 
@@ -34,8 +33,8 @@ pub fn format(text: String) -> Formatted {
 ## strings) exceed it.
 pub fn format_with_width(text: String, width: Int) -> Formatted {
   src = Array.from_list(text.code_points())
-  built = parse(src)
-  if !built.diagnostics.is_empty() {
+  built = Parse.parse(src)
+  if built.diagnostics.any(|d| !is_rewritten(d.code)) {
     SyntaxErrors
   } else {
     root = Cst.root(built.tree)
@@ -53,11 +52,6 @@ pub fn format_with_width(text: String, width: Int) -> Formatted {
   }
 }
 
-fn parse(src: Array[Int]) -> Sink.Built {
-  tokens = Lexer.tokens(src)
-  Sink.build(src, Array.from_list(tokens), Parser.run(src, tokens, Grammar.source_file))
-}
-
 ## Checks that formatting did not change the meaning: the output must parse without errors, and
 ## its comments must match the input's. Returns what went wrong.
 ##
@@ -65,7 +59,7 @@ fn parse(src: Array[Int]) -> Sink.Built {
 ## (`normalized_tokens`). Graft does not yet.
 fn verify(src: Array[Int], before: Cst.Node, out: String) -> Option[String] {
   out_src = Array.from_list(out.code_points())
-  after = parse(out_src)
+  after = Parse.parse(out_src)
   after.diagnostics match {
     [d, ..] -> Some("the output has a syntax error: #{d.message} at #{d.start}..#{d.end}")
     [] -> {
@@ -83,6 +77,11 @@ fn comment_texts(src: Array[Int], root: Cst.Node) -> List[String] {
   Cst.tokens(root)
     |> List.filter(|t| t.kind == Comment || t.kind == DocComment)
     |> List.map(|t| String.trim(Source.slice(src, t.start, t.end)))
+}
+
+## Diagnostics of old forms that the formatter rewrites instead of refusing the file.
+fn is_rewritten(code: String) -> Bool {
+  code == "E0147" || code == "E0148"
 }
 
 ## Strips trailing whitespace and ends the output with exactly one newline. Whitespace before a

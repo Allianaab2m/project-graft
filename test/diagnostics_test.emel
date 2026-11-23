@@ -1,0 +1,38 @@
+import Parse
+
+## The diagnostics of `src` as `code@start..end`.
+fn diagnostics(src: String) -> List[String] {
+  Parse.parse_text(src).diagnostics.map(|d| "#{d.code}@#{d.start}..#{d.end}")
+}
+
+@test
+fn an_unterminated_string_ends_at_the_newline() {
+  assert diagnostics("const A = \"abc\nconst B = 1\n") == ["E0101@10..14"]
+}
+
+@test
+fn a_malformed_unicode_escape_covers_what_was_read() {
+  assert diagnostics("const A = \"\\u{D800}\"\n") == ["E0108@11..19"]
+  assert diagnostics("const A = \"\\u41\"\n") == ["E0108@11..13"]
+}
+
+@test
+fn lexer_diagnostics_come_before_the_parser_ones() {
+  assert diagnostics("fn f( {\nconst A = 1 $\n")
+    == ["E0105@20..21", "E0110@6..7", "E0110@6..7", "E0110@8..13", "E0122@20..21"]
+}
+
+@test
+fn the_left_side_of_a_binding_must_read_as_a_pattern() {
+  assert diagnostics("fn f() {\n  a + b = 1\n  a\n}\n") == ["E0125@11..16"]
+}
+
+@test
+fn a_function_without_a_body_must_be_external() {
+  assert diagnostics("fn f() -> Int\n") == ["E0130@3..4"]
+}
+
+@test
+fn a_local_function_as_the_last_statement_is_never_called() {
+  assert diagnostics("fn f() -> Int {\n  fn g() -> Int { 1 }\n}\n") == ["E0151@21..22"]
+}

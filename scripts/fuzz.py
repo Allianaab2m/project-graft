@@ -23,7 +23,9 @@ GRAFT = ROOT / "target/emela/native/main"
 ORACLE = ROOT / "tools/oracle/target/release/graft-oracle"
 # Tokens that open and close constructs, inserted at random.
 PIECES = ["{", "}", "(", ")", "[", "]", "|", "||", ",", "\n", "=", "->", "fn ", "match ", "@",
-          "..", ":", "\"", "#{", "derive ", "fails ", "uses ", "pub ", "if ", "else "]
+          "..", ":", "\"", "#{", "derive ", "fails ", "uses ", "pub ", "if ", "else ",
+          # Pieces that break strings, escapes and names (lexer diagnostics).
+          "\\", "\\u{", "\\u{D800}", "\\q", "\"\"\"", "\"\"\"\n", "&", "$", "0x", "1e", "Ab_c", "\r"]
 
 
 def reflow(rng, text):

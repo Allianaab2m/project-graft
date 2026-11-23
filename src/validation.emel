@@ -1,0 +1,586 @@
+## Shape checks after the tree is built. Follows `validation.rs` of the reference implementation:
+## the parser reads leniently, and constraints outside the grammar are checked here.
+##
+## The ranges and codes are the reference's. The messages that show the rewritten form of an old
+## head, clause or anonymous function (E0144, E0145, E0147, E0148) say only what to rewrite.
+import Std.Array.{Array}
+import Cst.{
+  Node,
+  Element,
+  NodeElement,
+  TokenElement,
+  child_token,
+  children,
+  children_with_tokens,
+  descendants,
+  parent,
+}
+import Source.{slice}
+import Syntax.{
+  NodeKind,
+  Diagnostic,
+  Annotation,
+  AnnotArgList,
+  AnnotArg,
+  FnDecl,
+  LocalFn,
+  TypeDecl,
+  EnumDecl,
+  FieldList,
+  VariantList,
+  Variant,
+  OpSig,
+  MemberSig,
+  HandlerDecl,
+  HandlerEffect,
+  ImplDecl,
+  ImplType,
+  ItemList,
+  TypeParamList,
+  Path,
+  RetType,
+  FailsClause,
+  UsesClause,
+  EffectSet,
+  Literal,
+  String,
+  Interp,
+  NameRef,
+  PathExpr,
+  UnderscoreExpr,
+  UnitExpr,
+  TupleExpr,
+  ListExpr,
+  RestExpr,
+  CallExpr,
+  NamedArg,
+  SpreadArg,
+  PrefixExpr,
+  BlockExpr,
+  Binding,
+  LambdaExpr,
+  ParamList,
+  Param,
+  Error,
+}
+import Token.{
+  Kind,
+  Token,
+  StringText,
+  LowerName,
+  TypeName,
+  UpperName,
+  FnKw,
+  PubKw,
+  SuspendKw,
+  UseKw,
+  ImplKw,
+  SelfKw,
+  SelfTypeKw,
+  Colon,
+  Minus,
+}
+
+## The languages that `@external` and `@export` name (`[ext.decl]`), one per build target.
+const EXTERNAL_LANGUAGES = ["js", "wasm", "c"]
+
+## The diagnostics of `root`, a tree of `src`, in the order they are found.
+pub fn validate(src: Array[Int], root: Node) -> List[Diagnostic] {
+  walk(src, root, []).reverse()
+}
+
+fn report(found: List[Diagnostic], start: Int, end: Int, code: String, message: String)
+  -> List[Diagnostic] {
+  [Diagnostic(code, start, end, message), ..found]
+}
+
+fn at_node(found: List[Diagnostic], node: Node, code: String, message: String)
+  -> List[Diagnostic] {
+  report(found, node.start, node.end, code, message)
+}
+
+fn walk_children(src: Array[Int], nodes: List[Node], found: List[Diagnostic]) -> List[Diagnostic] {
+  nodes.fold(found, |acc, child| walk(src, child, acc))
+}
+
+## Newest first.
+fn walk(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  kind = node.kind
+  if kind == Binding {
+    children(node) match {
+      []            -> found
+      [lhs, ..rest] -> walk_children(src, rest, binding_target(lhs, found))
+    }
+  } else if kind == LocalFn {
+    # An attribute is already reported as one; what it would say on a top-level fn (E0146 for
+    # `@export`) is not added.
+    walk_children(src, children(node).filter(|c| c.kind != Annotation), local_fn_modifiers(node, found))
+  } else {
+    walk_children(src, children(node), check(src, node, found))
+  }
+}
+
+## The checks on `node` itself.
+fn check(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  kind = node.kind
+  if kind == FnDecl {
+    fn_externals(src, node, fn_decl(src, node, found))
+  } else if kind == Annotation && is_named(src, node, "export") {
+    export(src, node, found)
+  } else if kind == TypeDecl {
+    # A built-in type of the bundled sources (`Bytes`) has no fields either.
+    missing = if (
+      child_kind(node, FieldList).is_none()
+        && !has_annotation(src, node, "external")
+        && !has_annotation(src, node, "intrinsic")
+    ) {
+      name_or(found, node, "E0130", "a type without fields must be `@external`")
+    } else {
+      found
+    }
+    # The annotation on `@external type` takes no arguments (spec 12.3).
+    annotations(src, node, "external")
+      .filter_map(|a| child_kind(a, AnnotArgList))
+      .fold(missing, |acc, list| at_node(acc, list, "E0141", "`@external` on a type takes no arguments"))
+  } else if kind == OpSig || kind == MemberSig {
+    child_kind(node, UsesClause) match {
+      Some(clause) -> {
+        what = if kind == OpSig { "effect operations" } else { "handler members" }
+        at_node(found, clause, "E0137", "#{what} cannot have a `uses` clause")
+      }
+      None -> found
+    }
+  } else if kind == UsesClause {
+    (child_token(node, UseKw), child_kind(node, EffectSet)) match {
+      (Some(keyword), Some(_)) -> {
+        report(found, keyword.start, keyword.end, "E0147", "write `uses` instead of `use`")
+      }
+      _ -> found
+    }
+  } else if kind == EnumDecl {
+    child_kind(node, VariantList) match {
+      Some(list) if child_kind(list, Variant).is_none() -> {
+        name_or(found, node, "E0132", "an enum needs at least one variant")
+      }
+      _ -> found
+    }
+  } else if kind == ImplDecl {
+    old_impl_head(src, node) match {
+      Some((start, end)) -> report(found, start, end, "E0144", "write the head as `impl Type: Trait`")
+      None               -> found
+    }
+  } else if kind == HandlerDecl {
+    old_handler_head(src, node) match {
+      Some(t) -> report(found, t.start, t.end, "E0145", "write `:` instead of `implements`")
+      None    -> found
+    }
+  } else if kind == LambdaExpr {
+    old_lambda_head(node) match {
+      Some(end) -> report(found, node.start, end, "E0148", "anonymous functions are written `|x| body`")
+      None      -> found
+    }
+  } else if kind == BlockExpr {
+    unused_local_fn(src, node, unused_lambdas(node, found))
+  } else if kind == UnderscoreExpr {
+    at_node(found, node, "E0123", "`_` can only be used in patterns")
+  } else if (kind == RestExpr || kind == SpreadArg) && children(node).is_empty() {
+    at_node(found, node, "E0124", "`..` without an expression can only be used in patterns")
+  } else {
+    found
+  }
+}
+
+## From `fn` to the end of the parameter list of the old form of an anonymous function
+## (`fn(x) { ... }`), as the end of that range. None for the new form, or one too broken to
+## rewrite.
+fn old_lambda_head(node: Node) -> Option[Int] {
+  if child_token(node, FnKw).is_none() || child_kind(node, BlockExpr).is_none() {
+    None
+  } else {
+    child_kind(node, ParamList).map(|list| list.end)
+  }
+}
+
+## E0149: the value of an anonymous function written as a statement before the last one is
+## discarded (`[fn.block]`).
+fn unused_lambdas(block: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  stmts = children(block).filter(|n| n.kind != Error)
+  stmts.take(stmts.length() - 1).filter(|s| s.kind == LambdaExpr).fold(found, |acc, s| {
+    at_node(acc, s, "E0149", "this anonymous function is never used")
+  })
+}
+
+## E0151: a local fn as the last statement of its block can never be called (`[fn.local]`).
+fn unused_local_fn(src: Array[Int], block: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  children(block).filter(|n| n.kind != Error).last() match {
+    Some(last) if last.kind == LocalFn -> {
+      child_token(last, LowerName) match {
+        Some(name) -> {
+          message = "local function `#{slice(src, name.start, name.end)}` is never called"
+          report(found, name.start, name.end, "E0151", message)
+        }
+        None -> at_node(found, last, "E0151", "local function `` is never called")
+      }
+    }
+    _ -> found
+  }
+}
+
+## E0150: what a top-level fn can have and a local fn cannot (`[fn.local]`).
+fn local_fn_modifiers(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  children_with_tokens(node).fold(found, |acc, element| {
+    message = element match {
+      NodeElement(n) if n.kind == Annotation    -> Some(("a local function cannot have attributes", n.start, n.end))
+      NodeElement(n) if n.kind == TypeParamList -> Some(("a local function cannot have type parameters", n.start, n.end))
+      TokenElement(t) if t.kind == PubKw        -> Some(("a local function cannot be `pub`", t.start, t.end))
+      TokenElement(t) if t.kind == SuspendKw    -> Some(("a local function cannot be `suspend`", t.start, t.end))
+      _                                         -> None
+    }
+    message match {
+      Some((text, start, end)) -> report(acc, start, end, "E0150", text)
+      None                     -> acc
+    }
+  })
+}
+
+## Accepts only the expression shapes that correspond to spec 17.6 patterns.
+fn binding_target(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  kind = node.kind
+  (ok, inner) = if kind == UnderscoreExpr || kind == PathExpr || kind == UnitExpr || kind == Literal {
+    (True, found)
+  } else if kind == NameRef {
+    # `self` and `Self` are not patterns (`[effect.handler]`).
+    (!has_token(node, SelfKw) && !has_token(node, SelfTypeKw), found)
+  } else if kind == PrefixExpr {
+    # `-1` `-1.5`: a negative number is a pattern (spec 17.6). A Literal holds a number.
+    only_literal = children(node) match {
+      [c] -> c.kind == Literal
+      _   -> False
+    }
+    (has_token(node, Minus) && only_literal, found)
+  } else if kind == String {
+    (children(node).all(|c| c.kind != Interp), found)
+  } else if kind == TupleExpr || kind == ListExpr {
+    (True, children(node).fold(found, |acc, c| binding_target(c, acc)))
+  } else if kind == RestExpr {
+    # Only a name may follow `..`.
+    ok = children(node) match {
+      []     -> True
+      [c, ..] -> c.kind == NameRef && has_token(c, LowerName)
+    }
+    (ok, found)
+  } else if kind == CallExpr {
+    # `Circle(radius:)` `User(name: n, ..)`. The callee must be a type reference.
+    children(node) match {
+      [] -> (False, found)
+      [callee, ..lists] -> {
+        args = lists.fold(found, |acc, list| {
+          children(list).fold(acc, |a, arg| {
+            if arg.kind == NamedArg {
+              children(arg).fold(a, |b, c| binding_target(c, b))
+            } else if arg.kind == SpreadArg && children(arg).is_empty() {
+              # Only a bare `..` is a pattern; `..expr` is the partial update syntax.
+              a
+            } else {
+              binding_target(arg, a)
+            }
+          })
+        })
+        (callee.kind == PathExpr, args)
+      }
+    }
+  } else {
+    (False, found)
+  }
+  if ok {
+    inner
+  } else {
+    at_node(inner, node, "E0125", "invalid left-hand side of binding: expected a pattern")
+  }
+}
+
+## Constraints that depend on where the fn is.
+fn fn_decl(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  has_body = child_kind(node, BlockExpr).is_some()
+  owner = parent(node) match {
+    Some(list) if list.kind == ItemList -> parent(list).map(|decl| decl.kind)
+    _                                   -> None
+  }
+  owner match {
+    # Top level. Built-in functions of the bundled core omit the body with `@intrinsic`.
+    None -> {
+      if has_annotation(src, node, "external") || has_annotation(src, node, "intrinsic") {
+        found
+      } else if !has_body {
+        name_or(found, node, "E0130", "a function without a body must be `@external`")
+      } else if has_token(node, SuspendKw) {
+        name_or(found, node, "E0130", "a top-level `suspend fn` must be `@external`")
+      } else {
+        found
+      }
+    }
+    Some(HandlerDecl) -> {
+      params = child_kind(node, ParamList).map(children).or([])
+      typed = params.filter(|p| !children(p).is_empty()).fold(found, |acc, p| {
+        at_node(acc, p, "E0134", "handler operation parameters take their types from the effect")
+      })
+      if has_body { typed } else { name_or(typed, node, "E0135", "this function needs a body") }
+    }
+    Some(ImplDecl) -> {
+      clauses = children(node).filter(|c| {
+        c.kind == RetType || c.kind == FailsClause || c.kind == UsesClause
+      })
+      signature = clauses.fold(found, |acc, c| {
+        at_node(acc, c, "E0136", "impl methods take their signature from the trait")
+      })
+      if has_body {
+        signature
+      } else {
+        name_or(signature, node, "E0135", "this function needs a body")
+      }
+    }
+    # A trait fn may omit the body.
+    _ -> found
+  }
+}
+
+fn annot_args(annotation: Node) -> List[Node] {
+  child_kind(annotation, AnnotArgList).map(children).or([]).filter(|a| a.kind == AnnotArg)
+}
+
+## Arguments that failed to parse already have a syntax diagnostic; do not pile on.
+fn broken(args: List[Node]) -> Bool {
+  args.any(|arg| descendants(arg).any(|n| n.kind == Error))
+}
+
+## The shape of a fn's `@external(language, "a")` and `@external(language, "a", "b")` (spec 12.1):
+## one or two strings after the language name, and one annotation per language.
+fn fn_externals(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  (out, _) = annotations(src, node, "external").fold((found, []), |(acc, seen), annotation| {
+    args = annot_args(annotation)
+    if broken(args) {
+      (acc, seen)
+    } else {
+      args match {
+        [] -> {
+          message = "`@external` on a function needs a language and a name: `@external(js, \"name\")`"
+          (at_node(acc, annotation, "E0138", message), seen)
+        }
+        [first, ..rest] -> annot_name(src, first) match {
+          None -> {
+            message = "the first argument of `@external` must be a language name such as `js`"
+            (at_node(acc, first, "E0138", message), seen)
+          }
+          Some(language) -> {
+            (checked, now_seen) = if !EXTERNAL_LANGUAGES.any(|l| l == language) {
+              message = "unknown language `#{language}` in `@external`: expected `js`, `wasm` or `c`"
+              (at_node(acc, first, "E0140", message), seen)
+            } else if seen.any(|l| l == language) {
+              message = "more than one `@external` for language `#{language}`"
+              (at_node(acc, first, "E0139", message), seen)
+            } else {
+              (acc, [language, ..seen])
+            }
+            strings = rest.fold(checked, |a, arg| {
+              annot_string(arg) match {
+                Some(True)  -> a
+                Some(False) -> at_node(a, arg, "E0138", "string interpolation is not allowed in `@external`")
+                None        -> at_node(a, arg, "E0138", "arguments after the language of `@external` must be strings")
+              }
+            })
+            n = rest.length()
+            counted = if n < 1 || n > 2 {
+              message = "`@external` takes one or two strings after the language, found #{n}"
+              at_node(strings, annotation, "E0138", message)
+            } else {
+              strings
+            }
+            (counted, now_seen)
+          }
+        }
+      }
+    }
+  })
+  out
+}
+
+## The place and the arguments of `@export(language, "name")` and
+## `@export(language, "interface", "name")` (spec 12.7).
+fn export(src: Array[Int], annotation: Node, found: List[Diagnostic]) -> List[Diagnostic] {
+  on_fn_with_body = parent(annotation) match {
+    Some(decl) -> {
+      top_level = parent(decl) match {
+        Some(p) -> p.kind != ItemList
+        None    -> True
+      }
+      decl.kind == FnDecl && top_level && child_kind(decl, BlockExpr).is_some()
+    }
+    None -> False
+  }
+  malformed = "expected `@export(target, \"name\")`"
+  if !on_fn_with_body {
+    at_node(found, annotation, "E0146", "`@export` is written on a top-level fn with a body")
+  } else {
+    args = annot_args(annotation)
+    if broken(args) {
+      found
+    } else {
+      args match {
+        [] -> at_node(found, annotation, "E0146", malformed)
+        [first, ..rest] -> annot_name(src, first) match {
+          None           -> at_node(found, first, "E0146", malformed)
+          Some(language) -> export_args(src, annotation, first, language, rest, found)
+        }
+      }
+    }
+  }
+}
+
+fn export_args(
+  src: Array[Int],
+  annotation: Node,
+  first: Node,
+  language: String,
+  rest: List[Node],
+  found: List[Diagnostic],
+) -> List[Diagnostic] {
+  malformed = "expected `@export(target, \"name\")`"
+  known = if EXTERNAL_LANGUAGES.any(|l| l == language) {
+    found
+  } else {
+    message = "unknown language `#{language}` in `@export`: expected `js`, `wasm` or `c`"
+    at_node(found, first, "E0140", message)
+  }
+  (checked, strings) = rest.fold((known, True), |(acc, ok), arg| {
+    annot_string(arg) match {
+      Some(True)  -> (acc, ok)
+      Some(False) -> (at_node(acc, arg, "E0146", "string interpolation is not allowed in `@export`"), False)
+      None        -> (at_node(acc, arg, "E0146", malformed), False)
+    }
+  })
+  n = rest.length()
+  if n < 1 || n > 2 {
+    at_node(checked, annotation, "E0146", malformed)
+  } else if language == "c" && n == 2 {
+    message = "on the native target, `@export` takes one name: `@export(c, \"name\")`"
+    at_node(checked, annotation, "E0146", message)
+  } else if strings && language == "js" {
+    rest match {
+      [name] if string_value(src, name) == Some("default") -> {
+        message = "on target `js`, the name `\"default\"` is the default export: write `@export(js, \"default\", \"name\")`"
+        at_node(checked, name, "E0146", message)
+      }
+      [interface, _] if string_value(src, interface) != Some("default") -> {
+        message = "on target `js`, the middle argument of `@export` must be `\"default\"`"
+        at_node(checked, interface, "E0146", message)
+      }
+      _ -> checked
+    }
+  } else {
+    checked
+  }
+}
+
+## The old head of an impl (`impl Show for User`, `impl[A: Eq] Box[A]: Eq`): the range from `impl`
+## to the end of the head. None for the new form, or one too broken to rewrite.
+fn old_impl_head(src: Array[Int], node: Node) -> Option[(Int, Int)] {
+  leading = child_kind(node, TypeParamList).is_some()
+  has_for = tokens_of(node).any(|t| t.kind == LowerName && slice(src, t.start, t.end) == "for")
+  (child_token(node, ImplKw), child_kind(node, ImplType), child_kind(node, Path)) match {
+    (Some(keyword), Some(ty), Some(trait_ref)) if leading || has_for -> {
+      Some((keyword.start, Int.max(ty.end, trait_ref.end)))
+    }
+    _ -> None
+  }
+}
+
+## The `implements` of the old head of a handler (`handler H implements E`). None for the new
+## form, or one too broken to rewrite.
+fn old_handler_head(src: Array[Int], node: Node) -> Option[Token] {
+  implements = tokens_of(node).find(|t| {
+    t.kind == LowerName && slice(src, t.start, t.end) == "implements"
+  })
+  implements match {
+    None    -> None
+    Some(t) -> {
+      # The name, or the field list after it.
+      before = children_with_tokens(node).any(|e| {
+        e match {
+          TokenElement(n) -> n.kind == TypeName && n.end <= t.start
+          NodeElement(n)  -> n.kind == FieldList && n.end <= t.start
+        }
+      })
+      effects = children(node).any(|n| n.kind == HandlerEffect)
+      if before && child_token(node, TypeName).is_some() && effects { Some(t) } else { None }
+    }
+  }
+}
+
+## The text of a string argument without interpolation, as written.
+fn string_value(src: Array[Int], arg: Node) -> Option[String] {
+  child_kind(arg, String).map(|s| {
+    String.concat(tokens_of(s).filter(|t| t.kind == StringText).map(|t| slice(src, t.start, t.end)))
+  })
+}
+
+## Whether the annotation's name (the token after `@`) is `name`.
+fn is_named(src: Array[Int], annotation: Node, name: String) -> Bool {
+  child_token(annotation, LowerName).map(|t| slice(src, t.start, t.end)) == Some(name)
+}
+
+## The name of an annotation argument that is a bare name (`js`).
+fn annot_name(src: Array[Int], arg: Node) -> Option[String] {
+  if !children(arg).is_empty() || has_token(arg, Colon) {
+    None
+  } else {
+    child_token(arg, LowerName).map(|t| slice(src, t.start, t.end))
+  }
+}
+
+## Whether the annotation argument is just a string: `Some(True)` without interpolation,
+## `Some(False)` with it, `None` if it is not a string.
+fn annot_string(arg: Node) -> Option[Bool] {
+  if has_token(arg, LowerName) {
+    None
+  } else {
+    child_kind(arg, String).map(|s| child_kind(s, Interp).is_none())
+  }
+}
+
+fn has_annotation(src: Array[Int], node: Node, name: String) -> Bool {
+  !annotations(src, node, name).is_empty()
+}
+
+fn annotations(src: Array[Int], node: Node, name: String) -> List[Node] {
+  children(node).filter(|c| {
+    c.kind == Annotation && tokens_of(c).any(|t| {
+      t.kind == LowerName && slice(src, t.start, t.end) == name
+    })
+  })
+}
+
+fn child_kind(node: Node, kind: NodeKind) -> Option[Node] {
+  children(node).find(|c| c.kind == kind)
+}
+
+## The child tokens of `node`.
+fn tokens_of(node: Node) -> List[Token] {
+  children_with_tokens(node).filter_map(|e| {
+    e match {
+      TokenElement(t) -> Some(t)
+      NodeElement(_)  -> None
+    }
+  })
+}
+
+fn has_token(node: Node, kind: Kind) -> Bool {
+  child_token(node, kind).is_some()
+}
+
+## Reports on the declaration's name token if it has one; a whole declaration is long.
+fn name_or(found: List[Diagnostic], node: Node, code: String, message: String) -> List[Diagnostic] {
+  tokens_of(node).find(|t| t.kind == LowerName || t.kind == TypeName || t.kind == UpperName) match {
+    Some(t) -> report(found, t.start, t.end, code, message)
+    None    -> at_node(found, node, code, message)
+  }
+}

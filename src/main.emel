@@ -15,9 +15,8 @@ import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
 import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
 import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
-import Grammar
 import Lexer
-import Parser
+import Parse
 import Sink
 import Syntax
 
@@ -102,10 +101,7 @@ fn parse(files: List[String]) -> ExitCode uses { Console, FileSystem } {
 }
 
 fn build(text: String) -> Sink.Built {
-  src = Array.from_list(text.code_points())
-  tokens = Lexer.tokens(src)
-  p = Parser.run(src, tokens, Grammar.source_file)
-  Sink.build(src, Array.from_list(tokens), p)
+  Parse.parse_text(text)
 }
 
 fn tree(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {

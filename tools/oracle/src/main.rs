@@ -8,8 +8,8 @@
 //! - Positions count code points, not bytes, because Graft reads sources as code points.
 //! - Kinds are the PascalCase of the reference implementation's `SyntaxKind` (`L_PAREN` is
 //!   `LParen`), except for the few in `RENAMES`.
-//! - Diagnostics follow as `error[E0101]@start..end`, without messages. `tree` prints only the
-//!   codes the parser reports (`PARSER_CODES`), not those of the lexer or of validation.
+//! - Diagnostics follow as `error[E0101]@start..end`, without messages: those of the lexer, the
+//!   parser and validation, in the order `emela_syntax::parse` gives them.
 
 use std::env;
 use std::fs;
@@ -24,12 +24,6 @@ const RENAMES: &[(&str, &str)] = &[
     ("FLOAT", "FloatLit"),
     ("LTEQ", "LtEq"),
     ("GTEQ", "GtEq"),
-];
-
-/// The codes the parser of emela-syntax reports. Validation reports a disjoint set.
-const PARSER_CODES: &[&str] = &[
-    "E0110", "E0111", "E0112", "E0113", "E0114", "E0115", "E0117", "E0118", "E0119", "E0120",
-    "E0121", "E0122", "E0126", "E0127", "E0128", "E0129", "E0131", "E0133", "E0142",
 ];
 
 fn main() -> ExitCode {
@@ -75,9 +69,6 @@ fn main() -> ExitCode {
         let parse = emela_syntax::parse(&src);
         dump_tree(&parse.syntax(), &positions, &mut out);
         for d in parse.diagnostics() {
-            if !PARSER_CODES.contains(&d.code.as_str()) {
-                continue;
-            }
             out += &format!("error[{}]@{}\n", d.code, positions.range(d.range));
         }
     }

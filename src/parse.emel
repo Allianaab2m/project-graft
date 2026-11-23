@@ -1,0 +1,24 @@
+## Lexes, parses and validates a source. Follows `parse` of the reference implementation: the
+## diagnostics are the lexer's, then those of the parser and validation sorted by position
+## (keeping the parser's first for ties).
+import Std.Array.{Array}
+import Cst
+import Grammar
+import Lexer
+import Parser
+import Sink.{Built}
+import Validation
+
+pub fn parse(src: Array[Int]) -> Built {
+  lexed = Lexer.lex_all(src)
+  p = Parser.run(src, lexed.tokens, Grammar.source_file)
+  built = Sink.build(src, Array.from_list(lexed.tokens), p)
+  checked = built.diagnostics.append(Validation.validate(src, Cst.root(built.tree))).sort_by(
+    |a, b| Ord.compare((a.start, a.end), (b.start, b.end)),
+  )
+  Built(built.tree, lexed.diagnostics.append(checked))
+}
+
+pub fn parse_text(text: String) -> Built {
+  parse(Array.from_list(text.code_points()))
+}

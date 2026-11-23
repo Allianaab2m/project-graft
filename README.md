@@ -54,7 +54,7 @@ $ emela run . -- parse <file>...                     # parses the files, to time
 
 `tools/oracle` is a small Rust program that prints what the reference implementation
 (`emela-syntax` and `emela-fmt` at the tag of the release in `Pome.toml`) makes of a file, in the
-format of `graft tokens`, `graft tree` and `graft fmt`. `scripts/compare.sh` builds it with cargo.
+format of `graft tokens`, `graft tree` (with every syntax diagnostic) and `graft fmt`. `scripts/compare.sh` builds it with cargo.
 
 The scripts run the `emela` on `PATH`. Put the release in `Pome.toml` first if another version
 is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
@@ -63,11 +63,9 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
 
 - M1: done. All 297 files of the corpus at v0.28.2 round-trip on js and native (wasm has no
   `Std.FileSystem` yet).
-- M2, parser: the tokens and the syntax trees, with the parser's diagnostics, of all 297 files
-  equal the reference's. So do those of 4,394 inputs made by breaking corpus files at random.
-  Lexing and parsing the corpus (441 KB) takes 0.29 s on native.
-- M2, fmt: `graft fmt` gives byte for byte the output of `emela fmt` on every file the reference
-  formats (254 of 297), and refuses the same files for syntax errors, except 4 that only the
-  reference's validation rejects (`scripts/known-differences.txt`). So do 3,158 inputs made by
-  moving whitespace in corpus files, formatted at random widths from 10 to 140. Formatting the
-  largest file (18 KB) takes 54 ms on native.
+- M2: done. On all 297 files of the corpus at v0.28.2, the tokens, the syntax trees and the
+  diagnostics of the lexer, the parser and validation equal the reference's, and `graft fmt`
+  gives byte for byte the output of `emela fmt` (or refuses the same files). So do 1,998 inputs
+  made by breaking corpus files (`scripts/fuzz.py tree`) and 1,600 made by moving their whitespace,
+  formatted at random widths from 10 to 140 (`scripts/fuzz.py fmt`). Lexing, parsing and validating the corpus (441 KB) takes 0.31 s on native;
+  formatting its largest file (18 KB) takes 50 ms.

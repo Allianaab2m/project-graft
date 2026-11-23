@@ -1,11 +1,12 @@
 ## Splits a source into tokens, keeping trivia. Follows `[lex]` and `[grammar.lex]` of the
 ## specification and the token boundaries of the reference implementation (emela-syntax).
 ##
-## The source is read as an array of code points, and token positions count code points.
-## Diagnostics are not reported yet.
+## The source is read as an array of code points, and token and diagnostic positions count code
+## points.
 import Std.Array.{Array}
 import Continuation
 import Source.{slice}
+import Syntax.{Diagnostic}
 import Token.{
   Kind,
   Token,
@@ -112,37 +113,80 @@ const L_BRACE = 0x7B
 const PIPE = 0x7C
 const R_BRACE = 0x7D
 
-## What the lexer is inside. The bottom of the stack is always Code.
+## What the lexer is inside. The bottom of the stack is always Code. `open` is where the string
+## or interpolation starts.
 enum Mode {
   Code
-  Str
-  MultiStr
+  Str(open: Int)
+  ## A multiline string, with the start of each line of its body so far (newest first), to check
+  ## their indentation when it closes.
+  MultiStr(open: Int, lines: List[Int])
   ## An interpolation, with the number of `{` open inside it.
-  Interp(Int)
+  Interp(open: Int, depth: Int)
 }
 
-## The result of one step: the token read (if any), the next position and the modes after it.
-type Step(tokens: List[Token], next: Int, modes: List[Mode])
+## The result of one step: the token read (if any), the next position, the modes after it and
+## the diagnostics.
+type Step(tokens: List[Token], next: Int, modes: List[Mode], diagnostics: List[Diagnostic])
+
+## The tokens of a source and the lexer's diagnostics, sorted by position (keeping the order they
+## were found in for ties).
+pub type Lexed(tokens: List[Token], diagnostics: List[Diagnostic])
 
 pub fn lex(text: String) -> List[Token] {
   tokens(Array.from_list(text.code_points()))
 }
 
 pub fn tokens(src: Array[Int]) -> List[Token] {
-  raw = Array.from_list(run(src, 0, [Code], []).reverse())
-  Continuation.mark(src, raw)
+  lex_all(src).tokens
 }
 
-fn run(src: Array[Int], pos: Int, modes: List[Mode], acc: List[Token]) -> List[Token] {
+pub fn lex_all(src: Array[Int]) -> Lexed {
+  (raw, diagnostics) = run(src, 0, [Code], [], [])
+  marked = Continuation.mark(src, Array.from_list(raw.reverse()))
+  sorted = diagnostics.reverse().sort_by(|a, b| Ord.compare((a.start, a.end), (b.start, b.end)))
+  Lexed(marked, sorted)
+}
+
+## Tokens and diagnostics newest first.
+fn run(
+  src: Array[Int],
+  pos: Int,
+  modes: List[Mode],
+  acc: List[Token],
+  diagnostics: List[Diagnostic],
+) -> (List[Token], List[Diagnostic]) {
   if pos >= src.size() {
-    acc
+    (acc, unclosed(src.size(), modes, diagnostics))
   } else {
     step = modes match {
-      [Str, ..]      -> string_step(src, pos, modes)
-      [MultiStr, ..] -> multi_string_step(src, pos, modes)
-      _              -> code_step(src, pos, modes)
+      [Str(open), ..]      -> string_step(src, pos, open, modes)
+      [MultiStr(_, _), ..] -> multi_string_step(src, pos, modes)
+      _                    -> code_step(src, pos, modes)
     }
-    run(src, step.next, step.modes, step.tokens.reverse().append(acc))
+    run(
+      src,
+      step.next,
+      step.modes,
+      step.tokens.reverse().append(acc),
+      step.diagnostics.reverse().append(diagnostics),
+    )
+  }
+}
+
+## Reports what is still open at the end of the input, innermost first.
+fn unclosed(end: Int, modes: List[Mode], diagnostics: List[Diagnostic]) -> List[Diagnostic] {
+  modes match {
+    [] -> diagnostics
+    [mode, ..outer] -> {
+      found = mode match {
+        Str(open)         -> [Diagnostic("E0101", open, end, "unterminated string literal")]
+        MultiStr(open, _) -> [Diagnostic("E0101", open, end, "unterminated string literal")]
+        Interp(open, _)   -> [Diagnostic("E0102", open, end, "unterminated interpolation")]
+        Code              -> []
+      }
+      unclosed(end, outer, found.append(diagnostics))
+    }
   }
 }
 
@@ -161,7 +205,11 @@ fn skip_while(src: Array[Int], i: Int, f: fn(Int) -> Bool) -> Int {
 }
 
 fn one(kind: Kind, start: Int, end: Int, modes: List[Mode]) -> Step {
-  Step([Token(kind, start, end)], end, modes)
+  Step([Token(kind, start, end)], end, modes, [])
+}
+
+fn with_diagnostics(step: Step, diagnostics: List[Diagnostic]) -> Step {
+  Step(diagnostics: step.diagnostics.append(diagnostics), ..step)
 }
 
 fn pop(modes: List[Mode]) -> List[Mode] {
@@ -172,19 +220,41 @@ fn pop(modes: List[Mode]) -> List[Mode] {
 
 fn code_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
   (kind, end) = scan_code(src, pos)
-  kind match {
-    StringQuote -> one(StringQuote, pos, end, [Str, ..modes])
-    TripleQuote -> one(TripleQuote, pos, end, [MultiStr, ..modes])
+  step = kind match {
+    StringQuote -> one(StringQuote, pos, end, [Str(pos), ..modes])
+    TripleQuote -> one(TripleQuote, pos, end, [MultiStr(pos, []), ..modes])
     LBrace -> modes match {
-      [Interp(depth), ..rest] -> one(LBrace, pos, end, [Interp(depth + 1), ..rest])
-      _                       -> one(LBrace, pos, end, modes)
+      [Interp(open, depth), ..rest] -> one(LBrace, pos, end, [Interp(open, depth + 1), ..rest])
+      _                             -> one(LBrace, pos, end, modes)
     }
     RBrace -> modes match {
-      [Interp(0), ..rest]     -> one(InterpEnd, pos, end, rest)
-      [Interp(depth), ..rest] -> one(RBrace, pos, end, [Interp(depth - 1), ..rest])
-      _                       -> one(RBrace, pos, end, modes)
+      [Interp(_, 0), ..rest]        -> one(InterpEnd, pos, end, rest)
+      [Interp(open, depth), ..rest] -> one(RBrace, pos, end, [Interp(open, depth - 1), ..rest])
+      _                             -> one(RBrace, pos, end, modes)
     }
     _           -> one(kind, pos, end, modes)
+  }
+  bad = if kind == ErrorToken { [error_token(src, pos, end)] } else { [] }
+  next = at(src, end)
+  opening = if kind == TripleQuote && next != LF && next != CR {
+    [Diagnostic("E0109", pos, end, "expected a newline after the opening `\"\"\"`")]
+  } else {
+    []
+  }
+  with_diagnostics(step, bad.append(opening))
+}
+
+## What an ErrorToken is: a word that is no name, a malformed number, or a character the lexer
+## does not know.
+fn error_token(src: Array[Int], start: Int, end: Int) -> Diagnostic {
+  c = at(src, start)
+  text = slice(src, start, end)
+  if is_word_start(c) {
+    Diagnostic("E0103", start, end, "invalid name `#{text}`: not a lower, type, or upper name")
+  } else if is_digit(c) {
+    Diagnostic("E0104", start, end, "invalid number literal `#{text}`")
+  } else {
+    Diagnostic("E0105", start, end, "unrecognized character `#{text}`")
   }
 }
 
@@ -381,70 +451,112 @@ fn classify_name(cs: List[Int]) -> Kind {
 
 # Strings
 
-fn string_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
+fn string_step(src: Array[Int], pos: Int, open: Int, modes: List[Mode]) -> Step {
   c = at(src, pos)
   if c == QUOTE {
     one(StringQuote, pos, pos + 1, pop(modes))
   } else if c == HASH && at(src, pos + 1) == L_BRACE {
-    one(InterpStart, pos, pos + 2, [Interp(0), ..modes])
+    one(InterpStart, pos, pos + 2, [Interp(pos, 0), ..modes])
   } else if c == LF || c == CR {
     # An unterminated string. The newline is read again as code.
-    Step([], pos, pop(modes))
+    Step([], pos, pop(modes), [Diagnostic("E0101", open, pos, "unterminated string literal")])
   } else {
-    one(StringText, pos, scan_string_text(src, pos), modes)
+    (end, diagnostics) = scan_string_text(src, pos, [])
+    with_diagnostics(one(StringText, pos, end, modes), diagnostics)
   }
 }
 
-## Stops before the closing `"`, an interpolation `#{`, a newline, or the end of the input.
-fn scan_string_text(src: Array[Int], i: Int) -> Int {
+## Stops before the closing `"`, an interpolation `#{`, a newline, or the end of the input. Also
+## returns the diagnostics of the escapes.
+fn scan_string_text(src: Array[Int], i: Int, found: List[Diagnostic]) -> (Int, List[Diagnostic]) {
   c = at(src, i)
   if c < 0 || c == QUOTE || c == LF || c == CR {
-    i
+    (i, found)
   } else if c == HASH && at(src, i + 1) == L_BRACE {
-    i
+    (i, found)
   } else if c == BACKSLASH {
-    escape_end(src, i) match {
-      Some(next) -> scan_string_text(src, next)
-      None       -> i + 1
+    (next, diagnostics) = read_escape(src, i)
+    next match {
+      Some(n) -> scan_string_text(src, n, found.append(diagnostics))
+      None    -> (i + 1, found.append(diagnostics))
     }
   } else {
-    scan_string_text(src, i + 1)
+    scan_string_text(src, i + 1, found)
   }
 }
 
 fn multi_string_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
+  lines = modes match {
+    [MultiStr(_, ls), ..] -> ls
+    _                     -> []
+  }
   closing = if at(src, pos - 1) == LF { closing_indent(src, pos) } else { None }
   closing match {
-    Some(indent) -> one(TripleQuote, pos, pos + indent + 3, pop(modes))
+    Some(indent) -> {
+      step = one(TripleQuote, pos, pos + indent + 3, pop(modes))
+      with_diagnostics(step, under_indented(src, lines.reverse(), pos, indent))
+    }
     None -> {
       if is_triple_quote(src, pos) {
-        one(TripleQuote, pos, pos + 3, pop(modes))
+        step = one(TripleQuote, pos, pos + 3, pop(modes))
+        message = "the closing `\"\"\"` must be on its own line"
+        with_diagnostics(step, [Diagnostic("E0109", pos, pos + 3, message)])
       } else if at(src, pos) == HASH && at(src, pos + 1) == L_BRACE {
-        one(InterpStart, pos, pos + 2, [Interp(0), ..modes])
+        one(InterpStart, pos, pos + 2, [Interp(pos, 0), ..modes])
       } else {
-        one(StringText, pos, scan_multiline_text(src, pos), modes)
+        (end, new_lines, diagnostics) = scan_multiline_text(src, pos, [], [])
+        more = modes match {
+          [MultiStr(open, ls), ..rest] -> [MultiStr(open, new_lines.append(ls)), ..rest]
+          _                            -> modes
+        }
+        with_diagnostics(one(StringText, pos, end, more), diagnostics)
       }
     }
   }
 }
 
-## Stops before `"""` and `#{`, and at the start of a line holding only the closing `"""`.
-fn scan_multiline_text(src: Array[Int], i: Int) -> Int {
+## The lines of a multiline string indented less than its closing line, whose indentation is the
+## `indent` code points from `close`. Lines of only whitespace are not counted.
+fn under_indented(src: Array[Int], lines: List[Int], close: Int, indent: Int) -> List[Diagnostic] {
+  prefix = src.slice(close, close + indent)
+  lines.filter_map(|start| {
+    line_end = skip_while(src, start, |c| c != LF)
+    ws = skip_while(src, start, is_blank) - start
+    blank = skip_while(src, start, |c| is_blank(c) || c == CR) == line_end
+    if start == close || blank || src.slice(start, start + indent) == prefix {
+      None
+    } else {
+      message = "this line is indented less than the closing `\"\"\"`"
+      Some(Diagnostic("E0109", start, start + ws + 1, message))
+    }
+  })
+}
+
+## Stops before `"""` and `#{`, and at the start of a line holding only the closing `"""`. Also
+## returns the start of each line begun inside the body (newest first) and the diagnostics of the
+## escapes.
+fn scan_multiline_text(
+  src: Array[Int],
+  i: Int,
+  lines: List[Int],
+  found: List[Diagnostic],
+) -> (Int, List[Int], List[Diagnostic]) {
   c = at(src, i)
   if c < 0 || is_triple_quote(src, i) {
-    i
+    (i, lines, found)
   } else if c == HASH && at(src, i + 1) == L_BRACE {
-    i
+    (i, lines, found)
   } else if c == LF {
     closing_indent(src, i + 1) match {
-      Some(_) -> i + 1
-      None    -> scan_multiline_text(src, i + 1)
+      Some(_) -> (i + 1, [i + 1, ..lines], found)
+      None    -> scan_multiline_text(src, i + 1, [i + 1, ..lines], found)
     }
   } else if c == BACKSLASH {
     # A `\` before a newline does not end the body.
-    scan_multiline_text(src, escape_end(src, i).or(i + 1))
+    (next, diagnostics) = read_escape(src, i)
+    scan_multiline_text(src, next.or(i + 1), lines, found.append(diagnostics))
   } else {
-    scan_multiline_text(src, i + 1)
+    scan_multiline_text(src, i + 1, lines, found)
   }
 }
 
@@ -458,26 +570,58 @@ fn is_triple_quote(src: Array[Int], i: Int) -> Bool {
   at(src, i) == QUOTE && at(src, i + 1) == QUOTE && at(src, i + 2) == QUOTE
 }
 
-## The end of the escape whose `\` is at `i`. None if nothing follows the `\` on its line.
-fn escape_end(src: Array[Int], i: Int) -> Option[Int] {
+## The end of the escape whose `\` is at `i`, and its diagnostics. The end is None if nothing
+## follows the `\` on its line (the `\` stays in the body). Accepts `\" \\ \n \t \r \#` and
+## `\u{...}`; any other escape gets a diagnostic over `\` and the next character.
+fn read_escape(src: Array[Int], i: Int) -> (Option[Int], List[Diagnostic]) {
   c = at(src, i + 1)
   if c < 0 || c == LF || c == CR {
-    None
+    (None, [Diagnostic("E0106", i, i + 1, "missing character after `\\`")])
+  } else if c == QUOTE || c == BACKSLASH || c == 0x6E || c == 0x74 || c == 0x72 || c == HASH {
+    (Some(i + 2), [])
   } else if c == 0x75 {
-    Some(unicode_escape_end(src, i))
+    (end, diagnostics) = unicode_escape(src, i)
+    (Some(end), diagnostics)
   } else {
-    Some(i + 2)
+    message = "unknown escape sequence `\\#{slice(src, i + 1, i + 2)}`"
+    (Some(i + 2), [Diagnostic("E0107", i, i + 2, message)])
   }
 }
 
-## A `\u{...}` ends after `}`. A malformed one ends at the last character read.
-fn unicode_escape_end(src: Array[Int], i: Int) -> Int {
+## A `\u{...}` ends after `}`; a malformed one at the last character read. Reports E0108 if it is
+## malformed or its value is a surrogate or above 10FFFF.
+fn unicode_escape(src: Array[Int], i: Int) -> (Int, List[Diagnostic]) {
   after_u = i + 2
+  report = |end, message| (end, [Diagnostic("E0108", i, end, message)])
   if at(src, after_u) != L_BRACE {
-    after_u
+    report(after_u, "expected `{` after `\\u`")
   } else {
     digits_end = skip_while(src, after_u + 1, is_hex)
-    if at(src, digits_end) == R_BRACE { digits_end + 1 } else { digits_end }
+    count = digits_end - after_u - 1
+    if at(src, digits_end) != R_BRACE {
+      report(digits_end, "unterminated unicode escape: expected `}`")
+    } else if count < 1 || count > 6 {
+      report(digits_end + 1, "a unicode escape needs 1 to 6 hex digits")
+    } else {
+      value = src.slice(after_u + 1, digits_end).fold(0, |v, d| v * 16 + hex_value(d))
+      if value >= 0xD800 && value <= 0xDFFF {
+        report(digits_end + 1, "a surrogate is not a Unicode scalar value")
+      } else if value > 0x10FFFF {
+        report(digits_end + 1, "out of range: the maximum is `\\u{10FFFF}`")
+      } else {
+        (digits_end + 1, [])
+      }
+    }
+  }
+}
+
+fn hex_value(c: Int) -> Int {
+  if is_digit(c) {
+    c - 0x30
+  } else if c >= 0x61 {
+    c - 0x61 + 10
+  } else {
+    c - 0x41 + 10
   }
 }
 

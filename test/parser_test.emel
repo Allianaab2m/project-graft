@@ -1,9 +1,8 @@
 import Brix.Pbt.Gen
 import Brix.Pbt.Property
 import Std.Array
-import Grammar
 import Lexer
-import Parser
+import Parse
 import Sink
 import Syntax.{Tree, Branch, Leaf, dump}
 import Token.{Token}
@@ -16,10 +15,7 @@ fn tree(src: String) -> List[String] {
 }
 
 fn build(src: String) -> Sink.Built {
-  code_points = Array.from_list(src.code_points())
-  tokens = Lexer.tokens(code_points)
-  p = Parser.run(code_points, tokens, Grammar.source_file)
-  Sink.build(code_points, Array.from_list(tokens), p)
+  Parse.parse_text(src)
 }
 
 fn trim_newline(line: String) -> String {
