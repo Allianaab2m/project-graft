@@ -40,6 +40,8 @@ pub type Function(
   suspends: Bool,
   ## The value of a const: evaluated once, on the first call.
   constant: Bool,
+  ## The name in source, for messages (the const a defect names).
+  display: String,
 )
 
 ## The host function of an external function: the per-target `@external` arguments.

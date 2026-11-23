@@ -180,6 +180,7 @@ const RUNTIME: List[String] = [
   "$arraySlice",
   "$arrayConcat",
   "$foreign",
+  "$constant",
 ]
 
 ## The JS module of `module`.
@@ -191,8 +192,8 @@ pub fn emit(module: Module) -> String {
   host_lines = hosts.enumerate().map(|(i, (path, name))| {
     "import { #{name} as $ext#{i} } from \"#{path}\";"
   })
-  functions = module.functions.fold([], |acc, _, f| {
-    acc.append(emit_fn(module, hosts, f)).append([""])
+  functions = module.functions.fold([], |acc, id, f| {
+    acc.append(emit_fn(module, hosts, id, f)).append([""])
   })
   exported = module.functions.fold(
     [],
@@ -283,7 +284,7 @@ fn host_path(host: Ir.HostModule) -> String {
   }
 }
 
-fn emit_fn(module: Module, hosts: List[(String, String)], f: Function) -> List[String] {
+fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) -> List[String] {
   params = String.join(f.params.map(|p| local_name(module, p)), ", ")
   body = f.external match {
     Some(_) -> {
@@ -302,11 +303,52 @@ fn emit_fn(module: Module, hosts: List[(String, String)], f: Function) -> List[S
       } else {
         ["    return #{call};"]
       }
-      ["  try {"].append(inner).append(["  } catch ($e) {", "    throw $foreign($e);", "  }"])
+      ["function #{f.name}(#{params}) {", "  try {"].append(inner).append(
+        ["  } catch ($e) {", "    throw $foreign($e);", "  }", "}"],
+      )
     }
-    None -> returning(module, f.body, "  ")
+    None if f.constant -> [
+      "const #{f.name}$cell = { state: 0, value: undefined };",
+      "function #{f.name}() {",
+      "  return $constant(#{f.name}$cell, #{quote(f.display)}, #{f.name}$init);",
+      "}",
+      "",
+      "function #{f.name}$init() {",
+    ].append(returning(module, f.body, "  ")).append(["}"])
+    None -> if self_tail(f.body, id) {
+      # Self tail calls go round a loop: the parameters are `$p0`, `$p1`, ..., bound afresh to
+      # the parameters' locals on each round, so closures keep the values of their round.
+      temps = f.params.enumerate().map(|(i, _)| "$p#{i}")
+      binds = f.params.zip(temps).map(|(p, t)| "    const #{local_name(module, p)} = #{t};")
+      tail = Some(Tail(id, temps))
+      looped = ["  $L: for (;;) {"].append(binds).append(
+        returning_in(module, f.body, "    ", tail),
+      ).append(["  }"])
+      return_lines = ["function #{f.name}(#{String.join(temps, ", ")}) {"].append(looped).append(
+        ["}"],
+      )
+      return_lines
+    } else {
+      ["function #{f.name}(#{params}) {"].append(returning(module, f.body, "  ")).append(["}"])
+    }
   }
-  ["function #{f.name}(#{params}) {"].append(body).append(["}"])
+  body
+}
+
+## A function whose self calls in tail position become a loop: its index and the names of its
+## parameters' variables.
+type Tail(f: Int, temps: List[String])
+
+## Whether `expr`, in tail position, calls the function `f` itself.
+fn self_tail(expr: Expr, f: Int) -> Bool {
+  expr match {
+    XCall(Direct(g, _), _, _, _) -> g == f
+    XLet(_, _, body)             -> self_tail(body, f)
+    XSeq(_, rest)                -> self_tail(rest, f)
+    XIf(_, t, e)                 -> self_tail(t, f) || self_tail(e, f)
+    XMatch(_, arms)              -> arms.any(|arm| self_tail(arm.body, f))
+    _                            -> False
+  }
 }
 
 fn local_name(module: Module, local: Int) -> String {
@@ -320,28 +362,47 @@ fn fn_name(module: Module, f: Int) -> String {
 
 ## The statements that compute `expr` and return it.
 fn returning(module: Module, expr: Expr, indent: String) -> List[String] {
+  returning_in(module, expr, indent, None)
+}
+
+## Inside a looped function (`tail`), a self call in tail position sets the parameters and goes
+## round again. The arguments are computed before any parameter changes.
+fn returning_in(module: Module, expr: Expr, indent: String, tail: Option[Tail]) -> List[String] {
+  r = |x: Expr, i: String| returning_in(module, x, i, tail)
   expr match {
     XLet(bound, value, body) -> [
       "#{indent}const #{local_name(module, bound)} = #{emit_expr(module, value)};",
-    ].append(returning(module, body, indent))
-    XSeq(first, rest) -> statement(module, first, indent).append(returning(module, rest, indent))
-    XIf(c, t, e) -> ["#{indent}if (#{emit_expr(module, c)}) {"].append(
-      returning(module, t, "#{indent}  "),
-    ).append(["#{indent}} else {"]).append(returning(module, e, "#{indent}  ")).append(
-      ["#{indent}}"],
-    )
+    ].append(r(body, indent))
+    XSeq(first, rest) -> statement(module, first, indent).append(r(rest, indent))
+    XIf(c, t, e) -> ["#{indent}if (#{emit_expr(module, c)}) {"].append(r(t, "#{indent}  ")).append(
+      ["#{indent}} else {"],
+    ).append(r(e, "#{indent}  ")).append(["#{indent}}"])
     XMatch(scrutinee, arms) -> {
       s = "$s#{indent.code_points().length()}"
       ["#{indent}const #{s} = #{emit_expr(module, scrutinee)};"].append(
-        arms.flat_map(|arm| emit_arm(module, arm, s, indent)),
+        arms.flat_map(|arm| emit_arm(module, arm, s, indent, tail)),
       ).append(["#{indent}return $unreachable();"])
+    }
+    XCall(Direct(g, _), args, _, _) if tail.map(|t| t.f == g).or(False) -> {
+      temps = tail.map(|t| t.temps).or([])
+      values = args.enumerate().map(|(i, a)| "#{indent}const $n#{i} = #{emit_expr(module, a)};")
+      sets = temps.enumerate().map(|(i, t)| "#{indent}#{t} = $n#{i};")
+      ["#{indent}{"].append(values.map(|v| "  #{v}")).append(sets.map(|v| "  #{v}")).append(
+        ["#{indent}  continue $L;", "#{indent}}"],
+      )
     }
     _ -> ["#{indent}return #{emit_expr(module, expr)};"]
   }
 }
 
 ## An arm: if the pattern matches (and the guard holds), bind and return the body.
-fn emit_arm(module: Module, arm: Arm, s: String, indent: String) -> List[String] {
+fn emit_arm(
+  module: Module,
+  arm: Arm,
+  s: String,
+  indent: String,
+  tail: Option[Tail],
+) -> List[String] {
   tests = pat_tests(module, arm.pat, s)
   inner = "#{indent}  "
   binds = pat_binds(module, arm.pat, s).map(
@@ -349,9 +410,9 @@ fn emit_arm(module: Module, arm: Arm, s: String, indent: String) -> List[String]
   )
   body = arm.guard match {
     Some(g) -> ["#{inner}if (#{emit_expr(module, g)}) {"].append(
-      returning(module, arm.body, "#{inner}  "),
+      returning_in(module, arm.body, "#{inner}  ", tail),
     ).append(["#{inner}}"])
-    None -> returning(module, arm.body, inner)
+    None -> returning_in(module, arm.body, inner, tail)
   }
   cond = if tests.is_empty() { "true" } else { String.join(tests, " && ") }
   ["#{indent}if (#{cond}) {"].append(binds).append(body).append(["#{indent}}"])

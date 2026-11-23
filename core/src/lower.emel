@@ -96,6 +96,7 @@ import Check.Ty.{
   PString,
 }
 import Check.Typeck
+import Check.Numbers
 import Check.Signature
 import Check.Tylower
 import Check.Tylower.{def_of, con_def}
@@ -327,6 +328,7 @@ fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
   def = inst.def
   parts = program.items.get(def) match {
     Some(IFn(f))          -> Some((f.sig.params, f.body))
+    Some(Hir.IConst(c))   -> Some(([], Some(c.value)))
     Some(Hir.ITraitFn(f)) -> Some((f.sig.params, f.body))
     Some(_)               -> None
     None                  -> impl_fn(program, def).map(|(_, f)| (f.params, f.body))
@@ -356,6 +358,7 @@ fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
         Some(Ir.External(bindings)),
         False,
         False,
+        def_of(program, def).name,
       )
       set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
     }
@@ -366,7 +369,12 @@ fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
       lowered = lower_expr(body)
       main = def_of(program, def).name == "main" && inst.id == 0
       name = if main { "main" } else { "#{def_name(def)}$#{inst.id}" }
-      fun = Function(name, main, locals, ret, 0, False, lowered, None, False, False)
+      # The exit code `main` returns is set by `exit_with` of Std.Process.
+      exit_with = if main { exit_code_setter(ret) } else { None }
+      value = exit_with.map(|f| XCall(Direct(f, []), [lowered], False, False)).or(lowered)
+      constant = def_of(program, def).kind == Hir.ConstKind
+      display = def_of(program, def).name
+      fun = Function(name, main, locals, ret, 0, False, value, None, False, constant, display)
       set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
     }
     _ -> {
@@ -399,6 +407,23 @@ fn host_ref(def: Int, args: List[String]) -> Ir.HostRef uses { State[Lowering] }
     }
     [name] -> Ir.HostGlobal(name)
     _      -> Ir.HostGlobal("undefined")
+  }
+}
+
+## For an `ExitCode` of Std.Process, the instance of its `exit_with`.
+fn exit_code_setter(ret: Type) -> Option[Int] uses { State[Lowering] } {
+  program = st().program
+  ret match {
+    CEnum(def, []) if def_name(def) == "Std_Process_ExitCode" -> {
+      module = def_of(program, def).module match {
+        SourceModule(m) -> program.modules.get(m)
+        _               -> None
+      }
+      module.and_then(|items| items.items.find(|d| def_of(program, d).name == "exit_with")).map(
+        |d| instance(d, []),
+      )
+    }
+    _ -> None
   }
 }
 
@@ -627,8 +652,9 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
       }
     } else {
       callable(expr, def) match {
-        Some(f) -> XFn(f, [])
-        None    -> unsupported("a reference to #{def_name(def)}")
+        Some(f) if data.kind == Hir.ConstKind -> XCall(Direct(f, []), [], False, False)
+        Some(f)                               -> XFn(f, [])
+        None                                  -> unsupported("a reference to #{def_name(def)}")
       }
     }
   }
@@ -663,9 +689,10 @@ fn callable(expr: Int, def: Int) -> Option[Int] uses { State[Lowering] } {
   program = st().program
   kind = def_of(program, def).kind
   has_body = program.items.get(def) match {
-    Some(IFn(f)) -> f.body.is_some() || f.is_external
-    None         -> kind == ImplFnKind
-    _            -> False
+    Some(Hir.IConst(_)) -> True
+    Some(IFn(f))        -> f.body.is_some() || f.is_external
+    None                -> kind == ImplFnKind
+    _                   -> False
   }
   if has_body { Some(instance(def, type_args(expr))) } else { None }
 }
@@ -764,11 +791,31 @@ fn literal(lit: Literal, ty: Type) -> Lit {
     LInt(text) -> ty match {
       CInt64 -> VInt64(text)
       CFloat -> VFloat(Float.parse(text) escape { _ -> 0.0 })
-      _      -> VInt(Int.parse(text) escape { _ -> 0 })
+      _      -> VInt(int_value(text))
     }
     LFloat(text)  -> VFloat(Float.parse(text) escape { _ -> 0.0 })
     LString(text) -> VString(text)
   }
+}
+
+## The value of an Int literal: decimal, or `0x`, `0o`, `0b` (after an optional `-`), wrapped to
+## 32 bits.
+fn int_value(text: String) -> Int {
+  cps = text.code_points()
+  (negative, digits) = cps match {
+    [45, ..rest] -> (True, rest)
+    _            -> (False, cps)
+  }
+  (radix, body) = digits match {
+    [48, 120, ..rest] -> (16, rest)
+    [48, 88, ..rest]  -> (16, rest)
+    [48, 111, ..rest] -> (8, rest)
+    [48, 98, ..rest]  -> (2, rest)
+    _                 -> (10, digits)
+  }
+  # Int arithmetic wraps to 32 bits, as the literal's value does.
+  value = body.fold(0, |acc, c| acc * radix + Numbers.digit_value(c))
+  if negative { 0 - value } else { value }
 }
 
 fn op_ty(ty: Type) -> OpTy {
