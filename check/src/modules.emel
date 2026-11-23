@@ -11,10 +11,32 @@ import Std.Path
 ## A module name's segments: `["Http", "Client"]`.
 pub type ModuleData(name: List[String], file: String)
 
-## The modules, in the order they were added (by path within a root, then the core modules).
-## `by_name` maps a joined name to the index of the module that name points to: a core module
-## hides a source module of the same name.
-pub type ModuleMap(modules: List[ModuleData], by_name: Map[String, Int], core_from: Int)
+## The modules, in the order they were added (by path within a root, then the modules of the
+## dependencies, then the core modules). `by_name` maps a joined name to the index of the module
+## that name points to: a core module hides a source module of the same name. A dependency's
+## modules are under a root name unique in the map (`Check.Hir`).
+pub type ModuleMap(
+  modules: List[ModuleData],
+  by_name: Map[String, Int],
+  core_from: Int,
+  packages: List[Package],
+  package_of: Map[Int, Int],
+  ## The root names the project's `[dependencies]` give their Pomes.
+  project_deps: Map[String, Int],
+)
+
+## A Pome the project depends on (spec 4.7). Its modules import each other by their names inside
+## the Pome (`Router`), and import their own dependencies by the root names they chose.
+pub type Package(
+  name: String,
+  ## The root of the internal names of its modules.
+  root: String,
+  ## Module names inside the Pome (joined) to modules.
+  local: Map[String, Int],
+  ## `src/lib.emel`: the module the root name itself names.
+  lib: Option[Int],
+  deps: Map[String, Int],
+)
 
 ## A diagnostic of collecting: on a file or directory, without a range.
 pub type FileDiagnostic(code: String, path: String, message: String)
@@ -24,7 +46,7 @@ pub fn display(name: List[String]) -> String {
 }
 
 pub fn empty() -> ModuleMap {
-  ModuleMap([], Map.empty(), -1)
+  ModuleMap([], Map.empty(), -1, [], Map.empty(), Map.empty())
 }
 
 pub fn get(map: ModuleMap, index: Int) -> Option[ModuleData] {
@@ -33,6 +55,104 @@ pub fn get(map: ModuleMap, index: Int) -> Option[ModuleData] {
 
 pub fn lookup(map: ModuleMap, name: List[String]) -> Option[Int] {
   map.by_name.get(display(name))
+}
+
+## The module an import path in `importer` names (`lookup_from`, spec 4.7): a module of the
+## importer's own Pome, else a module of one of its dependencies under the root name it gave
+## them, else a bundled core module. Dependencies of dependencies are not visible.
+pub fn lookup_from(map: ModuleMap, importer: Int, name: List[String]) -> Option[Int] {
+  package = map.package_of.get(importer).and_then(|p| map.packages.get(p))
+  own = package match {
+    Some(p) -> p.local.get(display(name))
+    None -> lookup(map, name) match {
+      Some(id) if !map.package_of.contains(id) -> Some(id)
+      _                                        -> None
+    }
+  }
+  own match {
+    Some(_) -> own
+    None -> {
+      dependency = name.head().and_then(|first| {
+        package match {
+          Some(p) -> p.deps.get(first)
+          None    -> map.project_deps.get(first)
+        }
+      })
+      dependency.and_then(|d| map.packages.get(d)) match {
+        Some(dep) -> name.drop(1) match {
+          []                                        -> dep.lib
+          [only] if only == "Lib" || only == "Main" -> None
+          rest                                      -> dep.local.get(display(rest))
+        }
+        None -> lookup(map, name) match {
+          Some(id) if is_core(map, id) -> Some(id)
+          _                            -> None
+        }
+      }
+    }
+  }
+}
+
+## Whether a module belongs to a dependency, not to the project or core.
+pub fn is_dependency(map: ModuleMap, index: Int) -> Bool {
+  map.package_of.contains(index)
+}
+
+## Adds the modules of a dependency whose source root is `root` (its `src`). Their internal names
+## are under `preferred`, or under `preferred` with a number when another module already starts
+## with that name. `src/main.emel` is not used (spec 4.7).
+pub fn add_package(
+  map: ModuleMap,
+  name: String,
+  preferred: String,
+  root: String,
+) -> (ModuleMap, Int, List[FileDiagnostic]) uses { FileSystem } {
+  (collected, diagnostics) = collect(root, False)
+  taken = |r: String| map.modules.any(|m| m.name.head() == Some(r))
+  internal = List.range(1, 100).map(|n| if n == 1 { preferred } else { "#{preferred}#{n}" }).find(
+    |r| !taken(r),
+  ).or(preferred)
+  id = map.packages.length()
+  start = Package(name, internal, Map.empty(), None, Map.empty())
+  (next, package) = collected.modules.fold((map, start), |(m, p), data| {
+    is_lib = data.name == ["Lib"]
+    if data.name == ["Main"] {
+      (m, p)
+    } else {
+      internal_name = if is_lib { [internal] } else { [internal, ..data.name] }
+      (added, module) = insert(m, ModuleData(internal_name, data.file))
+      (
+        ModuleMap(package_of: added.package_of.insert(module, id), ..added),
+        Package(
+          local: p.local.insert(display(data.name), module),
+          lib: if is_lib { Some(module) } else { p.lib },
+          ..p,
+        ),
+      )
+    }
+  })
+  (ModuleMap(packages: next.packages.append([package]), ..next), id, diagnostics)
+}
+
+## The root names a Pome (`None` for the project) gives its dependencies.
+pub fn set_dependencies(
+  map: ModuleMap,
+  package: Option[Int],
+  deps: List[(String, Int)],
+) -> ModuleMap {
+  package match {
+    None -> ModuleMap(project_deps: deps.fold(map.project_deps, |m, (n, d)| m.insert(n, d)), ..map)
+    Some(p) -> ModuleMap(
+      packages: map.packages.enumerate().map(|(i, pk)| {
+        if i == p {
+          Package(deps: deps.fold(pk.deps, |m, (n, d)| m.insert(n, d)), ..pk)
+        } else {
+          pk
+        }
+      }),
+      ..map,
+    )
+  }
 }
 
 pub fn is_core(map: ModuleMap, index: Int) -> Bool {

@@ -1,0 +1,157 @@
+## The parts of `Pome.toml` that finding the modules of a project needs (spec 4.7): the Pome's
+## name and root name, its `[dependencies]`, and the directories of `[replace]`.
+##
+## Reads the subset of TOML these use: `[section]` headers, and `key = value` lines whose key is
+## bare or a basic string, and whose value is a basic string or an inline table of those. Other
+## lines are skipped.
+import Std.Map.{Map}
+
+## A dependency: its source path and the root name the depending side gives it (`module`).
+pub type Dependency(path: String, module: Option[String])
+
+pub type Manifest(
+  name: String,
+  ## `[pome].module`: the root name its author chose.
+  module: Option[String],
+  dependencies: List[Dependency],
+  ## `[replace]`: source path to a directory, relative to the manifest's directory.
+  replace: Map[String, String],
+)
+
+## A value: a string, an inline table, or something not read.
+enum Value {
+  Str(text: String)
+  Table(entries: List[(String, String)])
+  Other
+}
+
+pub fn parse(text: String) -> Manifest {
+  start = (Manifest("", None, [], Map.empty()), "")
+  (manifest, _) = text.split("\n").fold(start, |(m, section), raw| {
+    line = strip_comment(raw).trim()
+    if line.starts_with("[") && line.ends_with("]") && !line.starts_with("[[") {
+      (
+        m,
+        String.concat(
+          line.code_points().drop(1).take(line.code_points().length() - 2).filter_map(
+            String.from_code_point,
+          ),
+        ).trim(),
+      )
+    } else {
+      entry(line) match {
+        None               -> (m, section)
+        Some((key, value)) -> (add(m, section, key, value), section)
+      }
+    }
+  })
+  Manifest(dependencies: manifest.dependencies.reverse(), ..manifest)
+}
+
+fn add(m: Manifest, section: String, key: String, value: Value) -> Manifest {
+  (section, key, value) match {
+    ("pome", "name", Str(s))   -> Manifest(name: s, ..m)
+    ("pome", "module", Str(s)) -> Manifest(module: Some(s), ..m)
+    ("dependencies", _, Str(_)) -> Manifest(
+      dependencies: [Dependency(key, None), ..m.dependencies],
+      ..m,
+    )
+    ("dependencies", _, Table(entries)) -> {
+      module = entries.find(|(k, _)| k == "module").map(|(_, v)| v)
+      Manifest(dependencies: [Dependency(key, module), ..m.dependencies], ..m)
+    }
+    ("replace", _, Table(entries)) -> entries.find(|(k, _)| k == "path") match {
+      Some((_, path)) -> Manifest(replace: m.replace.insert(key, path), ..m)
+      None            -> m
+    }
+    _                          -> m
+  }
+}
+
+## The line up to a `#` outside a string.
+fn strip_comment(line: String) -> String {
+  cs = line.code_points()
+  (_, end) = cs.enumerate().fold((False, None), |(in_string, found), (i, c)| {
+    found match {
+      Some(_)                         -> (in_string, found)
+      None if c == 0x22               -> (!in_string, None)
+      None if c == 0x23 && !in_string -> (in_string, Some(i))
+      None                            -> (in_string, None)
+    }
+  })
+  end match {
+    Some(n) -> String.concat(cs.take(n).filter_map(String.from_code_point))
+    None    -> line
+  }
+}
+
+## `key = value`.
+fn entry(line: String) -> Option[(String, Value)] {
+  cs = line.code_points()
+  (key, rest) = read_key(cs)
+  rest_text = String.concat(rest.filter_map(String.from_code_point)).trim()
+  if key == "" || !rest_text.starts_with("=") {
+    None
+  } else {
+    value = String.concat(rest_text.code_points().drop(1).filter_map(String.from_code_point)).trim()
+    Some((key, read_value(value)))
+  }
+}
+
+## A bare or quoted key, and the code points after it.
+fn read_key(cs: List[Int]) -> (String, List[Int]) {
+  trimmed = drop_while(cs, |c| c == 0x20 || c == 0x09)
+  trimmed match {
+    [0x22, ..rest] -> {
+      inside = take_while(rest, |c| c != 0x22)
+      (String.concat(inside.filter_map(String.from_code_point)), rest.drop(inside.length() + 1))
+    }
+    _ -> {
+      bare = take_while(trimmed, |c| {
+        (
+          (c >= 0x61 && c <= 0x7A)
+            || (c >= 0x41 && c <= 0x5A)
+            || (c >= 0x30 && c <= 0x39)
+            || c == 0x5F
+            || c == 0x2D
+        )
+      })
+      (String.concat(bare.filter_map(String.from_code_point)), trimmed.drop(bare.length()))
+    }
+  }
+}
+
+fn read_value(text: String) -> Value {
+  cs = text.code_points()
+  cs match {
+    [0x22, ..rest] -> Str(
+      String.concat(take_while(rest, |c| c != 0x22).filter_map(String.from_code_point)),
+    )
+    [0x7B, ..rest] -> {
+      inner = String.concat(take_while(rest, |c| c != 0x7D).filter_map(String.from_code_point))
+      Table(
+        inner.split(",").filter_map(|part| {
+          entry(part.trim()) match {
+            Some((k, Str(v))) -> Some((k, v))
+            _                 -> None
+          }
+        }),
+      )
+    }
+    _ -> Other
+  }
+}
+
+fn take_while(cs: List[Int], keep: fn(Int) -> Bool) -> List[Int] {
+  cs match {
+    [c, ..rest] if keep(c) -> [c, ..take_while(rest, keep)]
+    _                      -> []
+  }
+}
+
+fn drop_while(cs: List[Int], skip: fn(Int) -> Bool) -> List[Int] {
+  cs match {
+    [c, ..rest] if skip(c) -> drop_while(rest, skip)
+    _                      -> cs
+  }
+}

@@ -272,6 +272,16 @@ st().types.ops.get(expr).map(|o| op_value(expr, base, o)).or(record_field(expr, 
 
 行き先: 本体 issue（std への追加）．
 
+### S4. List に take_while と drop_while がない
+
+やりたかったこと: M5 で Pome.toml を読むとき、文字列を code point の列として先頭から「条件を満たす間」切り出す（キーの読み取り、`"` までの文字列）．
+
+実際に書いたコード: `take_while(cs, f)` と `drop_while(cs, f)` を再帰で自分で書いた．自分のモジュールの関数なのでメソッドでは呼べない（S2 と同じ）．
+
+本来の形: `List.take_while` と `List.drop_while`．`take` と `drop` はある．
+
+行き先: 本体 issue（std への追加）．
+
 ## ツール
 
 ### T1. wasm で FileSystem を使うプログラムがコンパイルに通る

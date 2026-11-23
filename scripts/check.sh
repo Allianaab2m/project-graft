@@ -8,7 +8,8 @@ set -euo pipefail
 emela_repo=${1:?usage: scripts/check.sh <path to emela-lang/emela>}
 root=$(cd "$(dirname "$0")/.." && pwd)
 oracle="$root/tools/oracle/target/release/graft-oracle"
-graft="$root/target/emela/native/main"
+# `GRAFT` replaces the native build of Graft with another command (the JS build of M5).
+graft=${GRAFT:-"$root/target/emela/native/main"}
 core="$emela_repo/crates/emela-core/lib"
 # Every diagnostic is compared. `emela check` also reports a few codes that come from the driver
 # rather than from type checking and that the corpus never shows (`@test`, `@internal`, `@key` and
@@ -20,7 +21,7 @@ implemented=${IMPLEMENTED:-$implemented}
 # cases of this repository are passed relative to its root.
 cd "$root"
 (cd "$root/tools/oracle" && cargo build --release --quiet)
-(cd "$root" && emela build --target native . 2>/dev/null)
+[ -n "${GRAFT:-}" ] || (cd "$root" && emela build --target native . 2>/dev/null)
 units=()
 while IFS= read -r unit; do units+=("$unit"); done < <(
   find "$emela_repo/crates/emela-codegen-c/tests/programs" "$emela_repo/crates/emela-cli/tests" \

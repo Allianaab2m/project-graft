@@ -9,11 +9,12 @@ set -uo pipefail
 emela_repo=${1:?usage: scripts/run.sh <path to emela-lang/emela> [name...]}
 shift
 root=$(cd "$(dirname "$0")/.." && pwd)
-graft="$root/target/emela/native/main"
+# `GRAFT` replaces the native build of Graft with another command (the JS build of M5).
+graft=${GRAFT:-"$root/target/emela/native/main"}
 core="$emela_repo/crates/emela-core/lib"
 runtime="$emela_repo/crates/emela-codegen-js/src/runtime.mjs"
 programs="$emela_repo/crates/emela-codegen-c/tests/programs"
-(cd "$root" && emela build --target native . 2>/dev/null)
+[ -n "${GRAFT:-}" ] || (cd "$root" && emela build --target native . 2>/dev/null)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 # The launcher is the raw string `LAUNCHER` of emela-driver's run.rs.

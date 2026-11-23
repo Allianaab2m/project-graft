@@ -3,7 +3,8 @@
 ## `pipeline.rs` and `graph.rs` of the reference implementation.
 ##
 ## Paths stay as given (relative or absolute); `Pome.toml` is looked for in the given directory
-## and above it through `..`. Projects are read without their tests and Pome dependencies.
+## and above it through `..`. Projects are read without their tests. Their Pome dependencies are
+## read from the directories of `[replace]`.
 import Std.Array.{Array}
 import Std.FileSystem.{FileSystem}
 import Std.Map.{Map}
@@ -18,7 +19,18 @@ import Syntax.Cst.{
   TokenElement,
   NodeElement,
 }
-import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, lookup, is_core}
+import Modules.{
+  CORE,
+  ModuleMap,
+  ModuleData,
+  FileDiagnostic,
+  display,
+  get,
+  lookup,
+  lookup_from,
+  is_core,
+}
+import Manifest
 import Syntax.Parse
 import Resolve
 import Typeck
@@ -153,7 +165,13 @@ pub fn analyze(path: String, core_lib: String) -> Analysis uses { FileSystem } {
 }
 
 fn check_input(inp: Input, core_lib: String) -> Analysis uses { FileSystem } {
-  (collected, collect_diagnostics) = Modules.collect(inp.root, inp.single_file)
+  (own, own_diagnostics) = Modules.collect(inp.root, inp.single_file)
+  (collected, collect_diagnostics) = if inp.single_file {
+    (own, own_diagnostics)
+  } else {
+    (with_deps, dep_diagnostics) = add_dependencies(own, Path.parent(inp.root).or(""))
+    (with_deps, own_diagnostics.append(dep_diagnostics))
+  }
   (map, shadowed) = Modules.add_core(collected)
   entry = inp.entry.and_then(|e| {
     map.modules.enumerate().find(|(_, d)| d.file == e).map(|(i, _)| i)
@@ -277,7 +295,7 @@ fn next_rank(
       Some(r) -> {
         ranked = ranks.insert(module, ranks.size())
         targets = if single_file {
-          imports_of(r.src, r.parsed).filter_map(|imp| lookup(map, imp.path))
+          imports_of(r.src, r.parsed).filter_map(|imp| lookup_from(map, module, imp.path))
         } else {
           []
         }
@@ -317,7 +335,7 @@ fn read_all(
           src = Array.from_list(text.code_points())
           parsed = Parse.parse(src)
           more = if single_file {
-            imports_of(src, parsed).filter_map(|imp| lookup(map, imp.path))
+            imports_of(src, parsed).filter_map(|imp| lookup_from(map, index, imp.path))
           } else {
             []
           }
@@ -369,11 +387,13 @@ fn graph(map: ModuleMap, imports: Map[Int, List[ImportOf]]) -> List[Checked] {
   file_of = |i| get(map, i).map(|d| d.file).or("")
   # The edges of each module, in import order: (target, start, end).
   edges = List.range(0, count).map(|i| {
-    imports.get(i).or([]).filter_map(|imp| lookup(map, imp.path).map(|t| (t, imp.start, imp.end)))
+    imports.get(i).or([]).filter_map(|imp| {
+      lookup_from(map, i, imp.path).map(|t| (t, imp.start, imp.end))
+    })
   }) |> Array.from_list
   edges_of = |i| edges.get(i).or([])
   undefined = List.range(0, count).flat_map(|i| {
-    imports.get(i).or([]).filter(|imp| lookup(map, imp.path).is_none()).map(|imp| {
+    imports.get(i).or([]).filter(|imp| lookup_from(map, i, imp.path).is_none()).map(|imp| {
       Checked("error", "E0205", file_of(i), Some((imp.start, imp.end)))
     })
   })
@@ -463,4 +483,108 @@ fn path_back(parent: Map[Int, Int], start: Int, current: Int, path: List[Int]) -
       None    -> path
     }
   }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Dependencies (`dependencies.rs`)
+
+## A Pome found while reading dependencies: its source path, directory and manifest, and its
+## package in the module map.
+type Found(path: String, dir: String, manifest: Manifest.Manifest, package: Int)
+
+## Adds the modules of the Pomes the project in `project` depends on, directly or not, and the
+## root names each side gives its dependencies. A dependency is read from the directory
+## `[replace]` gives it: the project's, or else the one of the Pome that depends on it.
+fn add_dependencies(map: ModuleMap, project: String) -> (ModuleMap, List[FileDiagnostic])
+  uses { FileSystem } {
+  root = read_manifest(project)
+  (filled, found, diagnostics) = add_pomes(map, root, project, root, project, [], [])
+  names = |deps: List[Manifest.Dependency]| deps.filter_map(|d| {
+    found.find(|f| f.path == d.path).map(|f| (d.module.or(root_name(f.manifest)), f.package))
+  })
+  with_project = Modules.set_dependencies(filled, None, names(root.dependencies))
+  linked = found.fold(with_project, |m, f| {
+    Modules.set_dependencies(m, Some(f.package), names(f.manifest.dependencies))
+  })
+  (linked, diagnostics)
+}
+
+fn add_pomes(
+  map: ModuleMap,
+  root: Manifest.Manifest,
+  project: String,
+  from: Manifest.Manifest,
+  from_dir: String,
+  found: List[Found],
+  diagnostics: List[FileDiagnostic],
+) -> (ModuleMap, List[Found], List[FileDiagnostic]) uses { FileSystem } {
+  from.dependencies.fold((map, found, diagnostics), |(m, fs, ds), dep| {
+    if fs.any(|f| f.path == dep.path) {
+      (m, fs, ds)
+    } else {
+      dir = root.replace.get(dep.path).map(|d| Path.join(project, d)).or(
+        from.replace.get(dep.path).map(|d| Path.join(from_dir, d)).or(""),
+      )
+      if dir == "" {
+        (
+          m,
+          fs,
+          ds.append(
+            [FileDiagnostic("E0901", dep.path, "dependency without a [replace] directory")],
+          ),
+        )
+      } else {
+        dir_n = normalize_dir(dir)
+        manifest = read_manifest(dir_n)
+        (added, id, found_diags) = Modules.add_package(
+          m,
+          dep.path,
+          root_name(manifest),
+          Path.join(dir_n, "src"),
+        )
+        next = fs.append([Found(dep.path, dir_n, manifest, id)])
+        add_pomes(added, root, project, manifest, dir_n, next, ds.append(found_diags))
+      }
+    }
+  })
+}
+
+fn read_manifest(dir: String) -> Manifest.Manifest uses { FileSystem } {
+  fs = use FileSystem
+  text = fs.read_text(Path.join(dir, "Pome.toml")) escape { _ -> "" }
+  Manifest.parse(text)
+}
+
+## The root name a Pome prefers: its `[pome].module`, or the last element of its source path
+## without `/vN` as a type name.
+fn root_name(m: Manifest.Manifest) -> String {
+  m.module match {
+    Some(name) -> name
+    None -> {
+      parts = m.name.split("/")
+      last = parts.reverse() match {
+        [v, prev, ..] if v.starts_with("v") && v != "v" -> prev
+        [l, ..]                                         -> l
+        []                                              -> ""
+      }
+      Modules.to_type_name(last) match {
+        Modules.Converted(n) -> n
+        _                    -> "Pome"
+      }
+    }
+  }
+}
+
+## `a/b/../c` is `a/c`.
+fn normalize_dir(dir: String) -> String {
+  absolute = dir.starts_with("/")
+  parts = dir.split("/").filter(|p| p != "" && p != ".")
+  kept = parts.fold([], |acc, p| {
+    (p, acc) match {
+      ("..", [prev, ..rest]) if prev != ".." -> rest
+      _                                      -> [p, ..acc]
+    }
+  }).reverse()
+  joined = String.join(kept, "/")
+  if absolute { "/#{joined}" } else { joined }
 }

@@ -36,6 +36,7 @@ Each milestone is done when Graft's output matches the reference implementation 
 | M2 | parser + fmt | `graft fmt` gives byte for byte the output of `emela fmt` on the corpus |
 | M3 | resolve + type checking | The positions and codes of diagnostics match `emela check` |
 | M4 | lowering + JS codegen | The generated JS runs with the same result as `emela run` |
+| M5 | self-hosting | Graft built by `graft build` passes M1 to M4, and builds itself to the same JS |
 
 The corpus is every `.emel` file in the `emela-lang/emela` repository at the release tag.
 
@@ -68,6 +69,8 @@ $ scripts/fuzz.py tree <emela-lang/emela checkout> <out dir> # trees of broken c
 $ scripts/fuzz.py fmt <emela-lang/emela checkout> <out dir>  # fmt of reflowed files, any width
 $ scripts/check.sh <emela-lang/emela checkout>      # check diagnostics against the reference
 $ scripts/run.sh <emela-lang/emela checkout> [name...]  # run the JS of `graft build` on Node
+$ scripts/selfhost.sh <emela-lang/emela checkout>   # build Graft to JS: target/js/graft
+$ GRAFT=target/js/graft scripts/check.sh <checkout>  # any comparison, with the JS build of Graft
 $ emela run . -- parse <file>...                     # parses the files, to time the parser
 ```
 
@@ -123,3 +126,19 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   of a definition is lowered with its type arguments, set type arguments included as summaries
   (whether the set may fail or suspend). And every function and closure takes the evidence table
   as its last parameter, so the calling convention does not depend on types.
+- M5: done. Graft reads the Pome dependencies of a project from the directories of `[replace]`
+  in `Pome.toml`, with the import rules of the reference (a module sees its own Pome's modules,
+  and its dependencies under the root names it gives them). `scripts/selfhost.sh` builds Graft
+  itself with `graft build` into `target/js`. With `GRAFT=target/js/graft`, every comparison
+  passes as with the native build: tokens, tree and fmt 297/297, check 355/355, run 73/73. The
+  JS build of Graft builds Graft again to a `main.mjs` byte for byte the same.
+
+  Time of building Graft itself (28k lines, `graft build .`, on one machine):
+
+  | Graft built by | Time |
+  |---|---|
+  | `emela build --target native` | 21.2 s |
+  | `emela build --target js` | 19.8 s |
+  | `graft build` (JS) | 28.0 s |
+
+  Graft's JS is about 1.4 times slower than the reference's JS on the same work.

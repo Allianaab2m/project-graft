@@ -8,9 +8,10 @@ mode=${1:?usage: scripts/compare.sh <tokens|tree|fmt> <path to emela-lang/emela>
 emela_repo=${2:?usage: scripts/compare.sh <tokens|tree|fmt> <path to emela-lang/emela>}
 root=$(cd "$(dirname "$0")/.." && pwd)
 oracle="$root/tools/oracle/target/release/graft-oracle"
-graft="$root/target/emela/native/main"
+# `GRAFT` replaces the native build of Graft with another command (the JS build of M5).
+graft=${GRAFT:-"$root/target/emela/native/main"}
 (cd "$root/tools/oracle" && cargo build --release --quiet)
-(cd "$root" && emela build --target native . 2>/dev/null)
+[ -n "${GRAFT:-}" ] || (cd "$root" && emela build --target native . 2>/dev/null)
 known=$(sed -n "s/^$mode \([^ ]*\).*/\1/p" "$root/scripts/known-differences.txt")
 total=0
 failed=0

@@ -1592,7 +1592,10 @@ fn lower_pat(pat: Int) -> Pat uses { State[Lowering] } {
     Some(PUnit)         -> QWild
     Some(PBind(local))  -> QBind(new_local(local))
     Some(PLit(lit))     -> QLit(literal(lit, ty))
-    Some(PConst(ResDef(def))) -> ctor_pat(pat, def)
+    Some(PConst(ResDef(def))) -> program.items.get(def) match {
+      Some(Hir.IConst(c)) -> const_pat(c.value)
+      _                   -> ctor_pat(pat, def)
+    }
     Some(PCtor(ResDef(def), _, _)) -> ctor_pat(pat, def)
     Some(PTuple(elems)) -> QTuple(elems.map(lower_pat))
     Some(PList(elems, rest)) -> QList(
@@ -1601,6 +1604,27 @@ fn lower_pat(pat: Int) -> Pat uses { State[Lowering] } {
     )
     _ -> {
       unsupported("this pattern")
+      QWild
+    }
+  }
+}
+
+## A pattern naming a constant matches its value: the value of a literal constant, or of a constant
+## naming another one.
+fn const_pat(value: Int) -> Pat uses { State[Lowering] } {
+  program = st().program
+  ty = st().checked.types.exprs.get(value).map(lower_type).or(CUnit)
+  program.exprs.get(value).map(|e| e.kind) match {
+    Some(ELit(lit)) -> QLit(literal(lit, ty))
+    Some(EPath(ResDef(def))) -> program.items.get(def) match {
+      Some(Hir.IConst(c)) -> const_pat(c.value)
+      _ -> {
+        unsupported("a constant pattern of this value")
+        QWild
+      }
+    }
+    _ -> {
+      unsupported("a constant pattern of this value")
       QWild
     }
   }

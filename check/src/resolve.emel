@@ -196,7 +196,7 @@ import Hir.{
   describe,
   empty_program,
 }
-import Modules.{ModuleMap, display, get, lookup, is_core}
+import Modules.{ModuleMap, display, get, lookup, lookup_from, is_core}
 import Syntax.Source.{slice}
 import Syntax.Tree.{
   NodeKind,
@@ -1066,7 +1066,7 @@ fn imports(module: Int, root: Node) -> () uses { State[Resolver] } {
           Some(last) -> {
             name = segs.map(text_of)
             # The import graph has already reported undefined modules.
-            lookup(st().map, name) match {
+            lookup_from(st().map, module, name) match {
               None -> ()
               Some(target) -> {
                 alias = text_of(last)
