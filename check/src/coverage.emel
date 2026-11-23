@@ -1,0 +1,469 @@
+## Match exhaustiveness, redundant arms, and bindings that can fail (spec 6.3, 6.5). Follows
+## `exhaustiveness.rs` and `coverage.rs` of the reference type checker.
+##
+## The usefulness algorithm (Maranget): a pattern row is useful against the rows above it if some
+## value matches it and none of them. An arm is redundant when it is not useful; a match misses
+## values when `_` is still useful after every unguarded arm. Diagnostics show only where and
+## which code, so the examples of missing values are not built: usefulness is a Bool here.
+import Hir.{
+  Program,
+  Res,
+  ResDef,
+  Literal,
+  LInt,
+  LFloat,
+  LString,
+  PWild,
+  PBind,
+  PLit,
+  PConst,
+  PCtor,
+  PUnit,
+  PTuple,
+  PList,
+  PMissing,
+  Arg,
+  Arm,
+  ELit,
+  EUnary,
+  OpNeg,
+  EUnit,
+  ETuple,
+  EList,
+  EPath,
+  ECall,
+  Item,
+  IConst,
+  IEnum,
+  IType,
+  IError,
+  IHandler,
+  ICtor,
+}
+import Infer.{substitute_bound}
+import Ty.{Ty, TyPrim, TyTuple, TyList, TyNamed, TyFn, TyError, PBool}
+import Tylower.{TyTable, con_def, def_of, prelude_def}
+import Signature.{Signatures}
+import Numbers
+
+## A literal's value: numbers by value, strings by text.
+enum Lit {
+  LitInt(digits: String)
+  LitFloat(value: Float)
+  LitStr(text: String)
+  ## Digits that do not make a number; equal only to the same text.
+  LitBad(text: String)
+} derive Eq
+
+enum CPat {
+  CWild
+  CLit(lit: Lit)
+  ## The variant's index and the patterns of the fields given, by field position.
+  CVariant(variant: Int, fields: List[(Int, CPat)])
+  CTuple(elems: List[CPat])
+  CList(prefix: List[CPat], rest: Bool)
+}
+
+## How the values of a type are made.
+enum Shape {
+  ## Literals or nothing to match on.
+  Opaque
+  ## The field types of each variant.
+  SEnum(variants: List[List[Ty]])
+  STuple(tys: List[Ty])
+  SList(elem: Ty)
+}
+
+enum Ctor {
+  CtVariant(index: Int)
+  CtTuple
+  CtFixed(n: Int)
+  CtAtLeast(n: Int)
+  CtLit(lit: Lit)
+  CtOther
+}
+
+## What the checks need: types are passed with unification bindings followed.
+pub type Shapes(program: Program, table: TyTable, sigs: Signatures)
+
+## Whether some value is missed, and the redundant arms (indices).
+pub type MatchCheck(missing: Bool, redundant: List[Int])
+
+## Checks the arms (of `match` or `escape`) applied to a value of type `ty`.
+pub fn check_arms(shapes: Shapes, ty: Ty, arms: List[Arm]) -> MatchCheck {
+  check_match(shapes, ty, arms.map(|arm| arm_pat(shapes, arm.pat, ty, arm.guard.is_some())))
+}
+
+## Whether a binding's pattern can fail for a value of type `ty`.
+pub fn refutable(shapes: Shapes, pat: Int, ty: Ty) -> Bool {
+  check_match(shapes, ty, [arm_pat(shapes, pat, ty, False)]).missing
+}
+
+## The checker's arm for a pattern. An arm whose pattern has a const not made only of literals and
+## constructors counts as guarded: it is neither counted for exhaustiveness nor covers the arms
+## below it.
+fn arm_pat(shapes: Shapes, pat: Int, ty: Ty, guarded: Bool) -> (CPat, Bool) {
+  (p, computed) = to_pat(shapes, pat, ty)
+  (p, guarded || computed)
+}
+
+fn check_match(shapes: Shapes, ty: Ty, arms: List[(CPat, Bool)]) -> MatchCheck {
+  (rows, redundant) = arms.enumerate().fold(([], []), |(rows, redundant), (i, (p, guarded))| {
+    r = if useful(shapes, rows, [p], [ty]) { redundant } else { redundant.append([i]) }
+    (if guarded { rows } else { rows.append([[p]]) }, r)
+  })
+  MatchCheck(useful(shapes, rows, [CWild], [ty]), redundant)
+}
+
+fn is_wild(p: CPat) -> Bool {
+  p match {
+    CWild -> True
+    _     -> False
+  }
+}
+
+fn head_of(row: List[CPat]) -> CPat {
+  row.head().or(CWild)
+}
+
+fn useful(shapes: Shapes, rows: List[List[CPat]], q: List[CPat], tys: List[Ty]) -> Bool {
+  q match {
+    [] -> rows.is_empty()
+    [head, ..q_rest] -> {
+      ty = tys.head().or(TyError)
+      shape = shape_of(shapes, ty)
+      ctors = split_ctors(shape, rows.map(head_of).append([head]))
+      (found, missing) = ctors.fold((False, False), |(found, missing), ctor| {
+        if found || !covers(head, ctor) {
+          (found, missing)
+        } else if is_wild(head) && !rows.any(|r| !is_wild(head_of(r)) && covers(head_of(r), ctor)) {
+          (found, True)
+        } else {
+          n = arity(shape, ctor)
+          spec_rows = rows.filter(|r| covers(head_of(r), ctor)).map(|r| specialize(r, n))
+          spec_q = specialize(q, n)
+          spec_tys = field_tys(shape, ctor).append(tys.drop(1))
+          (useful(shapes, spec_rows, spec_q, spec_tys), missing)
+        }
+      })
+      if found {
+        True
+      } else if missing {
+        default_rows = rows.filter(|r| is_wild(head_of(r))).map(|r| r.drop(1))
+        useful(shapes, default_rows, q_rest, tys.drop(1))
+      } else {
+        False
+      }
+    }
+  }
+}
+
+fn split_ctors(shape: Shape, heads: List[CPat]) -> List[Ctor] {
+  shape match {
+    SEnum(variants) -> List.range(0, variants.length()).map(CtVariant)
+    STuple(_)       -> [CtTuple]
+    SList(_) -> {
+      n = heads.fold(0, |n, p| {
+        p match {
+          CList(prefix, rest) -> {
+            k = if rest { prefix.length() } else { prefix.length() + 1 }
+            if k > n { k } else { n }
+          }
+          _ -> n
+        }
+      })
+      List.range(0, n).map(CtFixed).append([CtAtLeast(n)])
+    }
+    Opaque -> {
+      lits = heads.fold([], |acc, p| {
+        p match {
+          CLit(l) if !acc.any(|x| x == l) -> acc.append([l])
+          _                               -> acc
+        }
+      })
+      lits.map(CtLit).append([CtOther])
+    }
+  }
+}
+
+fn covers(p: CPat, ctor: Ctor) -> Bool {
+  (p, ctor) match {
+    (CWild, _)                          -> True
+    (CVariant(v, _), CtVariant(w))      -> v == w
+    (CTuple(_), CtTuple)                -> True
+    (CList(prefix, False), CtFixed(n))  -> prefix.length() == n
+    (CList(_, False), CtAtLeast(_))     -> False
+    (CList(prefix, True), CtFixed(n))   -> prefix.length() <= n
+    (CList(prefix, True), CtAtLeast(n)) -> prefix.length() <= n
+    (CLit(a), CtLit(b))                 -> a == b
+    _                                   -> False
+  }
+}
+
+fn arity(shape: Shape, ctor: Ctor) -> Int {
+  (shape, ctor) match {
+    (SEnum(variants), CtVariant(v)) -> variants.get(v).map(|f| f.length()).or(0)
+    (STuple(tys), CtTuple)          -> tys.length()
+    (_, CtFixed(n))                 -> n
+    (_, CtAtLeast(n))               -> n
+    _                               -> 0
+  }
+}
+
+fn field_tys(shape: Shape, ctor: Ctor) -> List[Ty] {
+  (shape, ctor) match {
+    (SEnum(variants), CtVariant(v)) -> variants.get(v).or([])
+    (STuple(tys), CtTuple)          -> tys
+    (SList(elem), CtFixed(n))       -> List.range(0, n).map(|_| elem)
+    (SList(elem), CtAtLeast(n))     -> List.range(0, n).map(|_| elem)
+    _                               -> []
+  }
+}
+
+## The row with its first pattern replaced by the patterns of its fields (`n` of them).
+fn specialize(row: List[CPat], n: Int) -> List[CPat] {
+  wilds = List.range(0, n).map(|_| CWild)
+  fields = head_of(row) match {
+    CVariant(_, fs) -> wilds.enumerate().map(
+      |(i, w)| fs.find(|(j, _)| j == i).map(|(_, p)| p).or(w),
+    )
+    CTuple(ps)   -> wilds.enumerate().map(|(i, w)| ps.get(i).or(w))
+    CList(ps, _) -> wilds.enumerate().map(|(i, w)| ps.get(i).or(w))
+    _            -> wilds
+  }
+  fields.append(row.drop(1))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Shapes of types and patterns (`coverage.rs`)
+
+fn shape_of(shapes: Shapes, ty: Ty) -> Shape {
+  program = shapes.program
+  ty match {
+    TyPrim(PBool) -> prelude_def(program, "Bool").map(|b| SEnum(variants(shapes, b, []))).or(Opaque)
+    TyPrim(Ty.PUnit) -> STuple([])
+    TyTuple(elems) -> STuple(elems)
+    TyList(elem)  -> SList(elem)
+    TyNamed(id, args) -> {
+      def = con_def(shapes.table, id)
+      program.items.get(def) match {
+        Some(IEnum(_))    -> SEnum(variants(shapes, def, args))
+        Some(IType(t))    -> t.ctor.map(|c| SEnum([variant(shapes, c, args)])).or(Opaque)
+        Some(IError(_))   -> SEnum([variant(shapes, def, args)])
+        Some(IHandler(h)) -> h.ctor.map(|c| SEnum([variant(shapes, c, args)])).or(Opaque)
+        _                 -> Opaque
+      }
+    }
+    _             -> Opaque
+  }
+}
+
+fn variants(shapes: Shapes, enum_def: Int, args: List[Ty]) -> List[List[Ty]] {
+  shapes.program.items.get(enum_def) match {
+    Some(IEnum(e)) -> e.variants.map(|v| variant(shapes, v, args))
+    _              -> []
+  }
+}
+
+## Field types come from the constructor's declared type, with type arguments substituted.
+fn variant(shapes: Shapes, ctor: Int, args: List[Ty]) -> List[Ty] {
+  Signature.get(shapes.sigs, ctor).map(|s| s.scheme.ty) match {
+    Some(TyFn(f)) -> f.params.map(|p| substitute_bound(p, args))
+    _             -> []
+  }
+}
+
+## The type definition (type, enum, error, or the Bool enum).
+fn ty_def(shapes: Shapes, ty: Ty) -> Option[Int] {
+  ty match {
+    TyNamed(id, _) -> Some(con_def(shapes.table, id))
+    TyPrim(PBool)  -> prelude_def(shapes.program, "Bool")
+    _              -> None
+  }
+}
+
+## `None` if `ctor` does not construct `ty`.
+fn variant_index(shapes: Shapes, ctor: Int, ty: Ty) -> Option[Int] {
+  program = shapes.program
+  ty_def(shapes, ty).and_then(|td| {
+    program.items.get(ctor) match {
+      Some(IError(_)) -> if ctor == td { Some(0) } else { None }
+      Some(ICtor(c)) if c.owner == td -> program.items.get(td) match {
+        Some(IEnum(e)) -> e.variants.find_index(|v| v == ctor)
+        _              -> Some(0)
+      }
+      _               -> None
+    }
+  })
+}
+
+## The checker's pattern, and whether a const whose value cannot be known was met. Parts that do
+## not fit the type (reported by the type checker) become wildcards.
+fn to_pat(shapes: Shapes, pat: Int, ty: Ty) -> (CPat, Bool) {
+  program = shapes.program
+  shape = shape_of(shapes, ty)
+  kind = program.pats.get(pat).map(|p| p.kind)
+  (kind, shape) match {
+    (Some(PLit(lit)), Opaque) -> (CLit(lit_value(lit, False)), False)
+    (Some(PConst(ResDef(def))), _) -> const_pat(shapes, def, ty, []) match {
+      Some(p) -> (p, False)
+      None    -> (CWild, True)
+    }
+    (Some(PUnit), STuple([])) -> (CTuple([]), False)
+    (Some(PTuple(elems)), STuple(tys)) if elems.length() == tys.length() -> {
+      parts = elems.zip(tys).map(|(e, t)| to_pat(shapes, e, t))
+      (CTuple(parts.map(|(p, _)| p)), parts.any(|(_, c)| c))
+    }
+    (Some(PList(elems, rest)), SList(elem_ty)) -> {
+      parts = elems.map(|e| to_pat(shapes, e, elem_ty))
+      (CList(parts.map(|(p, _)| p), rest.is_some()), parts.any(|(_, c)| c))
+    }
+    (Some(PCtor(ResDef(ctor), args, _)), SEnum(vs)) -> variant_index(shapes, ctor, ty) match {
+      None -> (CWild, False)
+      Some(v) -> {
+        field_types = vs.get(v).or([])
+        labels = Signature.get(shapes.sigs, ctor).map(|s| s.labels)
+        (fields, _, computed) = args.or([]).fold(([], 0, False), |(fields, next, computed), arg| {
+          (position, after) = arg.label match {
+            None    -> (Some(next), next + 1)
+            Some(l) -> (labels.and_then(|ls| ls.find_index(|x| x == Some(l.name))), next)
+          }
+          position.and_then(|i| field_types.get(i).map(|t| (i, t))) match {
+            Some((i, t)) -> {
+              (p, c) = to_pat(shapes, arg.pat, t)
+              (fields.append([(i, p)]), after, computed || c)
+            }
+            None -> (fields, after, computed)
+          }
+        })
+        (CVariant(v, fields), computed)
+      }
+    }
+    _                         -> (CWild, False)
+  }
+}
+
+## The value of the const `def` as a pattern, if it is made only of literals, negated numbers,
+## constructors, tuples, lists and other such consts (spec 5.6). `seen` holds the consts being
+## expanded.
+fn const_pat(shapes: Shapes, def: Int, ty: Ty, seen: List[Int]) -> Option[CPat] {
+  shapes.program.items.get(def) match {
+    Some(IConst(c)) if !seen.any(|s| s == def) -> value_pat(shapes, c.value, ty, [def, ..seen])
+    _                                          -> None
+  }
+}
+
+fn value_pat(shapes: Shapes, expr: Int, ty: Ty, seen: List[Int]) -> Option[CPat] {
+  program = shapes.program
+  shape = shape_of(shapes, ty)
+  kind = program.exprs.get(expr).map(|e| e.kind)
+  (kind, shape) match {
+    (Some(ELit(lit)), Opaque) -> Some(CLit(lit_value(lit, False)))
+    (Some(EUnary(OpNeg, operand)), Opaque) -> program.exprs.get(operand).map(|e| e.kind) match {
+      Some(ELit(LInt(t)))   -> Some(CLit(lit_value(LInt(t), True)))
+      Some(ELit(LFloat(t))) -> Some(CLit(lit_value(LFloat(t), True)))
+      _                     -> None
+    }
+    (Some(EUnit), STuple([])) -> Some(CTuple([]))
+    (Some(ETuple(elems)), STuple(tys)) if elems.length() == tys.length() -> all_some(
+      elems.zip(tys).map(|(e, t)| value_pat(shapes, e, t, seen)),
+    ).map(CTuple)
+    (Some(EList(elems, rest)), SList(elem_ty)) -> all_some(
+      elems.map(|e| value_pat(shapes, e, elem_ty, seen)),
+    ).and_then(|prefix| {
+      rest match {
+        None -> Some(CList(prefix, False))
+        # `[x, ..REST]` with a known list `REST`.
+        Some(r) -> value_pat(shapes, r, ty, seen) match {
+          Some(CList(tail, False)) -> Some(CList(prefix.append(tail), False))
+          _                        -> None
+        }
+      }
+    })
+    (Some(EPath(ResDef(d))), _) -> program.items.get(d) match {
+      Some(IConst(_)) -> const_pat(shapes, d, ty, seen)
+      _               -> ctor_pat(shapes, d, [], ty, seen)
+    }
+    (Some(ECall(callee, args)), _) -> program.exprs.get(callee).map(|e| e.kind) match {
+      Some(EPath(ResDef(ctor))) -> ctor_pat(shapes, ctor, args, ty, seen)
+      _                         -> None
+    }
+    _                         -> None
+  }
+}
+
+fn all_some[A](xs: List[Option[A]]) -> Option[List[A]] {
+  xs.fold(Some([]), |acc, x| acc.and_then(|ys| x.map(|y| ys.append([y]))))
+}
+
+## The constructor applied to `args` as a pattern, if it constructs `ty` and every field has a
+## known value.
+fn ctor_pat(shapes: Shapes, ctor: Int, args: List[Arg], ty: Ty, seen: List[Int]) -> Option[CPat] {
+  shape_of(shapes, ty) match {
+    SEnum(vs) -> variant_index(shapes, ctor, ty).and_then(|v| {
+      field_types = vs.get(v).or([])
+      if args.length() != field_types.length() {
+        None
+      } else {
+        labels = Signature.get(shapes.sigs, ctor).map(|s| s.labels)
+        (fields, _) = args.fold((Some([]), 0), |(acc, next), arg| {
+          (position, after) = arg.label match {
+            None    -> (Some(next), next + 1)
+            Some(l) -> (labels.and_then(|ls| ls.find_index(|x| x == Some(l.name))), next)
+          }
+          step = acc.and_then(|fs| {
+            position.and_then(|i| {
+              if fs.any(|(j, _)| j == i) {
+                None
+              } else {
+                field_types.get(i).and_then(|t| value_pat(shapes, arg.value, t, seen)).map(
+                  |p| fs.append([(i, p)]),
+                )
+              }
+            })
+          })
+          (step, after)
+        })
+        fields.map(|fs| CVariant(v, fs))
+      }
+    })
+    _ -> None
+  }
+}
+
+## A literal's value. `negative` is for a const's unary minus; a pattern's literal carries its own
+## `-` in its text.
+fn lit_value(lit: Literal, negative: Bool) -> Lit {
+  lit match {
+    LInt(text) -> {
+      cps = text.code_points()
+      (sign, digits0) = cps match {
+        [45, ..rest] -> (!negative, rest)
+        _            -> (negative, cps)
+      }
+      (radix, digits) = digits0 match {
+        [48, 120, ..rest] -> (16, rest)
+        [48, 98, ..rest]  -> (2, rest)
+        _                 -> (10, digits0)
+      }
+      values = digits.map(Numbers.digit_value)
+      if digits.is_empty() || values.any(|v| v < 0 || v >= radix) {
+        LitBad(text)
+      } else {
+        magnitude = Numbers.to_decimal(values, radix)
+        if magnitude == "0" {
+          LitInt("0")
+        } else {
+          LitInt(if sign { "-#{magnitude}" } else { magnitude })
+        }
+      }
+    }
+    LFloat(text) -> {
+      x = Float.parse(text) escape {
+        _ -> 0.0
+      }
+      LitFloat(if negative { -x } else { x })
+    }
+    LString(s) -> LitStr(s)
+  }
+}

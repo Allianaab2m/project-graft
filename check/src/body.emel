@@ -228,6 +228,8 @@ import Signature.{
 }
 import Groups.{defining_module, impl_fn}
 import Traits.{Traits}
+import Numbers
+import Coverage
 
 ## A definition without a declared type: its monomorphic type within the group and its type
 ## parameters (written and invisible set ones).
@@ -274,7 +276,18 @@ pub type BodyState(
   trait_obligations: List[TraitObligation],
   ## Newest first.
   self_obligations: List[SelfObligation],
+  ## Matches and bindings to check for coverage once types are settled. Newest first.
+  coverage: List[CoverageSite],
 )
+
+## Places where coverage is checked.
+enum CoverageSite {
+  MatchSite(scrutinee: Int, ty: Ty, arms: List[Arm])
+  ## A binding `pat = value`, whose pattern must always succeed (spec 6.3).
+  BindingSite(pat: Int, ty: Ty)
+  ## `escape` arms grouped by the caught error type; only redundant arms are checked.
+  EscapeSite(groups: List[(Ty, List[Arm])])
+}
 
 ## A type that must satisfy a trait: the instantiation of a constrained type parameter at a
 ## reference, or an operand of `==`, `<` or interpolation. `owner` is the definition whose type
@@ -332,6 +345,7 @@ pub fn infer_group(
     Map.empty(),
     traits,
     Map.empty(),
+    [],
     [],
     [],
   )
@@ -522,6 +536,7 @@ fn finish() -> List[(Int, Signature)] {
   check_numbers()
   check_known_selves()
   check_traits()
+  check_coverage()
   program = prog()
   bs().pending.map(|p| {
     labels = program.items.get(p.def) match {
@@ -902,6 +917,7 @@ fn infer_block(block: Block, span: Span, expected: Option[Ty]) -> Ty {
           None -> infer_expr(value)
         }
         bind_pat(pat, bound)
+        add_coverage(BindingSite(pat, bound))
       }
       SLocalFn(f) -> infer_local_fn(f)
       SExpr(x) -> {
@@ -1662,6 +1678,7 @@ fn infer_unary(op: UnaryOp, operand: Int, span: Span) -> Ty {
 ## expected type goes to each arm body.
 fn infer_match(scrutinee: Int, arms: List[Arm], expected: Option[Ty]) -> Ty {
   scrutinee_ty = infer_expr(scrutinee)
+  add_coverage(MatchSite(scrutinee, scrutinee_ty, arms))
   arms.fold(TyNever, |result, arm| {
     bind_pat(arm.pat, scrutinee_ty)
     when_some(arm.guard, |g| check_expr(g, BOOL))
@@ -1684,46 +1701,103 @@ fn infer_match(scrutinee: Int, arms: List[Arm], expected: Option[Ty]) -> Ty {
 fn infer_escape(inner: Int, arms: List[Arm]) -> Ty {
   program = prog()
   inner_ty = infer_expr(inner)
-  (result, _) = arms.fold((inner_ty, False), |(result, below), arm| {
+  (result, _, groups) = arms.fold((inner_ty, False, []), |(result, below, groups), arm| {
     p = program.pats.get(arm.pat)
     span = p.map(|q| q.span).or(Span(0, 0, 0))
     if below {
       Tylower.report_warning(Some(span), "W0301", "unreachable match arm")
     }
-    now_below = p.map(|q| q.kind) match {
+    (now_below, next_groups) = p.map(|q| q.kind) match {
       Some(PCtor(ResDef(def), _, _)) if def_of(program, def).kind == ErrorKind -> {
-        bind_pat(arm.pat, self_ty(bs().table, def).or(TyError))
-        below
+        ty = self_ty(bs().table, def).or(TyError)
+        bind_pat(arm.pat, ty)
+        (below, if below { groups } else { add_to_group(groups, def, ty, arm) })
       }
       Some(PWild) -> {
         bind_pat(arm.pat, TyError)
         arm.guard match {
           Some(g) -> {
             diag(expr_span(g), "E0320", "an `escape` arm `_` cannot have a guard")
-            below
+            (below, groups)
           }
-          None -> True
+          None -> (True, groups)
         }
       }
       Some(PCtor(_, _, _)) -> {
         bind_pat(arm.pat, TyError)
-        below
+        (below, groups)
       }
       Some(PMissing) -> {
         bind_pat(arm.pat, TyError)
-        below
+        (below, groups)
       }
       _ -> {
         diag(span, "E0320", "an `escape` arm must be an error constructor or `_`")
         bind_pat(arm.pat, TyError)
-        below
+        (below, groups)
       }
     }
     when_some(arm.guard, |g| check_expr(g, BOOL))
     body_ty = infer_expr(arm.body)
-    (join_at(expr_span(arm.body), result, body_ty), now_below)
+    (join_at(expr_span(arm.body), result, body_ty), now_below, next_groups)
   })
+  add_coverage(EscapeSite(groups.map(|(_, ty, group)| (ty, group))))
   result
+}
+
+fn add_to_group(
+  groups: List[(Int, Ty, List[Arm])],
+  def: Int,
+  ty: Ty,
+  arm: Arm,
+) -> List[(Int, Ty, List[Arm])] {
+  if groups.any(|(d, _, _)| d == def) {
+    groups.map(|(d, t, g)| if d == def { (d, t, g.append([arm])) } else { (d, t, g) })
+  } else {
+    groups.append([(def, ty, [arm])])
+  }
+}
+
+fn add_coverage(site: CoverageSite) -> () {
+  bupd(|b| BodyState(coverage: [site, ..b.coverage], ..b))
+}
+
+## Checks match exhaustiveness, redundant arms, and that binding patterns always succeed (spec
+## 6.3, 6.5). Skipped when the type is broken, since another error has been reported.
+fn check_coverage() -> () {
+  b = bs()
+  shapes = Coverage.Shapes(b.program, b.table, b.sigs)
+  pat_span = |pat: Int| b.program.pats.get(pat).map(|p| p.span).or(Span(0, 0, 0))
+  unreachable = |arms: List[Arm], redundant: List[Int]| {
+    redundant.each(|i| {
+      when_some(arms.get(i), |arm| {
+        Tylower.report_warning(Some(pat_span(arm.pat)), "W0301", "unreachable match arm")
+      })
+    })
+  }
+  b.coverage.reverse().each(|site| {
+    site match {
+      MatchSite(scrutinee, ty0, arms) -> {
+        ty = resolve(ty0)
+        if ty != TyError {
+          r = Coverage.check_arms(shapes, ty, arms)
+          if r.missing {
+            diag(expr_span(scrutinee), "E0303", "non-exhaustive match")
+          }
+          unreachable(arms, r.redundant)
+        }
+      }
+      EscapeSite(groups) -> groups.each(|(ty, arms)| {
+        unreachable(arms, Coverage.check_arms(shapes, ty, arms).redundant)
+      })
+      BindingSite(pat, ty0) -> {
+        ty = resolve(ty0)
+        if ty != TyError && Coverage.refutable(shapes, pat, ty) {
+          diag(pat_span(pat), "E0317", "this pattern can fail")
+        }
+      }
+    }
+  })
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1872,59 +1946,17 @@ fn int_literal_fits(text: String, ty: Ty) -> Bool {
       [48, 98, ..rest]  -> (2, rest)
       _                 -> (10, digits0)
     }
-    values = digits.map(|d| digit_value(d))
+    values = digits.map(Numbers.digit_value)
     if digits.is_empty() || values.any(|v| v < 0 || v >= radix) {
       False
     } else {
       # The magnitude in decimal digits, compared with 2^(bits-1) (- 1 if positive).
-      decimal = to_decimal(values, radix)
+      decimal = Numbers.to_decimal(values, radix)
       limit = if bits == 32 { "2147483648" } else { "9223372036854775808" }
       cmp = compare_decimal(decimal, limit)
       if negative { cmp != Greater } else { cmp == Less }
     }
   }
-}
-
-fn digit_value(c: Int) -> Int {
-  {
-    if c >= 48 && c <= 57 {
-      c - 48
-    } else if c >= 97 && c <= 102 {
-      c - 87
-    } else if c >= 65 && c <= 70 {
-      c - 55
-    } else {
-      -1
-    }
-  }
-}
-
-## The digits in base `radix` as a decimal string without leading zeros ("0" for zero).
-fn to_decimal(values: List[Int], radix: Int) -> String {
-  # Little-endian decimal digits.
-  acc = values.fold([], |dec, v| add_small(mul_small(dec, radix), v))
-  s = String.concat(acc.reverse().map(|d| "#{d}"))
-  if s == "" { "0" } else { s }
-}
-
-fn mul_small(dec: List[Int], m: Int) -> List[Int] {
-  (out, carry) = dec.fold(([], 0), |(acc, c), d| {
-    x = d * m + c
-    ([x % 10, ..acc], x / 10)
-  })
-  flush(out.reverse(), carry)
-}
-
-fn add_small(dec: List[Int], a: Int) -> List[Int] {
-  (out, carry) = dec.fold(([], a), |(acc, c), d| {
-    x = d + c
-    ([x % 10, ..acc], x / 10)
-  })
-  flush(out.reverse(), carry)
-}
-
-fn flush(dec: List[Int], carry: Int) -> List[Int] {
-  if carry == 0 { dec } else { flush(dec.append([carry % 10]), carry / 10) }
 }
 
 fn compare_decimal(a: String, b: String) -> Ordering {

@@ -1,0 +1,42 @@
+## Digits of integer literals, shared by the range check of literals and the coverage check.
+
+## The value of a digit (`0` to `9`, `a` to `f`, `A` to `F`) given as a code point; -1 for others.
+pub fn digit_value(c: Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    -1
+  }
+}
+
+## The digits in base `radix` as a decimal string without leading zeros ("0" for zero).
+pub fn to_decimal(values: List[Int], radix: Int) -> String {
+  # Little-endian decimal digits.
+  acc = values.fold([], |dec, v| add_small(mul_small(dec, radix), v))
+  s = String.concat(acc.reverse().map(|d| "#{d}"))
+  if s == "" { "0" } else { s }
+}
+
+fn mul_small(dec: List[Int], m: Int) -> List[Int] {
+  (out, carry) = dec.fold(([], 0), |(acc, c), d| {
+    x = d * m + c
+    ([x % 10, ..acc], x / 10)
+  })
+  flush(out.reverse(), carry)
+}
+
+fn add_small(dec: List[Int], a: Int) -> List[Int] {
+  (out, carry) = dec.fold(([], a), |(acc, c), d| {
+    x = d + c
+    ([x % 10, ..acc], x / 10)
+  })
+  flush(out.reverse(), carry)
+}
+
+fn flush(dec: List[Int], carry: Int) -> List[Int] {
+  if carry == 0 { dec } else { flush(dec.append([carry % 10]), carry / 10) }
+}
