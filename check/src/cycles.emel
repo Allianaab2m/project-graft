@@ -139,39 +139,39 @@ fn eager_refs(program: Program, expr: Int, out: List[Int]) -> List[Int] {
         Some(IConst(_)) -> [d, ..out]
         _               -> out
       }
-      EMissing            -> out
-      ELit(_)             -> out
-      EPath(_)            -> out
-      EUnit               -> out
-      EUse(_, _)          -> out
-      ELambda(_, _)       -> out
+      EMissing                    -> out
+      ELit(_)                     -> out
+      EPath(_)                    -> out
+      EUnit                       -> out
+      EUse(_, _)                  -> out
+      ELambda(_, _)               -> out
       EInterpolated(parts) -> parts.fold(out, |acc, p| {
         p match {
           SInterp(x) -> go(x, acc)
           _          -> acc
         }
       })
-      EField(base, _)     -> go(base, out)
-      ECall(callee, args) -> all(args.map(|a| a.value), go(callee, out))
-      EUnary(_, operand)  -> go(operand, out)
+      EField(base, _)             -> go(base, out)
+      ECall(callee, args)         -> all(args.map(|a| a.value), go(callee, out))
+      EUnary(_, operand)          -> go(operand, out)
       EBinary(op, lhs, rhs) -> if op == OpAnd || op == OpOr {
         go(lhs, out)
       } else {
         go(rhs, go(lhs, out))
       }
-      ETuple(elems)       -> all(elems, out)
+      ETuple(elems)               -> all(elems, out)
       EList(elems, rest) -> {
         o = all(elems, out)
         rest.map(|r| go(r, o)).or(o)
       }
-      EBlock(block)       -> block_refs(program, block, out)
-      EIf(c, _, _)        -> go(c, out)
-      EMatch(s, _)        -> go(s, out)
-      EEscape(s, _)       -> go(s, out)
-      EFail(x)            -> go(x, out)
-      EAssert(x)          -> go(x, out)
+      EBlock(block)               -> block_refs(program, block, out)
+      EIf(c, _, _)                -> go(c, out)
+      EMatch(s, _)                -> go(s, out)
+      EEscape(s, _)               -> go(s, out)
+      EFail(x)                    -> go(x, out)
+      EAssert(x)                  -> go(x, out)
       EUpdate(ctor, fields, base) -> go(base, all(fields.map(|f| f.value), go(ctor, out)))
-      EWith(items, body)  -> go(body, all(items.flat_map(item_args), out))
+      EWith(items, body)          -> go(body, all(items.flat_map(item_args), out))
     }
   }
 }
