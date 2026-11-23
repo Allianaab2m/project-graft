@@ -217,6 +217,8 @@ TPath(ResDef(d), _) -> def_of(program, d).kind != TypeParamKind
 
 起きたこと: どれも予約語で、フィールド名や引数名に書くと構文エラーになる．このセッションだけで `HandlerBody(handler: Int)` → `owner`、`Entry(effect: Tag)` → `provided`、`Holder.HCaller(effect: Int)` → `eff`、`suspend: Bool` → `is_suspend`、`uses: Map[Int, Row]` → `handler_uses` と直した．エラーは `expected field name` や `expected parameter name` で、予約語だからとは言わない．同じファイルの後続の宣言にもエラーが連鎖するので、最初のエラーを読まないと原因が分からない．
 
+M4 の Core IR でも同じことが続いた: `EnumDef(error: Bool)` → `is_error`、`external` → `is_external`、`CHandler(effect: Int)` → `eff`、`XFail(error: Expr)` → `err`、`XLet(var: Int)` → `bound`、`XSeq(first, then)` → `rest`、`XFinally(handler: Expr)` → `retired`、`CEnum(id, as)` のパターン変数 `as` → `targs`．IR の名前は reference（Rust）と揃えたいが、Rust で書ける名前の多くが Emela では書けない．
+
 本来の形: フィールド名、引数名、名前付き引数のラベルの位置では予約語を名前として許す（文脈依存のキーワード）．少なくとも診断で「`handler` は予約語」と言う．
 
 行き先: 診断は本体 issue．文脈依存のキーワードは proposal．

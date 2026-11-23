@@ -123,3 +123,9 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   3. Traits and derived impls, `dbg` and `inspect`.
   4. Errors (`fail`, `escape`) and effects (evidence passing, handlers, `with`, layers).
   5. Suspension (generators) and fibers.
+
+  Unlike the reference, Graft monomorphizes while lowering (each instance of a definition is
+  lowered with its type arguments), and every function and closure takes the evidence table as
+  its last parameter. 38 of the 73 programs behave as on `emela run`: what remains is labels and
+  handler members in `with`, suspend fn implementations, fibers, `State.run`, and the derived
+  `ObjectKey` and `Encode`.
