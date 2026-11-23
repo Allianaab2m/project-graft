@@ -229,6 +229,8 @@ type Lowering(
   ## The `with` expressions of the definition around the expression, innermost first: the
   ## evidence table after the handler, and the keys of the effects it provides.
   withs: List[(Int, List[String])],
+  ## In an init, the cell holding the release of the handler members it opens.
+  opened: Option[Int],
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -276,6 +278,7 @@ pub fn lower(
         Map.empty(),
         -1,
         [],
+        None,
       )
       (_, done) = State.run(start, || {
         instance(root, [])
@@ -335,7 +338,15 @@ fn def_name(def: Int) -> String {
     SourceModule(m) -> program.modules.get(m).map(|items| items.name).or([])
     _               -> []
   }
-  String.join(module.append([data.name]), "_")
+  # An inner handler is named after its outer handler too (`MemFiles_Open`).
+  outer = data.parent.and_then(|p| {
+    if data.kind == Hir.HandlerKind && def_of(program, p).kind == Hir.HandlerKind {
+      Some(def_of(program, p).name)
+    } else {
+      None
+    }
+  })
+  String.join(module.append(outer.map(|o| [o]).or([])).append([data.name]), "_")
 }
 
 fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
@@ -1035,12 +1046,23 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
       _                     -> None
     }
   })
-  op match {
-    Some((o, base)) -> {
+  # Opening a handler member inside an init: `Files.Open(p)`, `fs.Open(p)`.
+  member = types.members.get(callee).and_then(|m| {
+    if def_of(program, m).kind == Hir.MemberKind { Some(m) } else { None }
+  })
+  (op, member) match {
+    (Some((o, base)), _) -> {
       h = lower_expr(base)
       Ir.XOp(h, def_of(program, o).name, args, may_fail(callee))
     }
-    None -> plain_call(expr, callee, target, args)
+    (None, Some(m)) -> {
+      provider = callee_kind match {
+        Some(EField(base, _)) -> lower_expr(base)
+        _                     -> member_provider(callee, m)
+      }
+      opened_in_init(provider, m, args)
+    }
+    _ -> plain_call(expr, callee, target, args)
   }
 }
 
@@ -1070,6 +1092,40 @@ fn plain_call(expr: Int, callee: Int, target: Option[Int], args: List[Expr]) -> 
   }
 }
 
+## `State.run(initial, body)` (spec 8.8), a handler the runtime provides: a cell holding the
+## state, a handler value reading and writing it under the key of `State[S]`, the call of `body`
+## with it, and the pair of its value and the final state. A failure of `body` propagates.
+fn state_run(run: Int, targs: List[Type], args: List[Expr]) -> Expr uses { State[Lowering] } {
+  program = st().program
+  state = targs.head().or(CUnit)
+  module = def_of(program, run).module match {
+    SourceModule(m) -> program.modules.get(m).map(|items| items.items).or([])
+    _               -> []
+  }
+  state_effect = module.find(|d| def_of(program, d).name == "State").or(-1)
+  key = "#{def_name(state_effect)}[#{type_key(state)}]"
+  cell = fresh_local("state", CUnit, None)
+  hv = fresh_local("h", CUnit, None)
+  result = fresh_local("result", CUnit, None)
+  value = fresh_local("value", state, None)
+  f = fresh_local("f", CUnit, None)
+  get = || XBuiltin("$cellGet", [], [XVar(cell)])
+  set = |v: Expr| XBuiltin("$cellSet", [], [XVar(cell), v])
+  ops = [
+    ("get", XLambda([], CUnit, get(), False)),
+    ("set", XLambda([value], CUnit, set(XVar(value)), False)),
+    ("update", XLambda([f], CUnit, set(XCall(Indirect(XVar(f)), [get()], False, False)), False)),
+  ]
+  initial = args.get(0).or(XLit(VUnit))
+  body = args.get(1).or(XLit(VUnit))
+  call = XCall(Indirect(body), [Ir.XProvide(Some(ev_var()), [(key, XVar(hv))])], True, False)
+  XLet(
+    cell,
+    XBuiltin("$cellNew", [], [initial]),
+    XLet(hv, Ir.XHandler(ops), XLet(result, call, XTuple([XVar(result), get()]))),
+  )
+}
+
 ## Whether a call of `callee` may fail: the E of its type is not empty. A set type parameter
 ## counts as not empty; checking a result that is not a failure costs only the check.
 fn may_fail(callee: Int) -> Bool uses { State[Lowering] } {
@@ -1092,9 +1148,13 @@ fn builtin_call(callee: Int, def: Int, args: List[Expr]) -> Option[Expr] uses { 
       SourceModule(m) -> program.modules.get(m).map(|items| String.join(items.name, ".")).or("")
       _               -> ""
     }
-    Builtins.runtime_name(module, data.name) match {
-      Some(name) -> Some(XBuiltin(name, type_args(callee), args))
-      None       -> Some(unsupported("the intrinsic #{module}.#{data.name}"))
+    if module == "Std.State" && data.name == "run" {
+      Some(state_run(def, type_args(callee), args))
+    } else {
+      Builtins.runtime_name(module, data.name) match {
+        Some(name) -> Some(XBuiltin(name, type_args(callee), args))
+        None       -> Some(unsupported("the intrinsic #{module}.#{data.name}"))
+      }
     }
   } else {
     None
@@ -1308,9 +1368,13 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
     inst.role match {
       1 -> {
         params = h.init_params.map(|p| new_local(p.local))
+        # The cell holding the release of the handler members the init opens.
+        cell = fresh_local("opened", CUnit, None)
         ev = fresh_ev()
+        upd(|l| Lowering(opened: Some(cell), ..l))
         body = h.init.map(lower_expr).or(h.ctor.map(|c| XCtor(ctor_ref(c), [], [])).or(XLit(VUnit)))
-        (params.append([ev]), body)
+        upd(|l| Lowering(opened: None, ..l))
+        (params.append([cell, ev]), body)
       }
       2 -> {
         me = fresh_local("self", handler_ty, None)
@@ -1328,7 +1392,20 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
             (op_name, XLambda(params, CUnit, XLet(self_local, XVar(me), lowered), False))
           })
         })
-        ([me, ev], Ir.XHandler(ops))
+        # An inner handler is opened through its member: its init, its handler value, and a
+        # closure releasing it with the members its init opened.
+        members = h.inner.filter_map(|inner| {
+          program.items.get(inner) match {
+            Some(Hir.IHandler(ih)) -> ih.member.and_then(|m| {
+              m match {
+                ResDef(md) -> Some((def_of(program, md).name, open_member_fn(inner, ih, ev)))
+                _          -> None
+              }
+            })
+            _ -> None
+          }
+        })
+        ([me, ev], Ir.XHandler(ops.append(members)))
       }
       _ -> {
         me = fresh_local("self", handler_ty, None)
@@ -1347,10 +1424,96 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
   })
 }
 
+## The function opening the inner handler `inner` of a handler value made with the evidence
+## `ev`: its arguments are those of the inner init; it returns the inner handler value and the
+## closure releasing it.
+fn open_member_fn(inner: Int, item: Hir.HandlerItem, ev: Int) -> Expr uses { State[Lowering] } {
+  params = item.init_params.map(|_| fresh_local("x", CUnit, None))
+  cell = fresh_local("opened", CUnit, None)
+  me = fresh_local("self", named_type(inner, []), None)
+  init = instance_of(inner, [], 1)
+  maker = instance_of(inner, [], 2)
+  release = if item.release.is_some() {
+    XCall(Direct(instance_of(inner, [], 3), []), [XVar(me), XVar(ev)], False, False)
+  } else {
+    XLit(VUnit)
+  }
+  release_all = XLambda(
+    [],
+    CUnit,
+    XSeq(release, XCall(Indirect(XBuiltin("$cellGet", [], [XVar(cell)])), [], False, False)),
+    False,
+  )
+  body = XLet(
+    cell,
+    XBuiltin("$cellNew", [], [XLambda([], CUnit, XLit(VUnit), False)]),
+    XLet(
+      me,
+      init_call(init, params.map(XVar), cell, ev),
+      XTuple([XCall(Direct(maker, []), [XVar(me), XVar(ev)], False, False), release_all]),
+    ),
+  )
+  XLambda(params, CUnit, body, False)
+}
+
+## Opens a handler member through `provider` (a handler value of the member's effect): the inner
+## handler value and the closure releasing it, bound to `value` and `release` around `body`.
+fn open_member(
+  provider: Expr,
+  member: Int,
+  args: List[Expr],
+  value: Int,
+  release: Int,
+  body: Expr,
+) -> Expr
+  uses { State[Lowering] } {
+  opened = Ir.XOp(provider, def_of(st().program, member).name, args, True)
+  XMatch(opened, [Arm(QTuple([QBind(value), QBind(release)]), None, body)])
+}
+
+## The provider of the member `member` opened by `expr`: the handler of its effect (or of the label
+## it is named through) in scope.
+fn member_provider(expr: Int, member: Int) -> Expr uses { State[Lowering] } {
+  program = st().program
+  key = program.member_labels.get(expr) match {
+    Some(label) -> def_name(label)
+    None        -> def_of(program, member).parent.map(def_name).or("")
+  }
+  Ir.XUse(ev_var(), key)
+}
+
+## A member opened in an init: its release is put before the releases already in the init's
+## cell, so they run when the handler is released, the latest first.
+fn opened_in_init(provider: Expr, member: Int, args: List[Expr]) -> Expr uses { State[Lowering] } {
+  st().opened match {
+    None -> unsupported("opening a handler member outside an init")
+    Some(cell) -> {
+      value = fresh_local("opened", CUnit, None)
+      release = fresh_local("release", CUnit, None)
+      previous = fresh_local("previous", CUnit, None)
+      both = XLambda(
+        [],
+        CUnit,
+        XSeq(
+          XCall(Indirect(XVar(release)), [], False, False),
+          XCall(Indirect(XVar(previous)), [], False, False),
+        ),
+        False,
+      )
+      body = XLet(
+        previous,
+        XBuiltin("$cellGet", [], [XVar(cell)]),
+        XSeq(XBuiltin("$cellSet", [], [XVar(cell), both]), XVar(value)),
+      )
+      open_member(provider, member, args, value, release, body)
+    }
+  }
+}
+
 ## A handler a `with` initializes: the handler, the item it comes from, the locals of its `self`
 ## and handler value, the locals holding the arguments of its init, and the evidence its init and
 ## handler value see (set when it is placed in the initialization order).
-type Made(hdl: Int, origin: Int, me: Int, value: Int, args: List[Int], ev: Int)
+type Made(hdl: Int, origin: Int, me: Int, value: Int, args: List[Int], ev: Int, cell: Int)
 
 ## `with H1, ..., Hn { body }` (spec 8.3, 8.5, 14.2). The arguments of the inits are evaluated in
 ## the order the items are written. The handlers are initialized in the order of their
@@ -1366,12 +1529,6 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
   provided = entries.filter(|e| e.named).map(|e| effect_key(e.provided))
   outer = st().ev
   outer_withs = st().withs
-  items.each(|item| {
-    if item_is_member(item) {
-      unsupported("an item of `with` that opens a handler member")
-      ()
-    }
-  })
   # The handlers in the order of the items, with their arguments evaluated in that order.
   (arg_lets, units) = items.enumerate().fold(([], []), |(ls, us), (i, item)| {
     mine = entries.filter(|e| e.origin == i)
@@ -1401,7 +1558,8 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
       locals = values.map(|_| fresh_local("arg", CUnit, None))
       me = fresh_local("self", named_type(h, []), None)
       value = fresh_local("h", CUnit, None)
-      (ls2.append(locals.zip(values)), us2.append([Made(h, i, me, value, locals, -1)]))
+      cell = fresh_local("opened", CUnit, None)
+      (ls2.append(locals.zip(values)), us2.append([Made(h, i, me, value, locals, -1, cell)]))
     })
   })
   ordered = init_order(entries, units)
@@ -1417,11 +1575,12 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
     )
     next = fresh_local("ev", Ir.CEvidence, None)
     lets = [
-      (m.me, XCall(Direct(init, []), m.args.map(XVar).append([XVar(ev)]), True, False)),
+      (m.cell, XBuiltin("$cellNew", [], [XLambda([], CUnit, XLit(VUnit), False)])),
+      (m.me, init_call(init, m.args.map(XVar), m.cell, ev)),
       (m.value, XCall(Direct(maker, []), [XVar(m.me), XVar(ev)], False, False)),
       (next, Ir.XProvide(Some(XVar(ev)), bindings)),
     ]
-    (ls.append(lets), next, done.append([Made(ev:, ..m)]))
+    (ls.append([lets]), next, done.append([Made(ev:, ..m)]))
   })
   # Labels plugged from effects in scope, after every handler.
   labels = entries.filter(|e| e.named).filter_map(|e| {
@@ -1433,7 +1592,7 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
   final_ev = fresh_local("ev", Ir.CEvidence, None)
   label_lets = [(final_ev, Ir.XProvide(Some(XVar(ev_after)), labels))]
   # Names bound to items hold their handler value (or the handler of the effect plugged).
-  binds = items.enumerate().filter_map(|(i, item)| {
+  binds = items.enumerate().filter(|(_, item)| !item_is_member(item)).filter_map(|(i, item)| {
     item.bind.map(|b| {
       value = placed.find(|m| m.origin == i).map(|m| XVar(m.value)).or(
         Ir.XUse(
@@ -1446,10 +1605,39 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
   })
   all_keys = provided.append(labels.map(|(k, _)| k))
   upd(|x| Lowering(ev: final_ev, withs: [(final_ev, all_keys), ..outer_withs], ..x))
-  inner = lower_expr(body)
+  # Items that open handler members, after every provider, in the order written.
+  members = items.filter(item_is_member).map(|item| {
+    member = item.res match {
+      ResDef(d) if def_of(program, d).kind == Hir.MemberKind -> d
+      _                                                      -> cap_member(item)
+    }
+    provider = item.cap match {
+      Some((cap, _)) -> lower_expr(cap)
+      None -> item.label match {
+        Some(label) -> Ir.XUse(XVar(final_ev), def_name(label))
+        None        -> Ir.XUse(XVar(final_ev), def_of(program, member).parent.map(def_name).or(""))
+      }
+    }
+    args = item.args.map(|a| a.args).or([]).map(|a| lower_expr(a.value))
+    value = item.bind.map(new_local).or(fresh_local("h", CUnit, None))
+    release = fresh_local("release", CUnit, None)
+    (member, provider, args, value, release)
+  })
+  body0 = lower_expr(body)
   upd(|x| Lowering(ev: outer, withs: outer_withs, ..x))
-  # Each handler is released, then retired, however the body ends; the last one first.
-  guarded = placed.reverse().fold(inner, |acc, m| {
+  inner = members.reverse().fold(body0, |acc, (member, provider, args, value, release)| {
+    guarded_member = Ir.XFinally(
+      acc,
+      XCall(Indirect(XVar(release)), [], False, False),
+      XVar(value),
+      def_of(program, member).name,
+    )
+    open_member(provider, member, args, value, release, guarded_member)
+  })
+  inside = label_lets.append(binds).reverse().fold(inner, |acc, (l, v)| XLet(l, v, acc))
+  # Each handler is released, then retired, however what comes after its init ends (the later
+  # inits and the body); the last one first.
+  guarded = placed.zip(inits).reverse().fold(inside, |acc, (m, lets)| {
     has_release = program.items.get(m.hdl) match {
       Some(Hir.IHandler(item)) -> item.release.is_some()
       _                        -> False
@@ -1459,10 +1647,22 @@ fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowerin
     } else {
       XLit(VUnit)
     }
-    Ir.XFinally(acc, release, XVar(m.value), def_of(program, m.hdl).name)
+    # Then the members its init opened.
+    members = XCall(Indirect(XBuiltin("$cellGet", [], [XVar(m.cell)])), [], False, False)
+    finally = Ir.XFinally(acc, XSeq(release, members), XVar(m.value), def_of(program, m.hdl).name)
+    lets.reverse().fold(finally, |a, (l, v)| XLet(l, v, a))
   })
-  all_lets = arg_lets.append(inits).append(label_lets).append(binds)
-  all_lets.reverse().fold(guarded, |acc, (l, v)| XLet(l, v, acc))
+  arg_lets.reverse().fold(guarded, |acc, (l, v)| XLet(l, v, acc))
+}
+
+## A call of an init that opens handler members into `cell`: if it fails, the members it opened
+## are released before the failure goes on; its own release does not run.
+fn init_call(init: Int, args: List[Expr], cell: Int, ev: Int) -> Expr uses { State[Lowering] } {
+  r = fresh_local("init", CUnit, None)
+  call = XCall(Direct(init, []), args.append([XVar(cell), XVar(ev)]), False, False)
+  opened = XCall(Indirect(XBuiltin("$cellGet", [], [XVar(cell)])), [], False, False)
+  failed = XSeq(opened, XFail(XBuiltin("$errorOf", [], [XVar(r)])))
+  XLet(r, call, XIf(XBuiltin("$failed", [], [XVar(r)]), failed, XVar(r)))
 }
 
 ## The keys of the labels declared `default` of the effects `tags`, which the `with` does not
@@ -1508,11 +1708,30 @@ fn place(left: List[Made], done: List[Made], depends: fn(Made, Made) -> Bool) ->
     # On a cycle (reported by the type checker) the rest keep source order.
     next = ready match {
       Some(r) -> r
-      None    -> left.head().or(Made(0, 0, 0, 0, [], 0))
+      None    -> left.head().or(Made(0, 0, 0, 0, [], 0, 0))
     }
     rest = left.filter(|m| !(m.origin == next.origin && m.hdl == next.hdl))
     place(rest, done.append([next]), depends)
   }
+}
+
+## The member an item `x = fs.Open(p)` opens through the capability `fs`: the member of its
+## effect with that name.
+fn cap_member(item: Hir.WithItem) -> Int uses { State[Lowering] } {
+  program = st().program
+  item.cap.and_then(|(cap, name)| {
+    st().checked.types.exprs.get(cap) match {
+      Some(Ty.TyCap(tags)) -> tags.fold(None, |found, t| {
+        found match {
+          Some(_) -> found
+          None -> Signature.effect_members(program, t.def).find(
+            |m| def_of(program, m).name == name.name,
+          )
+        }
+      })
+      _ -> None
+    }
+  }).or(-1)
 }
 
 fn item_is_member(item: Hir.WithItem) -> Bool uses { State[Lowering] } {

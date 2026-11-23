@@ -189,6 +189,9 @@ const RUNTIME: List[String] = [
   "$assertCmp",
   "$releaseDefect",
   "$retire",
+  "$cellNew",
+  "$cellGet",
+  "$cellSet",
 ]
 
 ## The comparison of derived and built-in Ord impls: by `<` on primitive values, element by
@@ -840,9 +843,9 @@ fn via_tmp(expr: Expr) -> String uses { State[Em] } {
 fn value_of(expr: Expr) -> String uses { State[Em] } {
   module = mdl()
   expr match {
-    XLit(lit)                       -> emit_lit(lit)
-    XVar(local)                     -> local_name(module, local)
-    XFn(f, _)                       -> fn_name(module, f)
+    XLit(lit)                   -> emit_lit(lit)
+    XVar(local)                 -> local_name(module, local)
+    XFn(f, _)                   -> fn_name(module, f)
     XLet(bound, value, body) -> {
       v = bound_value(bound, value)
       line("const #{local_name(module, bound)} = #{v};")
@@ -873,6 +876,12 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       v = String.join(vs, ", ")
       if ty == CString { v } else { show_call(module, ty, v) }
     }
+    XBuiltin(
+      "$failed",
+      _,
+      args,
+    ) -> "(#{values_in_order(args).head().or("undefined")} instanceof $Fail)"
+    XBuiltin("$errorOf", _, args) -> "#{values_in_order(args).head().or("undefined")}.error"
     XBuiltin("$compareValues", _, args) -> {
       vs = values_in_order(args)
       "$ordering[$graftCompare(#{String.join(vs, ", ")}) + 1]"
@@ -900,8 +909,8 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       b = value_of(base)
       "#{b}.#{field_key(variant_fields(module, ctor), index)}"
     }
-    XTuple(elems)                   -> "[#{String.join(values_in_order(elems), ", ")}]"
-    Ir.XUse(ev, key)                -> "#{value_of(ev)}[#{quote(key)}]"
+    XTuple(elems)               -> "[#{String.join(values_in_order(elems), ", ")}]"
+    Ir.XUse(ev, key)            -> "#{value_of(ev)}[#{quote(key)}]"
     Ir.XProvide(base, bindings) -> {
       vs = values_in_order(base.map(|b| [b]).or([]).append(bindings.map(|(_, h)| h)))
       (proto, hs) = base match {
@@ -934,15 +943,15 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       }
     }
     XIf(c, t, e) if is_simple(expr) -> "(#{value_of(c)} ? #{value_of(t)} : #{value_of(e)})"
-    XBinary(BAnd, _, lhs, rhs)      -> logical(True, lhs, rhs)
-    XBinary(BOr, _, lhs, rhs)       -> logical(False, lhs, rhs)
+    XBinary(BAnd, _, lhs, rhs)  -> logical(True, lhs, rhs)
+    XBinary(BOr, _, lhs, rhs)   -> logical(False, lhs, rhs)
     XBinary(op, ty, lhs, rhs) -> values_in_order([lhs, rhs]) match {
       [a, b] -> binary(op, ty, a, b)
       _      -> "undefined"
     }
-    XUnary(UNot, _, operand)        -> "(!#{value_of(operand)})"
-    XUnary(UNeg, ty, operand)       -> wrap(ty, "(-#{value_of(operand)})")
-    XLambda(params, _, body, _)     -> lambda_js(params, body, None)
+    XUnary(UNot, _, operand)    -> "(!#{value_of(operand)})"
+    XUnary(UNeg, ty, operand)   -> wrap(ty, "(-#{value_of(operand)})")
+    XLambda(params, _, body, _) -> lambda_js(params, body, None)
     XConcat(parts) -> {
       values = values_in_order(
         parts.filter_map(|p| {
@@ -968,7 +977,7 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       })
       "`#{String.concat(pieces)}`"
     }
-    _                               -> via_tmp(expr)
+    _                           -> via_tmp(expr)
   }
 }
 
