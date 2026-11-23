@@ -69,3 +69,15 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   made by breaking corpus files (`scripts/fuzz.py tree`) and 1,600 made by moving their whitespace,
   formatted at random widths from 10 to 140 (`scripts/fuzz.py fmt`). Lexing, parsing and validating the corpus (441 KB) takes 0.31 s on native;
   formatting its largest file (18 KB) takes 50 ms.
+- M3: started. `tools/oracle check <path>` prints the diagnostics of `emela check`. The plan:
+  1. Modules: collecting the files of a single file or a project, the bundled core and std
+     modules, and the import graph (E0201 to E0210).
+  2. Name resolution: lowering the tree to HIR, where every name points to its definition
+     (E0211 to E0225, W0201, W0202).
+  3. Type checking, from monomorphic expressions to polymorphism, effects and error sets (E03xx,
+     E04xx).
+
+  The corpus for M3 is what is written to be checked: the 87 programs of
+  `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of
+  `examples/` and `tests/laws` (all check without errors), Graft itself, and the inputs embedded in
+  the tests of emela-resolve and emela-types, which do have errors.

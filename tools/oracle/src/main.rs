@@ -1,5 +1,9 @@
 //! `graft-oracle tokens <file>` and `graft-oracle tree <file>` print the tokens or the syntax
 //! tree that the reference implementation makes of a file, in the format Graft prints.
+//! `graft-oracle check <path>` prints the diagnostics of `emela check <path>` (without tests or
+//! Pome dependencies), one per line as `severity[CODE]@file:start..end`, with the file relative to
+//! the current directory and positions in code points; diagnostics without a code or a location
+//! print `-` in their place.
 //! `graft-oracle fmt <file> [width]` prints the file as `emela fmt` formats it (at `width`,
 //! 100 by default), or `error` if it refuses to (syntax errors), or `internal error` (a
 //! formatter bug).
@@ -28,6 +32,11 @@ const RENAMES: &[(&str, &str)] = &[
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let [mode, path] = args.as_slice()
+        && mode == "check"
+    {
+        return check(path);
+    }
     let (mode, path, width) = match args.as_slice() {
         [mode, path] if mode == "tokens" || mode == "tree" || mode == "fmt" => {
             (mode.as_str(), path, emela_fmt::DEFAULT_WIDTH)
@@ -71,6 +80,55 @@ fn main() -> ExitCode {
         for d in parse.diagnostics() {
             out += &format!("error[{}]@{}\n", d.code, positions.range(d.range));
         }
+    }
+    print!("{out}");
+    ExitCode::SUCCESS
+}
+
+fn check(path: &str) -> ExitCode {
+    use emela_driver::{Input, Location, OsFs, Severity, Typecheck};
+    let input = match Input::resolve(&OsFs, std::path::Path::new(path)) {
+        Ok(input) => input,
+        Err(d) => {
+            println!("error[{}]@-", d.code.unwrap_or("-"));
+            return ExitCode::SUCCESS;
+        }
+    };
+    let (analysis, _) = emela_driver::check(&OsFs, &input, &mut Typecheck::default());
+    let cwd = env::current_dir().unwrap_or_default();
+    let mut out = String::new();
+    for d in &analysis.diagnostics {
+        let severity = match d.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        let place = match &d.location {
+            Some(Location::Span(span)) => {
+                let file = analysis
+                    .sources
+                    .iter()
+                    .find(|(id, _)| *id == span.file)
+                    .map(|(_, f)| f);
+                match file {
+                    Some(f) => {
+                        let positions = Positions::new(f.text());
+                        let shown = f.path().strip_prefix(&cwd).unwrap_or(f.path());
+                        format!("{}:{}", shown.display(), positions.range(span.range))
+                    }
+                    None => "-".to_owned(),
+                }
+            }
+            Some(Location::File(id)) => analysis
+                .sources
+                .iter()
+                .find(|(i, _)| i == id)
+                .map_or("-".to_owned(), |(_, f)| {
+                    f.path().strip_prefix(&cwd).unwrap_or(f.path()).display().to_string()
+                }),
+            Some(Location::Path(p)) => p.strip_prefix(&cwd).unwrap_or(p).display().to_string(),
+            None => "-".to_owned(),
+        };
+        out += &format!("{severity}[{}]@{place}\n", d.code.unwrap_or("-"));
     }
     print!("{out}");
     ExitCode::SUCCESS
