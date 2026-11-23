@@ -280,7 +280,7 @@ pub fn infer_group(
   closed: Map[Int, Closed],
   fibers: Fibers,
   group: List[Int],
-) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts, GroupTypes)
+) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts, BodyTypes)
   uses { State[TyLower] } {
   start = new_state(program, table, traits, sigs, facts, closed, fibers)
   (((inferred, solved, types), state), _) = State.run(new_infer(), || {
@@ -294,14 +294,79 @@ pub fn infer_group(
   (inferred, state.used, solved, types)
 }
 
-## The settled types of a group's bodies and how its calls are placed, for capture sets.
-pub type GroupTypes(
+## What type checking learns about bodies, with the types settled: for capture sets and lowering.
+pub type BodyTypes(
   exprs: Map[Int, Ty],
+  pats: Map[Int, Ty],
   locals: Map[Int, Ty],
+  ## The definition whose body each local belongs to.
+  local_owner: Map[Int, Int],
+  ## Field accesses → the index of the field.
+  fields: Map[Int, Int],
+  ## Calls, method calls and pipes → the arguments by parameter position.
   calls: Map[Int, List[Option[Int]]],
+  ## References to generic definitions → the instantiated type arguments and sets.
+  type_args: Map[Int, List[Ty]],
+  type_rows: Map[Int, List[Row]],
+  ## Constructor patterns → their patterns by field position.
+  pat_fields: Map[Int, List[Option[Int]]],
+  ## Each expression's E and R.
+  errors: Map[Int, Row],
+  effects: Map[Int, Row],
+  ## References to capability operations → the effect operation.
   ops: Map[Int, Int],
+  ## Openings of handler members → the member.
+  members: Map[Int, Int],
+  ## Method call callees → the fn called.
   methods: Map[Int, Int],
+  ## Capability arguments passed to a parameter that wants fewer effects → those effects.
+  narrowings: Map[Int, List[Tag]],
 )
+
+pub fn empty_body_types() -> BodyTypes {
+  BodyTypes(
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+    Map.empty(),
+  )
+}
+
+fn add_all[V](a: Map[Int, V], b: Map[Int, V]) -> Map[Int, V] {
+  b.fold(a, |m, k, v| m.insert(k, v))
+}
+
+## `b` added to `a`; the groups' maps have different keys.
+pub fn merge_body_types(a: BodyTypes, b: BodyTypes) -> BodyTypes {
+  BodyTypes(
+    exprs: add_all(a.exprs, b.exprs),
+    pats: add_all(a.pats, b.pats),
+    locals: add_all(a.locals, b.locals),
+    local_owner: add_all(a.local_owner, b.local_owner),
+    fields: add_all(a.fields, b.fields),
+    calls: add_all(a.calls, b.calls),
+    type_args: add_all(a.type_args, b.type_args),
+    type_rows: add_all(a.type_rows, b.type_rows),
+    pat_fields: add_all(a.pat_fields, b.pat_fields),
+    errors: add_all(a.errors, b.errors),
+    effects: add_all(a.effects, b.effects),
+    ops: add_all(a.ops, b.ops),
+    members: add_all(a.members, b.members),
+    methods: add_all(a.methods, b.methods),
+    narrowings: add_all(a.narrowings, b.narrowings),
+  )
+}
 
 ## Switches to the definition about to be inferred, taking its module and type parameters.
 fn enter(def: Int) -> () {
@@ -472,7 +537,7 @@ fn set_binder(binder: Option[Int]) -> () {
 
 ## Finishes the group: checks deferred references and numeric types, then generalizes the
 ## definitions without declared types.
-fn finish() -> (List[(Int, Signature)], HandlerFacts, GroupTypes) {
+fn finish() -> (List[(Int, Signature)], HandlerFacts, BodyTypes) {
   bs().deferred.reverse().each(|r| {
     pending_of(r.def) match {
       Some(p) -> {
@@ -512,12 +577,22 @@ fn finish() -> (List[(Int, Signature)], HandlerFacts, GroupTypes) {
     )
   })
   b = bs()
-  types = GroupTypes(
+  types = BodyTypes(
     exprs: b.expr_tys.map_values(resolve),
+    pats: b.pat_tys.map_values(resolve),
     locals: b.locals.map_values(resolve),
+    local_owner: b.local_owner,
+    fields: b.fields,
     calls: b.calls,
+    type_args: b.type_args.map_values(|tys| tys.map(resolve)),
+    type_rows: b.type_rows.map_values(|rows| rows.map(resolve_row)),
+    pat_fields: b.pat_fields,
+    errors: b.expr_rows.map_values(resolve_row),
+    effects: b.expr_effects.map_values(resolve_row),
     ops: b.ops,
+    members: b.member_opens,
     methods: b.methods,
+    narrowings: b.narrowings,
   )
   (inferred, facts, types)
 }
@@ -726,7 +801,8 @@ fn infer_path(expr: Int, def: Int, span: Span) -> Ty {
   if def_of(program, def).kind == MemberKind {
     check_member_open(expr, def, span)
   }
-  (ty, _, _) = instantiate_def(def, span)
+  (ty, args, rows) = instantiate_def(def, span)
+  record_type_args(expr, args, rows)
   labelled = program.member_labels.get(expr) match {
     Some(label) -> through_label(ty, label)
     None        -> ty
@@ -916,6 +992,19 @@ fn require_immediate(def: Int, params: List[TyParam], rows: List[Row], span: Spa
       bupd(|b| BodyState(immediates: b.immediates.append([ob]), ..b))
     }
   })
+}
+
+## Records the type arguments and sets a reference instantiated, for lowering.
+fn record_type_args(expr: Int, args: List[Ty], rows: List[Row]) -> () {
+  if !args.is_empty() || !rows.is_empty() {
+    bupd(|b| {
+      BodyState(
+        type_args: if args.is_empty() { b.type_args } else { b.type_args.insert(expr, args) },
+        type_rows: if rows.is_empty() { b.type_rows } else { b.type_rows.insert(expr, rows) },
+        ..b,
+      )
+    })
+  }
 }
 
 ## Replaces undetermined type variables with fresh ones, consistently.
@@ -1162,6 +1251,9 @@ fn check_cap_arg(arg: Int, wanted: List[Tag], param_ty: Ty) -> () {
         diag(span, "E0452", "the capability lacks effects the parameter needs")
       } else {
         matched.each(|(w, h)| coerce_at(span, cap([w]), cap([h])))
+        if have.length() > wanted.length() {
+          bupd(|b| BodyState(narrowings: b.narrowings.insert(arg, wanted), ..b))
+        }
       }
     }
     _ -> coerce_at(span, param_ty, actual)
@@ -1415,9 +1507,10 @@ fn infer_dot(expr: Int, base: Int, base_ty0: Ty, name: Label, call: Bool) -> Dot
     }
     _ -> lookup_field(base_ty, name.name) match {
       # E0334 keeps the fns of the module apart from the fields, so only traits can also be found.
-      FieldFound(_, ty) -> if call && !trait_methods(base_ty, name.name).is_empty() {
+      FieldFound(index, ty) -> if call && !trait_methods(base_ty, name.name).is_empty() {
         DotValue(field_error(name, "E0335", "ambiguous method `#{name.name}`"))
       } else {
+        bupd(|b| BodyState(fields: b.fields.insert(expr, index), ..b))
         DotValue(ty)
       }
       field -> {
@@ -1452,7 +1545,8 @@ fn infer_method_call(
 ) -> Ty {
   program = prog()
   check_external(def, name.span)
-  (ty0, _, _) = instantiate_def(def, name.span)
+  (ty0, targs, trows) = instantiate_def(def, name.span)
+  record_type_args(callee, targs, trows)
   ty = open_fails(ty0)
   record(callee, ty)
   bupd(|b| BodyState(methods: b.methods.insert(callee, def), ..b))
@@ -1616,6 +1710,7 @@ fn infer_op(expr: Int, base: Int, tags: List[Tag], name: Label) -> Ty {
             sig.scheme.params.length()
           }
           (fresh, fresh_rows) = fresh_args(sig.scheme.params.drop(n))
+          record_type_args(expr, fresh, [])
           own = args.take(n)
           rows = own.enumerate().map(|(i, a)| {
             a match {
@@ -1928,6 +2023,7 @@ fn check_coverage() -> () {
 ## Also records the types of the variables the pattern binds. `ty` is the incoming value's type,
 ## the expected side.
 fn bind_pat(pat: Int, ty: Ty) -> () {
+  bupd(|b| BodyState(pat_tys: b.pat_tys.insert(pat, ty), ..b))
   program = prog()
   program.pats.get(pat) match {
     None -> ()
@@ -1985,6 +2081,7 @@ fn bind_ctor_pat(pat: Int, def: Int, args: List[PatArg], rest: Bool, ty: Ty, spa
   }
   assigned.slots.zip(field_tys).each(|(slot, field_ty)| when_some(slot, |q| bind_pat(q, field_ty)))
   assigned.extra.each(|q| bind_pat(q, TyError))
+  bupd(|b| BodyState(pat_fields: b.pat_fields.insert(pat, assigned.slots), ..b))
   coerce_at(span, ty, made_ty)
 }
 

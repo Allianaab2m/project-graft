@@ -5,6 +5,7 @@ import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program}
 import Body
+import Body.{BodyTypes, empty_body_types, merge_body_types}
 import Bodystate.{HandlerFacts, Closed, ClosedMain, ClosedExport, Fibers}
 import Cycles
 import Groups
@@ -21,6 +22,24 @@ import Ty.{TyFn, TyPrim, TyNever, TyError, TyBound, TyVar, TyNamed}
 ## reference reports them. Those without a location come first.
 ## `entry` is the entry module, if there is one; with `library_only`, it has no `main`.
 pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> List[TyDiag] {
+  check_program(given, entry_module, library_only).diags
+}
+
+## Everything type checking learns, for lowering: the program with the fns `@entry` makes, the
+## table of named types, the signatures, the traits and impls, the bodies' types, the
+## dependencies and init E of handlers, the fns `@entry` makes, and the diagnostics.
+pub type Checked(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  traits: Traits.Traits,
+  types: BodyTypes,
+  facts: HandlerFacts,
+  entry_exports: List[Export.EntryExport],
+  diags: List[TyDiag],
+)
+
+pub fn check_program(given: Program, entry_module: Option[Int], library_only: Bool) -> Checked {
   (program, made, entry_diags) = Export.add_entry_exports(given, entry_module)
   entry = if library_only { None } else { entry_module }
   table = new_table(program)
@@ -37,8 +56,9 @@ pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> L
         HandlerFacts(Map.empty(), Map.empty()),
         Map.empty(),
         [],
+        empty_body_types(),
       ),
-      |(known, used, facts, summaries, captures), group| {
+      |(known, used, facts, summaries, captures, all_types), group| {
         (inferred, group_used, next_facts, types) = Body.infer_group(
           program,
           table,
@@ -68,11 +88,12 @@ pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> L
           next_facts,
           next_summaries,
           captures.append(escapes),
+          merge_body_types(all_types, types),
         )
       },
     )
   })
-  (final_sigs, used, facts, _, captures) = inferred
+  (final_sigs, used, facts, _, captures, all_types) = inferred
   diags = sig_diags.append(trait_diags).append(Cycles.check(program)).append(
     lowered.diags.reverse(),
   ).append(Traits.unused_derives(program, traits, used)).append(
@@ -80,7 +101,8 @@ pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> L
   ).append(Layer.check_layers(program, sigs, facts.uses)).append(captures)
   main = entry_main(program, entry).and_then(|d| if is_test(program, d) { None } else { Some(d) })
   checked = Export.check(program, table, final_sigs, entry, main, made, diags).append(entry_diags)
-  checked.sort_by(|a, b| Ord.compare(position(a), position(b)))
+  sorted = checked.sort_by(|a, b| Ord.compare(position(a), position(b)))
+  Checked(program, table, final_sigs, traits, all_types, facts, made, sorted)
 }
 
 fn position(d: TyDiag) -> (Int, Int, Int) {

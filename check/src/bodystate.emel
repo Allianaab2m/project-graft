@@ -124,6 +124,15 @@ pub type BodyState(
   ## decided once sets are solved.
   withs: List[PendingWith],
   fibers: Fibers,
+  ## For lowering: the types of patterns, field accesses → field index, references to generic
+  ## definitions → type arguments and sets, constructor patterns → their patterns by field, and
+  ## capability arguments narrowed to fewer effects.
+  pat_tys: Map[Int, Ty],
+  fields: Map[Int, Int],
+  type_args: Map[Int, List[Ty]],
+  type_rows: Map[Int, List[Row]],
+  pat_fields: Map[Int, List[Option[Int]]],
+  narrowings: Map[Int, List[Tag]],
 )
 
 ## A `with` whose providers' initialization order is decided once sets are solved.
@@ -209,6 +218,12 @@ pub fn new_state(
     member_opens: Map.empty(),
     withs: [],
     fibers:,
+    pat_tys: Map.empty(),
+    fields: Map.empty(),
+    type_args: Map.empty(),
+    type_rows: Map.empty(),
+    pat_fields: Map.empty(),
+    narrowings: Map.empty(),
   )
 }
 
