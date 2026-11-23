@@ -97,6 +97,7 @@ import Check.Ty.{
   PString,
 }
 import Check.Typeck
+import Check.Layer
 import Check.Traits
 import Check.Numbers
 import Check.Signature
@@ -1346,75 +1347,180 @@ fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
   })
 }
 
-## A handler listed in a `with`, with the arguments of its init and the name it is bound to.
-type Listed(hdl: Int, args: List[Hir.Arg], bind: Option[Int])
+## A handler a `with` initializes: the handler, the item it comes from, the locals of its `self`
+## and handler value, the locals holding the arguments of its init, and the evidence its init and
+## handler value see (set when it is placed in the initialization order).
+type Made(hdl: Int, origin: Int, me: Int, value: Int, args: List[Int], ev: Int)
 
-## `with H1, ..., Hn { body }`: each handler's init and handler value, in order, each seeing the
-## evidence of the handlers before it; the body with all of them provided; then the releases in
-## reverse order, however the body ends.
+## `with H1, ..., Hn { body }` (spec 8.3, 8.5, 14.2). The arguments of the inits are evaluated in
+## the order the items are written. The handlers are initialized in the order of their
+## dependencies (a handler using an effect another handler of the `with` provides comes after
+## it), each seeing the handlers before it. Then labels plugged from effects in scope (`L by E`,
+## and `L` alone for its base). A provider of an effect also provides its labels declared
+## `default`, unless the `with` gives them a provider. The body runs with everything provided;
+## then the handlers are released in reverse order, however it ends.
 fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowering] } {
   program = st().program
-  listed = items.flat_map(|item| {
-    item.res match {
-      ResDef(d) -> program.items.get(d) match {
-        Some(Hir.IHandler(_)) if item.by.is_none() -> [
-          Listed(d, item.args.map(|a| a.args).or([]), item.bind),
-        ]
-        Some(Hir.ILayer(_)) -> flatten_layer(program, d).map(|h| {
-          Listed(h, layer_args(d, h), None)
-        })
-        _ -> {
-          unsupported("this item of `with`")
-          []
-        }
-      }
-      _ -> []
+  sigs = st().checked.sigs
+  entries = Layer.with_entries(program, st().checked.table, sigs, items)
+  provided = entries.filter(|e| e.named).map(|e| effect_key(e.provided))
+  outer = st().ev
+  outer_withs = st().withs
+  items.each(|item| {
+    if item_is_member(item) {
+      unsupported("an item of `with` that opens a handler member")
+      ()
     }
   })
-  outer = st().ev
-  # (self local, handler local, evidence after it, the init call, the handler value) per handler.
-  (steps, last_ev) = listed.fold(([], outer), |(acc, ev), l| {
-    upd(|x| Lowering(ev:, ..x))
-    args = init_args(l.hdl, l.args)
-    init = instance_of(l.hdl, [], 1)
-    maker = instance_of(l.hdl, [], 2)
-    handler_ty = named_type(l.hdl, [])
-    me = fresh_local("self", handler_ty, None)
-    h = fresh_local("h", CUnit, None)
+  # The handlers in the order of the items, with their arguments evaluated in that order.
+  (arg_lets, units) = items.enumerate().fold(([], []), |(ls, us), (i, item)| {
+    mine = entries.filter(|e| e.origin == i)
+    handlers = mine.fold([], |acc, e| {
+      Layer.entry_handler(e) match {
+        Some(h) if !acc.any(|x| x == h) -> acc.append([h])
+        _                               -> acc
+      }
+    })
+    item_def = item.res match {
+      ResDef(d) -> d
+      _         -> -1
+    }
+    from_layer = program.items.get(item_def) match {
+      Some(Hir.ILayer(_)) -> True
+      _                   -> False
+    }
+    handlers.fold((ls, us), |(ls2, us2), h| {
+      written = if item.by.is_some() {
+        item.by_init_args.map(|a| a.args).or([])
+      } else if from_layer {
+        layer_args(item_def, h)
+      } else {
+        item.args.map(|a| a.args).or([])
+      }
+      values = init_args(h, written)
+      locals = values.map(|_| fresh_local("arg", CUnit, None))
+      me = fresh_local("self", named_type(h, []), None)
+      value = fresh_local("h", CUnit, None)
+      (ls2.append(locals.zip(values)), us2.append([Made(h, i, me, value, locals, -1)]))
+    })
+  })
+  ordered = init_order(entries, units)
+  # Each handler initialized with the evidence of the ones before it.
+  (inits, ev_after, placed) = ordered.fold(([], outer, []), |(ls, ev, done), m| {
+    init = instance_of(m.hdl, [], 1)
+    maker = instance_of(m.hdl, [], 2)
+    keys = entries.filter(
+      |e| e.named && e.origin == m.origin && Layer.entry_handler(e) == Some(m.hdl),
+    )
+    bindings = keys.map(|e| (effect_key(e.provided), XVar(m.value))).append(
+      default_labels(keys.map(|e| e.provided), provided).map(|k| (k, XVar(m.value))),
+    )
     next = fresh_local("ev", Ir.CEvidence, None)
-    keys = Signature.effects_of_handler(st().checked.sigs, l.hdl).map(effect_key)
-    init_call = XCall(Direct(init, []), args.append([XVar(ev)]), True, False)
-    made = XCall(Direct(maker, []), [XVar(me), XVar(ev)], False, False)
-    provide = Ir.XProvide(Some(XVar(ev)), keys.map(|k| (k, XVar(h))))
-    (acc.append([(l, me, h, next, init_call, made, provide)]), next)
+    lets = [
+      (m.me, XCall(Direct(init, []), m.args.map(XVar).append([XVar(ev)]), True, False)),
+      (m.value, XCall(Direct(maker, []), [XVar(m.me), XVar(ev)], False, False)),
+      (next, Ir.XProvide(Some(XVar(ev)), bindings)),
+    ]
+    (ls.append(lets), next, done.append([Made(ev:, ..m)]))
   })
-  outer_withs = st().withs
-  added = steps.map(|(l, _, _, next, _, _, _)| {
-    (next, Signature.effects_of_handler(st().checked.sigs, l.hdl).map(effect_key))
+  # Labels plugged from effects in scope, after every handler.
+  labels = entries.filter(|e| e.named).filter_map(|e| {
+    e.supplier match {
+      Layer.SEffect(t) -> Some((effect_key(e.provided), Ir.XUse(XVar(ev_after), effect_key(t))))
+      _                -> None
+    }
   })
-  upd(|x| Lowering(ev: last_ev, withs: added.reverse().append(outer_withs), ..x))
+  final_ev = fresh_local("ev", Ir.CEvidence, None)
+  label_lets = [(final_ev, Ir.XProvide(Some(XVar(ev_after)), labels))]
+  # Names bound to items hold their handler value (or the handler of the effect plugged).
+  binds = items.enumerate().filter_map(|(i, item)| {
+    item.bind.map(|b| {
+      value = placed.find(|m| m.origin == i).map(|m| XVar(m.value)).or(
+        Ir.XUse(
+          XVar(final_ev),
+          entries.find(|e| e.origin == i).map(|e| effect_key(e.provided)).or(""),
+        ),
+      )
+      (new_local(b), value)
+    })
+  })
+  all_keys = provided.append(labels.map(|(k, _)| k))
+  upd(|x| Lowering(ev: final_ev, withs: [(final_ev, all_keys), ..outer_withs], ..x))
   inner = lower_expr(body)
   upd(|x| Lowering(ev: outer, withs: outer_withs, ..x))
   # Each handler is released, then retired, however the body ends; the last one first.
-  guarded = steps.reverse().fold(inner, |acc, (l, me, h, _, _, _, _)| {
-    has_release = program.items.get(l.hdl) match {
+  guarded = placed.reverse().fold(inner, |acc, m| {
+    has_release = program.items.get(m.hdl) match {
       Some(Hir.IHandler(item)) -> item.release.is_some()
       _                        -> False
     }
     release = if has_release {
-      XCall(Direct(instance_of(l.hdl, [], 3), []), [XVar(me), XVar(outer)], False, False)
+      XCall(Direct(instance_of(m.hdl, [], 3), []), [XVar(m.me), XVar(m.ev)], False, False)
     } else {
       XLit(VUnit)
     }
-    Ir.XFinally(acc, release, XVar(h), def_of(program, l.hdl).name)
+    Ir.XFinally(acc, release, XVar(m.value), def_of(program, m.hdl).name)
   })
-  # The binding names hold the handler values.
-  bound = steps.reverse().fold(guarded, |acc, (l, _, h, _, _, _, _)| {
-    l.bind.map(|b| XLet(new_local(b), XVar(h), acc)).or(acc)
+  all_lets = arg_lets.append(inits).append(label_lets).append(binds)
+  all_lets.reverse().fold(guarded, |acc, (l, v)| XLet(l, v, acc))
+}
+
+## The keys of the labels declared `default` of the effects `tags`, which the `with` does not
+## give a provider of its own.
+fn default_labels(tags: List[Ty.Tag], provided: List[String]) -> List[String]
+  uses { State[Lowering] } {
+  sigs = st().checked.sigs
+  tags.flat_map(|t| {
+    sigs.default_labels.get(t.def).or([]).filter(
+      |l| Signature.label_base(sigs, l) == Some(t),
+    ).filter_map(|l| {
+      key = def_name(l)
+      if provided.any(|k| k == key) { None } else { Some(key) }
+    })
   })
-  steps.reverse().fold(bound, |acc, (_, me, h, next, init_call, made, provide)| {
-    XLet(me, init_call, XLet(h, made, XLet(next, provide, acc)))
-  })
+}
+
+## The initialization order (spec 14.2): among the handlers whose dependencies are all placed, the
+## first in source order. A handler depends on another when its dependencies include an effect the
+## other provides that is not one of its own.
+fn init_order(entries: List[Layer.Entry], units: List[Made]) -> List[Made]
+  uses { State[Lowering] } {
+  uses = st().checked.facts.uses
+  provides = |m: Made| entries.filter(
+    |e| e.named && e.origin == m.origin && Layer.entry_handler(e) == Some(m.hdl),
+  )
+  own = |m: Made| provides(m).flat_map(|e| e.own)
+  depends = |a: Made, b: Made| {
+    deps = uses.get(a.hdl).map(|r| r.elems).or([])
+    !(a.origin == b.origin && a.hdl == b.hdl)
+      && provides(b).any(|e| {
+        !own(a).any(|o| o == e.provided) && deps.any(|d| d == Ty.RTag(e.provided))
+      })
+  }
+  place(units, [], depends)
+}
+
+fn place(left: List[Made], done: List[Made], depends: fn(Made, Made) -> Bool) -> List[Made] {
+  if left.is_empty() {
+    done
+  } else {
+    ready = left.find(|m| !left.any(|o| depends(m, o)))
+    # On a cycle (reported by the type checker) the rest keep source order.
+    next = ready match {
+      Some(r) -> r
+      None    -> left.head().or(Made(0, 0, 0, 0, [], 0))
+    }
+    rest = left.filter(|m| !(m.origin == next.origin && m.hdl == next.hdl))
+    place(rest, done.append([next]), depends)
+  }
+}
+
+fn item_is_member(item: Hir.WithItem) -> Bool uses { State[Lowering] } {
+  member = item.res match {
+    ResDef(d) -> def_of(st().program, d).kind == Hir.MemberKind
+    _         -> False
+  }
+  item.cap.is_some() || member
 }
 
 ## The arguments of a handler's init written on an item, by parameter: by label, or in order.
