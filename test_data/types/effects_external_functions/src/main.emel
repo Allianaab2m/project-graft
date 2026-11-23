@@ -1,0 +1,22 @@
+effect Console {
+  fn print_line(text: String) -> ()
+}
+
+@external(js, "console.log")
+fn console_log(text: String) -> ()
+
+@external(js, "Math.abs")
+fn abs(x: Int) -> Int uses {}
+
+handler SystemConsole: Console {
+  fn print_line(text) {
+    f = || console_log(text)
+    f()
+  }
+}
+
+fn outside() {
+  console_log("x")
+  g = console_log
+  abs(1)
+}

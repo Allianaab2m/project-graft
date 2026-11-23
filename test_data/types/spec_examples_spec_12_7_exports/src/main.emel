@@ -1,0 +1,5 @@
+@export(c, "TIM2_IRQHandler")
+pub fn on_tick() -> () {}  # 補: the body
+
+@export(js, "default", "add")
+pub fn add(a: Int, b: Int) -> Int { a + b }

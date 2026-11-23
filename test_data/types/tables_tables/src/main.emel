@@ -1,0 +1,18 @@
+type User(id: Int, name: String)
+fn connect(host: String, port: Int) -> Bool { todo() }
+fn add(x: Int, y: Int) -> Int { x }
+
+fn f(u: User, o: Option[Int]) -> Int {
+  a = u.name
+  b = connect(port: 1, host: "h")
+  c = 1 |> add(2)
+  d = User(name: "b", ..u)
+  e = Some("s")
+  g = dbg(u)
+  User(name: n, ..) = u
+  h = o match {
+    Some(x) -> x
+    None -> 0
+  }
+  u.id
+}

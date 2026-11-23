@@ -1,0 +1,52 @@
+handler Out: Console {
+  fn print_line(s) { () }
+}
+
+layer App {
+  Out
+}
+
+layer Bad {
+  Files.Open
+}
+
+handler NoOpen: Files {
+}
+
+handler Twice: Files {
+  handler Open(path: String): ReadFile {
+    init(path: String) { Self(path:) }
+    fn read(max) { max }
+  }
+  handler Open(path: String): ReadFile {
+    init(path: String) { Self(path:) }
+    fn read(max) { max }
+  }
+}
+
+handler WrongParams: Files {
+  handler Open(path: Int): ReadFile {
+    init(path: Int) { Self(path:) }
+    fn read(max) { max }
+  }
+}
+
+handler NoInit: Files {
+  handler Open: ReadFile {
+    fn read(max) { max }
+  }
+}
+
+handler WrongEffect: Files {
+  handler Open(): Console {
+    init(path: String) { Self() }
+    fn print_line(s) { () }
+  }
+}
+
+fn f() -> () fails Missing uses { Files } {
+  x = Files.Open("a")
+  with Files.Open("b") { () }
+  with y = App { () }
+  ()
+}

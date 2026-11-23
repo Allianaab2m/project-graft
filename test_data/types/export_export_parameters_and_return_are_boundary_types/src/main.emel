@@ -1,0 +1,2 @@
+@export(js, "f")
+pub fn f(a: Int, b: List[Int]) -> List[Int] { b }

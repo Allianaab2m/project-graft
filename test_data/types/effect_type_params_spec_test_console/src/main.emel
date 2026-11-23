@@ -1,0 +1,23 @@
+import Std.Console.{Console}
+import Std.State.{State}
+
+fn greet(id: Int) -> () uses { Console } {
+  (use Console).print_line("Hello, alice!")
+}
+
+handler TestConsole: Console {
+  fn print_line(text) {
+    st = use State[List[String]]
+    st.set([text, ..st.get()])
+  }
+  fn print_error_line(text) { () }
+}
+
+fn test_greets() {
+  (_, lines) = State.run([], || with TestConsole { greet(1) })
+  assert lines == ["Hello, alice!"]
+}
+
+fn captured() {
+  State.run([], || with TestConsole { greet(1) })
+}

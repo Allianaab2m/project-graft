@@ -1,0 +1,35 @@
+import Std.State.{State}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Raise[E] {
+  fn guard(f: fn() -> () fails E) -> ()
+}
+
+handler Generic: State {
+  fn get() { 0 }
+  fn set(value) { () }
+  fn update(f) { () }
+}
+
+handler TooMany: State[Int, String] {
+  fn get() { 0 }
+  fn set(value) { () }
+  fn update(f) { () }
+}
+
+fn omitted() { (use State).get() }
+
+fn clause() -> () uses { State } { () }
+
+fn logger() { (use Logger[Int]).info("a") }
+
+fn wrong_value() { (use State[Int]).set("a") }
+
+fn undeclared() -> () uses { State[Int] } {
+  (use State[String]).set("a")
+}
+
+fn as_type(x: State[Int]) { () }

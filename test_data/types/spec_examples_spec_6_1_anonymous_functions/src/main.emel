@@ -1,0 +1,28 @@
+error Timeout
+error Refused
+type Request(url: String, method: String)  # 補
+
+fn fetch(n: Int) -> Int { n }  # 補
+
+fn closures(xs: List[Int], pairs: List[(String, Int)], reqs: List[Request]) -> Int {
+  ys = xs |> List.map(|x| x + 1)
+  total = List.fold(ys, 0, |acc, x| acc + x)
+  thunk = || fetch(1)
+  keys = List.map(pairs, |(key, _)| key)
+  first = |acc, _| acc
+  urls = List.map(reqs, |Request(url:, ..)| url)
+  sum = |(a, b): (Int, Int)| a + b
+  run = |f: (fn() -> Int fails Timeout | Refused)| f()
+  f = |x| x + 1
+  n = (|x| x + 1)(2)
+  m = List.map(ys, |x| x match {
+    0 -> 1
+    _ -> x
+  })
+  total + thunk() + sum((1, 2)) + f(n) + first(1, "a")
+}
+
+fn make(n: Int) -> fn() -> Int {
+  m = n * 2
+  || m
+}

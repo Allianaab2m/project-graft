@@ -1,0 +1,17 @@
+type User(id: Int, name: String)
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+
+fn f(shape: Shape, o: Option[Int], u: User) -> Float {
+  Some(n) = o
+  User(name:) = u
+  shape match {
+    Circle(radius:) if radius > 0.0 -> radius
+    Rect(w, h) -> w
+    _ -> 0.0
+    Empty -> 1.0
+  }
+}

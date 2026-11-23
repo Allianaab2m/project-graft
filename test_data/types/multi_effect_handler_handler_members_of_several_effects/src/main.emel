@@ -1,0 +1,27 @@
+effect Files {
+  handler Lock(path: String): Query + Execute
+}
+
+handler MemFiles: Files {
+  handler Lock(path: String): Execute + Query {
+    init(path: String) { Self(path:) }
+    fn query(sql) { 0 }
+    fn execute(sql) { () }
+  }
+}
+
+handler BadFiles: Files {
+  handler Lock(path: String): Query {
+    init(path: String) { Self(path:) }
+    fn query(sql) { 0 }
+  }
+}
+
+fn read_only(q: use Query) -> Int { q.query("a") }
+
+fn locked() -> Int {
+  with MemFiles, l = Files.Lock("a") {
+    l.execute("b")
+    read_only(l)
+  }
+}

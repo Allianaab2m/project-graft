@@ -1,0 +1,37 @@
+effect Reader {
+  fn query(sql: String) -> Int
+}
+
+handler Missing: Query + Execute + Audit {
+  fn execute(sql) { () }
+}
+
+handler Twice: Query + Execute {
+  fn query(sql) { 0 }
+  fn execute(sql) { () }
+  fn execute(sql) { () }
+}
+
+handler Clash: Query + Reader {
+  fn query(sql) { 0 }
+}
+
+handler Repeated: Audit + Query + Audit {
+  fn note(msg) { () }
+  fn query(sql) { 0 }
+}
+
+handler Arity: Query + Execute {
+  fn query(sql) { 0 }
+  fn execute() { () }
+}
+
+effect Replica of Query
+
+handler OfLabel: Replica + Audit {
+  fn note(msg) { () }
+}
+
+handler WithAsync: Audit + Async {
+  fn note(msg) { () }
+}

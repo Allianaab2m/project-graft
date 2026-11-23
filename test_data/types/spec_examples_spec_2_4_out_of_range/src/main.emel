@@ -1,0 +1,6 @@
+fn f() -> Int {
+  a: Int = 0xFFFF_FFFF
+  b: Int64 = 0xFFFF_FFFF
+  c: Float = 1
+  a
+}

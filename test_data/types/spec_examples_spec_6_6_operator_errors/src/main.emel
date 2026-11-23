@@ -1,0 +1,7 @@
+fn f(n: Int, big: Int64, s: String) -> Int {
+  a = n + big
+  b = s + s
+  c = n + 1.5
+  d = !n
+  n
+}

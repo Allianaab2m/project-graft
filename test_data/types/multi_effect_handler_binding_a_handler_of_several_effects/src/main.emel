@@ -1,0 +1,12 @@
+fn use_both(tx: use Execute + Query) -> Int {
+  tx.execute("a")
+  tx.query("b")
+}
+
+fn bound() -> Int {
+  with tx = SystemTx(url: "db") {
+    use_both(tx)
+  }
+}
+
+fn typed(tx: use Query + Execute) -> use Execute + Query { tx }

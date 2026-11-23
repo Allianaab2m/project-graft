@@ -1,0 +1,28 @@
+fn run(f: fn() -> Int uses { Db }) -> Int { f() }
+
+fn widened() -> Int {
+  with PrimaryDb {
+    p = use Db
+    with ReplicaDb {
+      f = || p.query("x")
+      g = || (use Db).query("y")
+      run(f) + run(g)
+    }
+  }
+}
+
+fn pure_rejects() -> Int {
+  with PrimaryDb {
+    p = use Db
+    h: fn() -> Int uses {} = || p.query("x")
+    h()
+  }
+}
+
+fn declared_local() -> Int {
+  with PrimaryDb {
+    p = use Db
+    fn g() -> Int uses {} { p.query("x") }
+    g()
+  }
+}

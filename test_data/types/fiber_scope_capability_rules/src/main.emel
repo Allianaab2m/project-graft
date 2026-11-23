@@ -1,0 +1,24 @@
+import Std.Fiber.{Fiber, Scope}
+
+fn take[A](x: A) -> () { () }
+
+fn leaks() {
+  Fiber.scope(|| {
+    s = use Scope
+    take(s)
+    xs = [s]
+    ()
+  })
+}
+
+fn returned() {
+  use Scope
+}
+
+fn closure_is_fine() {
+  Fiber.scope(|| {
+    s = use Scope
+    run = || s.fork(|| 1)
+    Fiber.join(run())
+  })
+}

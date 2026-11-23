@@ -1,0 +1,55 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+}
+
+@external(js, "setTimeout")
+fn set_timeout(ms: Int, f: fn() -> ()) -> ()
+
+@external(js, "./ffi.mjs", "fetchText")
+suspend fn fetch_text(url: String) -> String
+
+@external(js, "onTick")
+fn on_tick(f: fn() -> () uses { Clock }) -> ()
+
+fn update[A, R: Immediate](x: A, f: fn(A) -> A uses { R }) -> A uses { R } { f(x) }
+
+fn logs() -> Int {
+  update(1, |x| {
+    (use Logger).info("x")
+    x
+  })
+}
+
+fn sleeps() -> Int {
+  update(1, |x| {
+    (use Clock).sleep(1)
+    x
+  })
+}
+
+fn hidden(f: fn(Int) -> Int) -> Int { update(1, f) }
+
+fn named[R: Immediate](f: fn(Int) -> Int uses { R }) -> Int uses { R } { update(1, f) }
+
+fn unnamed[R](f: fn(Int) -> Int uses { R }) -> Int uses { R } { update(1, f) }
+
+fn inferred() { |g| update(1, g) }
+
+fn not_effect[A: Immediate](x: A) -> A { x }
+
+fn trait_bound[R: Show](f: fn() -> () uses { R }) -> () uses { R } { f() }
+
+handler Ticking: Logger {
+  fn info(msg) {
+    set_timeout(1, || (use Logger).info(msg))
+    set_timeout(1, || (use Clock).sleep(1))
+    set_timeout(1, || {
+      fetch_text(msg)
+      ()
+    })
+  }
+}

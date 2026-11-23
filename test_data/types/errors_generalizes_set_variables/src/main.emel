@@ -1,0 +1,16 @@
+error Boom
+
+fn caller() {
+  |g| g()
+}
+
+fn twice() {
+  |g| g() + g()
+}
+
+fn use_it() {
+  call = caller()
+  a = call(|| 1)
+  b = call(|| fail Boom)
+  (a, b)
+}

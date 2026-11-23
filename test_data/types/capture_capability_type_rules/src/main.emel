@@ -1,0 +1,21 @@
+effect Replica of Db
+
+effect State[S] {
+  fn get() -> S
+}
+
+fn wrong_op(db: use Db) -> () {
+  db.info("x")
+}
+
+fn other_effect(log: use Logger) -> use Db { log }
+
+fn label(r: use Replica) -> use Db { r }
+
+fn type_args(s: use State[Int]) -> use State[String] { s }
+
+fn equal(a: use Db, b: use Db) -> Bool { a == b }
+
+fn shown(a: use Db) -> String { "#{a}" }
+
+fn op_value(db: use Db) -> fn(String) -> Int uses { Db } { db.query }

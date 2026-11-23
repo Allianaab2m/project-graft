@@ -1,0 +1,45 @@
+fn sync_users(from: use Db, to: use Db) -> Int {
+  from.query("a") + to.query("b")
+}
+
+fn through_closure(db: use Db) -> Int {
+  f = || db.query("c")
+  f()
+}
+
+fn declared(db: use Db) -> Int uses { Db } {
+  db.query("d")
+}
+
+fn pure_rejects(db: use Db) -> Int uses {} {
+  db.query("e")
+}
+
+fn in_a_list(dbs: List[use Db]) -> Int {
+  dbs.fold(from: 0, f: |n, db| n + db.query("f"))
+}
+
+fn caller() -> Int {
+  with PrimaryDb {
+    primary = use Db
+    with ReplicaDb {
+      replica = use Db
+      sync_users(replica, primary) + through_closure(primary)
+    }
+  }
+}
+
+fn forwarded(db: use Db) -> Int {
+  sync_users(db, db)
+}
+
+fn no_provider_needed() -> Int {
+  with PrimaryDb {
+    p = use Db
+    run_without(p)
+  }
+}
+
+fn run_without(db: use Db) -> Int {
+  forwarded(db)
+}

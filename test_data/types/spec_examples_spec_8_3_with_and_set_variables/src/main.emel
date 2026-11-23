@@ -1,0 +1,26 @@
+effect Logger {  # 補
+  fn info(msg: String) -> ()
+}
+
+effect Clock {  # 補
+  fn now() -> Int
+}
+
+handler ConsoleLogger: Logger {  # 補
+  fn info(msg) { () }
+}
+
+fn run_hidden(f: fn() -> ()) { with ConsoleLogger { f() } }  # 補．仕様の `run(f: fn() -> ())`
+
+fn run[R](f: fn() -> () uses { Logger, R }) -> () uses { R } {
+  with ConsoleLogger { f() }      # R は R だけ。Logger は消える
+}
+
+fn callers() {  # 補
+  a = run(|| {
+    (use Logger).info("x")
+    (use Clock).now()
+    ()
+  })
+  b = run_hidden(|| (use Logger).info("y"))
+}

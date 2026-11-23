@@ -1,0 +1,21 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+handler Quiet: Logger {
+  fn info(msg) { () }
+}
+
+const C: () = (use Logger).info("c")
+
+fn main() {
+  (use Logger).info("main")
+}
+
+fn test_inside() {
+  with Quiet { (use Logger).info("ok") }
+}
+
+fn test_outside() -> () uses { Logger } {
+  (use Logger).info("t")
+}

@@ -1,0 +1,29 @@
+effect Kv {
+  fn get(key: String) -> String
+}
+
+effect Log {
+  fn info(msg: String) -> ()
+}
+
+handler RemoteKv(url: String): Kv {
+  init(url: String) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+handler QuietLog: Log {
+  fn info(msg) { () }
+}
+
+layer Unused {
+  RemoteKv
+}
+
+layer Missing {
+  QuietLog
+  RemoteKv
+}
+
+fn main() {
+  with Missing { (use Kv).get("a") }
+}

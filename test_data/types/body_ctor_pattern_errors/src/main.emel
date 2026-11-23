@@ -1,0 +1,16 @@
+type User(id: Int, name: String)
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+
+fn f(u: User, s: Shape) -> Int {
+  User(name:) = u
+  Rect(w) = s
+  Rect(w2, h2, d2) = s
+  Circle(r: r) = s
+  Some(v) = u
+  [q] = u
+  1
+}

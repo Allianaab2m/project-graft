@@ -1,0 +1,16 @@
+fn use_them() -> Int {
+  a = wrap(1)
+  b = wrap("s")
+  c = empty(0)
+  d: List[String] = empty(1)
+  e = one()
+  a_len()
+}
+
+fn wrap[A](x: A) { [x] }
+fn untyped(x) { x }
+fn empty(n: Int) { [] }
+fn one() { 1 }
+fn keep[A](x: A, n: Int) { (x, n) }
+const LIMIT = 10
+fn a_len() { LIMIT }

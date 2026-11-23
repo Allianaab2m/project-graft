@@ -1,0 +1,5 @@
+@external
+type Handle
+
+@export(js, "f")
+pub fn f(a: Handle, g: fn(Handle) -> Handle fails {} uses {}) -> Handle { g(a) }

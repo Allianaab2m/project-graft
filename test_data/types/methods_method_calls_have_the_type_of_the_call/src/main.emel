@@ -1,0 +1,44 @@
+error Bad
+
+effect Log {
+  fn write(s: String) -> ()
+}
+
+type User(name: String, age: Int)
+
+fn chained(u: User) {
+  u.rename("a").check().logged()
+}
+
+fn named(u: User) {
+  u.rename(name: "b").name
+}
+
+fn before(u: User) {
+  u.later()
+}
+
+fn rename(u: User, name: String) -> User {
+  User(name:, ..u)
+}
+
+fn check(u: User) -> User fails Bad {
+  if u.age < 0 { fail Bad } else { u }
+}
+
+fn logged(u: User) -> User uses { Log } {
+  (use Log).write(u.name)
+  u
+}
+
+fn later(u: User) {
+  u.age + 1
+}
+
+fn private_here(u: User) {
+  u.helper()
+}
+
+fn helper(u: User) -> Int {
+  u.age
+}

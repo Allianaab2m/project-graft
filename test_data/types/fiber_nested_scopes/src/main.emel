@@ -1,0 +1,34 @@
+import Std.Fiber.{Fiber, Scope}
+
+error Boom
+error Bust
+
+fn boom() -> Int fails Boom { fail Boom }
+
+fn bust() -> Int fails Bust { fail Bust }
+
+fn nested() {
+  Fiber.scope(|| {
+    Fiber.fork(|| boom())
+    inner = Fiber.scope(|| {
+      Fiber.fork(|| {
+        Fiber.fork(|| bust())
+        ()
+      })
+      1
+    })
+    inner
+  })
+}
+
+fn test_nested() {
+  Fiber.scope(|| {
+    Fiber.scope(|| {
+      Fiber.fork(|| {
+        Fiber.fork(|| ())
+        ()
+      })
+      ()
+    })
+  })
+}

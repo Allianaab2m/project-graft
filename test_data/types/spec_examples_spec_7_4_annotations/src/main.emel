@@ -1,0 +1,22 @@
+type User(name: String)  # 補
+error NotFound  # 補
+error DbError  # 補
+error Timeout  # 補
+
+fn inferred(n: Int) {
+  if n > 0 { fail NotFound } else { fail DbError }
+}
+
+fn load(id: Int) -> User fails NotFound | DbError {
+  inferred(id)
+}
+
+fn retry[A, E](f: fn() -> A fails Timeout | E) -> A fails Timeout | E { f() }
+
+fn only_db() {  # 補
+  retry(|| if True { fail Timeout } else { fail DbError })
+}
+
+fn no_timeout() {  # 補．Timeout を起こさない関数を渡してもよい
+  retry(|| fail DbError)
+}

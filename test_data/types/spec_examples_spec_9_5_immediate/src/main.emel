@@ -1,0 +1,15 @@
+type Ref[A](value: A)  # 補
+
+fn update[A, R: Immediate](
+  ref: Ref[A],
+  f: fn(A) -> A uses { R },
+) -> () uses { R } {
+  f(ref.value)  # 補
+  ()
+}
+
+@external(js, "./http_ffi.mjs", "fetchText")
+@external(wasm, "wasi:http/client", "fetch")
+suspend fn fetch_text(url: String) -> String
+
+fn bump(r: Ref[Int]) { update(r, |n| n + 1) }  # 補

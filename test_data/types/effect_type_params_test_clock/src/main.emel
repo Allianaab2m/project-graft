@@ -1,0 +1,25 @@
+import Std.Clock.{Clock}
+import Std.State.{State}
+import Std.Instant.{Instant}
+import Std.Duration.{Duration}
+
+handler TestClock: Clock {
+  suspend fn sleep(ms, resume) {
+    (use State[Instant]).update(|t| Instant.add(t, Duration.milliseconds(Int64.from_int(ms))))
+    resume(())
+  }
+  fn now() { (use State[Instant]).get() }
+}
+
+fn elapsed() -> Duration uses { Clock } {
+  clock = use Clock
+  start = clock.now()
+  clock.sleep(1500)
+  clock.now() |> Instant.since(start)
+}
+
+fn test_elapsed() {
+  start = Instant.from_unix_milliseconds(Int64.from_int(0))
+  (d, last) = State.run(start, || with TestClock { elapsed() })
+  assert Duration.to_milliseconds(d) == Int64.from_int(1500)
+}

@@ -1,0 +1,86 @@
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+  fn now() -> Int
+}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+handler InstantClock: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() { (use Clock).now() }
+}
+
+handler CapturedClock: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    clock = use Clock
+    (use Logger).info("now")
+    clock.now() + (clock.now() |> (|x| x))
+  }
+}
+
+handler LazyClock: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    clock = use Clock
+    later = || clock.sleep(1)
+    1
+  }
+}
+
+fn stamp() -> Int uses { Clock } { (use Clock).now() }
+
+handler ViaFn: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() { stamp() }
+}
+
+handler ViaClosure: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    clock = use Clock
+    f = || clock.now()
+    f()
+  }
+}
+
+handler ViaValue: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    clock = use Clock
+    g = clock.now
+    g()
+  }
+}
+
+handler Sleeping: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    (use Clock).sleep(1)
+    0
+  }
+}
+
+handler PureClock: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() { 0 }
+}
+
+handler LocalSleep: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    with PureClock { (use Clock).sleep(1) }
+    0
+  }
+}
+
+handler MixedSleep: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() {
+    t = (use Clock).now()
+    with PureClock { (use Clock).sleep(1) }
+    t
+  }
+}

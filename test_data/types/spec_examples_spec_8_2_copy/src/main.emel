@@ -1,0 +1,30 @@
+type Rows(n: Int)  # 補
+
+effect Db {  # 補
+  fn query(q: String) -> Rows
+  fn execute(rows: Rows) -> ()
+}
+
+handler PrimaryDb: Db {  # 補
+  fn query(q) { Rows(n: 0) }
+  fn execute(rows) { () }
+}
+
+handler ReplicaDb: Db {  # 補
+  fn query(q) { Rows(n: 1) }
+  fn execute(rows) { () }
+}
+
+fn copy(from: use Db, to: use Db) {
+  to.execute(from.query("..."))
+}
+
+fn main() {  # 補
+  with PrimaryDb {
+    primary = use Db
+    with ReplicaDb {
+      replica = use Db
+      copy(replica, primary)
+    }
+  }
+}

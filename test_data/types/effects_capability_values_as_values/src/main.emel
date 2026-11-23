@@ -1,0 +1,26 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+type Box(log: Int)
+
+fn f() {
+  log = use Logger
+  xs = [log]
+  p = (log, 1)
+  s = Some(log)
+  pipe = log |> Some
+  id = |x| x
+  id(log)
+  log
+}
+
+fn g() {
+  log = use Logger
+  || log
+}
+
+fn h() {
+  log = use Logger
+  || log.info("closure")
+}

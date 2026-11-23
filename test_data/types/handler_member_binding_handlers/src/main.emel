@@ -1,0 +1,15 @@
+handler Out: Console {
+  fn print_line(s) { () }
+}
+
+handler Err: Console {
+  fn print_line(s) { () }
+}
+
+fn both() {
+  with out = Out, err = Err {
+    out.print_line("a")
+    err.print_line("b")
+    (use Console).print_line("c")
+  }
+}

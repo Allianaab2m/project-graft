@@ -1,0 +1,896 @@
+## Declared types: the types (`Scheme`) of fns, constructors, consts and effect operations, and
+## parameter labels. Follows `signature.rs` of the reference type checker.
+##
+## Fns without a written return type, fns with a body but no `uses` clause, and consts without a
+## written type get their types after their bodies are inferred.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  DefData,
+  DefKind,
+  EffectKind,
+  TypeParamKind,
+  TraitKind,
+  TraitFnKind,
+  SourceModule,
+  SelfLocal,
+  Res,
+  ResDef,
+  ResErr,
+  Span,
+  TPath,
+  TTuple,
+  TFn,
+  Fields,
+  NoFields,
+  NamedFields,
+  PositionalFields,
+  FnItem,
+  FnSig,
+  Param,
+  TypeParam,
+  EffectRef,
+  LabelOf,
+  MemberItem,
+  Item,
+  IFn,
+  ICtor,
+  IError,
+  ITraitFn,
+  IConst,
+  IOp,
+  IMember,
+  IEffect,
+  IHandler,
+}
+import Infer.{Infer, new_infer}
+import Ty.{
+  Ty,
+  TyBound,
+  TyFn,
+  TySet,
+  TyError,
+  FnTy,
+  Row,
+  RBound,
+  RTag,
+  Tag,
+  SetKind,
+  Effects,
+  TyParam,
+  ParamKind,
+  SetParamKind,
+  Scheme,
+  EMPTY_ROW,
+  BOOL,
+  STRING,
+  UNIT,
+  cap,
+  func,
+  insert,
+  mono,
+  row_of,
+  ty_param,
+  union,
+}
+import Tylower.{
+  TyTable,
+  TyLower,
+  TyDiag,
+  OmitEmpty,
+  OmitHidden,
+  begin_hidden,
+  classify_fn_sets,
+  classify_sets,
+  con_of,
+  def_of,
+  effect_op_types,
+  effect_params,
+  effect_tag,
+  has_omitted,
+  immediate_bounds,
+  is_intrinsic_effect,
+  lower,
+  lower_effect_set,
+  lower_error_set,
+  lower_in,
+  lw,
+  new_lower,
+  prelude_def,
+  report,
+  scoped,
+  self_ty,
+  set_kind,
+  start_param,
+  ty_params,
+  type_param_defs,
+}
+
+pub type Signature(scheme: Scheme, labels: List[Option[String]])
+
+## The parameters of a handler's init. Handlers are not generic, so the types are concrete.
+pub type InitParams(tys: List[Ty], labels: List[Option[String]])
+
+pub type Signatures(
+  by_def: Map[Int, Signature],
+  ## Handler → the parameters of its init, if it takes any.
+  init_params: Map[Int, InitParams],
+  ## Handler → the effects it implements with their type arguments, in the order written. Host
+  ## effects, built-in effects, labels, unknown effects and repeated effects are left out.
+  handler_effects: Map[Int, List[Tag]],
+  ## Label → the effect it stands for.
+  label_bases: Map[Int, Tag],
+  ## Effect → its labels declared `default`, in definition order.
+  default_labels: Map[Int, List[Int]],
+)
+
+pub fn empty_signatures() -> Signatures {
+  Signatures(Map.empty(), Map.empty(), Map.empty(), Map.empty(), Map.empty())
+}
+
+pub fn get(sigs: Signatures, def: Int) -> Option[Signature] {
+  sigs.by_def.get(def)
+}
+
+pub fn insert_sig(sigs: Signatures, def: Int, sig: Signature) -> Signatures {
+  Signatures(by_def: sigs.by_def.insert(def, sig), ..sigs)
+}
+
+## The effects `handler` implements, in the order written.
+pub fn effects_of_handler(sigs: Signatures, owner: Int) -> List[Tag] {
+  sigs.handler_effects.get(owner).or([])
+}
+
+pub fn label_base(sigs: Signatures, label: Int) -> Option[Tag] {
+  sigs.label_bases.get(label)
+}
+
+## The effect whose operations a capability of `tag` has: the base for a label, else `tag`.
+pub fn base_of(sigs: Signatures, tag: Tag) -> Tag {
+  label_base(sigs, tag.def).or(tag)
+}
+
+## Collects the declared types of fns, constructors, consts and effect operations. Returns them
+## with the diagnostics, in the order the reference reports them.
+pub fn collect(program: Program, table: TyTable) -> (Signatures, List[TyDiag]) {
+  ((sigs, lowered), _) = State.run(new_infer(), || {
+    State.run(new_lower(program, table, []), || {
+      program.defs.fold(empty_signatures(), |sigs, def, data| collect_def(sigs, def, data))
+    })
+  })
+  (sigs, lowered.diags.reverse())
+}
+
+fn collect_def(sigs: Signatures, def: Int, data: DefData) -> Signatures
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  item = program.items.get(def)
+  sig = item match {
+    Some(IFn(f)) -> {
+      check_bounds(def, f)
+      if f.is_external { check_external_uses(def, f) }
+      fn_signature(f)
+    }
+    Some(ICtor(c))                   -> ctor_signature(c.owner, c.fields)
+    Some(IError(e))                  -> ctor_signature(def, e.fields)
+    Some(ITraitFn(f))                -> data.parent.map(|t| trait_fn_signature(t, f))
+    None if data.kind == TraitFnKind -> prelude_trait_fn_signature(def)
+    Some(IConst(c))                  -> c.ty.map(|t| Signature(mono(lower([], t)), []))
+    Some(IOp(o))                     -> Some(op_signature(data.parent, o.sig))
+    Some(IMember(m))                 -> Some(member_signature(data.parent, m))
+    _                                -> None
+  }
+  next = item match {
+    Some(IEffect(e)) -> {
+      check_effect_params(def)
+      # Only the compiler declares effects without operations (the host effects of the Prelude).
+      source = data.module match {
+        SourceModule(_) -> True
+        _               -> False
+      }
+      if e.ops.is_empty() && e.members.is_empty() && e.label.is_none() && source {
+        report(data.span, "E0446", "effect `#{data.name}` declares no operations")
+      }
+      e.label.and_then(|label| label_base_of(def, label).map(|b| (label, b))) match {
+        Some((label, b)) -> {
+          defaults = if label.default {
+            sigs.default_labels.insert(b.def, sigs.default_labels.get(b.def).or([]).append([def]))
+          } else {
+            sigs.default_labels
+          }
+          Signatures(label_bases: sigs.label_bases.insert(def, b), default_labels: defaults, ..sigs)
+        }
+        None -> sigs
+      }
+    }
+    Some(IHandler(h)) -> {
+      with_init = if h.init_params.is_empty() {
+        sigs
+      } else {
+        Signatures(
+          init_params: sigs.init_params.insert(def, init_params(def, h.init_params)),
+          ..sigs,
+        )
+      }
+      tags = h.effects.fold([], |tags, r| handler_effect(def, data, tags, r))
+      if tags.is_empty() {
+        with_init
+      } else {
+        Signatures(handler_effects: with_init.handler_effects.insert(def, tags), ..with_init)
+      }
+    }
+    _ -> sigs
+  }
+  sig.map(|s| insert_sig(next, def, s)).or(next)
+}
+
+## One effect listed after the `:` of a handler.
+fn handler_effect(owner: Int, data: DefData, tags: List[Tag], r: EffectRef) -> List[Tag]
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  r.res match {
+    ResDef(eff) if is_label(program, eff) -> {
+      base = program.items.get(eff) match {
+        Some(IEffect(e)) -> e.label.map(|l| l.base) match {
+          Some(ResDef(b)) -> def_of(program, b).name
+          _               -> "?"
+        }
+        _ -> "?"
+      }
+      report(
+        data.span,
+        "E0433",
+        "handler `#{data.name}` implements label `#{def_of(program, eff).name}`; implement `#{base}` instead",
+      )
+      tags
+    }
+    ResDef(eff) if is_host_effect(program, eff) || is_intrinsic_effect(program, eff) -> tags
+    ResDef(eff) -> {
+      tag = scoped(
+        [],
+        [],
+        OmitEmpty,
+        False,
+        None,
+        || effect_tag(eff, r.args, data.span, Some(data.name)),
+      )
+      tag match {
+        Some(t) -> {
+          check_listed_effect(owner, tags, t, r.span)
+          if tags.any(|x| x == t) { tags } else { tags.append([t]) }
+        }
+        None -> tags
+      }
+    }
+    _                                                                                -> tags
+  }
+}
+
+pub fn is_host_effect(program: Program, def: Int) -> Bool {
+  d = def_of(program, def)
+  d.module == Hir.BuiltinPrelude
+    && d.kind == EffectKind
+    && ["Async", "ProcessHost", "PageHost"].any(|n| n == d.name)
+}
+
+## Whether `effect` is declared as a label (`effect AuditLog of Console`).
+pub fn is_label(program: Program, eff: Int) -> Bool {
+  program.items.get(eff) match {
+    Some(IEffect(e)) -> e.label.is_some()
+    _                -> False
+  }
+}
+
+## The base effect of a label, as written.
+pub fn label_base_def(program: Program, eff: Int) -> Option[Int] {
+  program.items.get(eff) match {
+    Some(IEffect(e)) -> e.label.map(|l| l.base) match {
+      Some(ResDef(b)) -> Some(b)
+      _               -> None
+    }
+    _ -> None
+  }
+}
+
+## The operations of an effect; a label has those of its base.
+pub fn effect_ops(program: Program, eff: Int) -> List[Int] {
+  program.items.get(label_base_def(program, eff).or(eff)) match {
+    Some(IEffect(e)) -> e.ops
+    _                -> []
+  }
+}
+
+## The handler members of an effect; a label has those of its base.
+pub fn effect_members(program: Program, eff: Int) -> List[Int] {
+  program.items.get(label_base_def(program, eff).or(eff)) match {
+    Some(IEffect(e)) -> e.members
+    _                -> []
+  }
+}
+
+## Whether an effect is Immediate (spec 9.5): no suspend fn, no suspend handler member, and not
+## Async. An unknown effect counts as Immediate.
+pub fn is_immediate_effect(program: Program, eff: Int) -> Bool {
+  suspends = |d: Int| {
+    program.items.get(d) match {
+      Some(IOp(o))     -> o.sig.is_suspend
+      Some(IMember(m)) -> m.sig.is_suspend
+      _                -> False
+    }
+  }
+  prelude_def(program, "Async") != Some(eff)
+    && !effect_ops(program, eff).any(suspends)
+    && !effect_members(program, eff).any(suspends)
+}
+
+## The uses clause of an external function contains only ProcessHost and PageHost (E0445).
+fn check_external_uses(def: Int, f: FnItem) -> () uses { State[TyLower] } {
+  program = lw().program
+  f.sig.uses.map(|u| u.items).or([]).each(|e| {
+    allowed = e.res match {
+      ResDef(d) -> is_host_effect(program, d) && def_of(program, d).name != "Async"
+      ResErr    -> True
+      _         -> False
+    }
+    if !allowed {
+      report(
+        Some(e.span),
+        "E0445",
+        "the `uses` of external function `#{def_of(program, def).name}` may only name ProcessHost and PageHost",
+      )
+    }
+  })
+}
+
+## The base of a label as a tag, or None with E0429 if it cannot be used.
+fn label_base_of(def: Int, label: LabelOf) -> Option[Tag] uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  label.base match {
+    ResDef(b) if def_of(program, b).kind == EffectKind -> {
+      if is_label(program, b) || is_host_effect(program, b) || is_intrinsic_effect(program, b) {
+        report(
+          Some(label.span),
+          "E0429",
+          "label `#{def_of(program, def).name}` cannot stand for `#{def_of(program, b).name}`",
+        )
+        None
+      } else {
+        scoped([], [], OmitEmpty, False, None, || effect_tag(b, label.args, Some(label.span), None))
+      }
+    }
+    _ -> None
+  }
+}
+
+## None if no return type is written, if the return type has a function type with `fails` or
+## `uses` omitted, or if a fn with a body has no `uses` clause: those are inferred from the body.
+fn fn_signature(f: FnItem) -> Option[Signature] uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  f.sig.ret.and_then(|ret| {
+    if (
+      has_omitted(program, ret, False)
+        || has_omitted(program, ret, True)
+        || (f.body.is_some() && f.sig.uses.is_none())
+    ) {
+      None
+    } else {
+      fp = fn_params(f, None)
+      arg_tys = lower_params(fp, f.sig.params)
+      ret_ty = in_fn(fp, || lower_in(ret, True))
+      fails = declared_fails(fp, f.sig)
+      uses0 = declared_uses(fp, f.sig)
+      # `@external suspend fn` requires Async.
+      uses = if f.sig.is_suspend {
+        prelude_def(program, "Async").map(|a| insert(uses0, RTag(Tag(a, [])))).or(uses0)
+      } else {
+        uses0
+      }
+      Some(
+        Signature(
+          Scheme(all_params(fp), func(arg_tys, ret_ty, fails, uses)),
+          param_labels(program, f.sig.params),
+        ),
+      )
+    }
+  })
+}
+
+## The type of a trait's function: `Self` is the first type parameter, constrained by the trait.
+## Without a return type, it returns `()`.
+fn trait_fn_signature(trait_def: Int, f: FnItem) -> Signature
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  fp = fn_params(f, Some(trait_def))
+  arg_tys = lower_params(fp, f.sig.params)
+  ret_ty = f.sig.ret.map(|r| in_fn(fp, || lower_in(r, True))).or(UNIT)
+  fails = declared_fails(fp, f.sig)
+  uses = declared_uses(fp, f.sig)
+  Signature(
+    Scheme(all_params(fp), func(arg_tys, ret_ty, fails, uses)),
+    param_labels(program, f.sig.params),
+  )
+}
+
+## The functions of the Prelude's traits, which have no source: `Eq.eq`, `Ord.compare` and
+## `Show.show`.
+fn prelude_trait_fn_signature(def: Int) -> Option[Signature] uses { State[TyLower] } {
+  program = lw().program
+  table = lw().table
+  data = def_of(program, def)
+  ordering = prelude_def(program, "Ordering").and_then(|d| con_of(table, d)).map(
+    |id| Ty.TyNamed(id, []),
+  ).or(TyError)
+  shape = data.name match {
+    "eq"      -> Some((2, BOOL))
+    "compare" -> Some((2, ordering))
+    "show"    -> Some((1, STRING))
+    _         -> None
+  }
+  (data.parent, shape) match {
+    (Some(t), Some((n, ret))) -> {
+      labels = ["self", "other"].take(n).map(|l| Some(l))
+      Some(
+        Signature(
+          Scheme(
+            [self_param(program, t)],
+            func(List.range(0, n).map(|_| TyBound(0)), ret, EMPTY_ROW, EMPTY_ROW),
+          ),
+          labels,
+        ),
+      )
+    }
+    _ -> None
+  }
+}
+
+## Checks the bounds on a fn's type parameters (spec 9.5). Immediate only on effect sets (E0322);
+## a trait bound on an effect set is not supported; a `uses` in a callback of an external
+## function must be Immediate (E0416).
+fn check_bounds(def: Int, f: FnItem) -> () uses { State[TyLower] } {
+  program = lw().program
+  table = lw().table
+  sig = f.sig
+  types = sig.params.filter_map(|p| p.ty).append(sig.ret.map(|r| [r]).or([]))
+  immediate = prelude_def(program, "Immediate")
+  defs = sig.type_params.map(|tp| tp.def)
+  sets = classify_fn_sets(program, table.sets, defs, types, sig.uses)
+  constrained = sig.type_params.enumerate().fold([], |acc, (i, tp)| {
+    in_uses = (
+      sets.get(i).and_then(|k| k) == Some(Effects)
+        || sig.uses.map(|u| u.items).or([]).any(|e| e.res == ResDef(tp.def))
+    )
+    spans = immediate_bounds(program, tp)
+    if !in_uses {
+      spans.each(
+        |sp| report(
+          Some(sp),
+          "E0322",
+          "`Immediate` can only bound an effect set, not `#{def_of(program, tp.def).name}`",
+        ),
+      )
+      acc
+    } else {
+      tp.bounds.each(|(res, sp)| {
+        res match {
+          ResDef(d) if Some(d) != immediate -> report(
+            Some(sp),
+            "-",
+            "not supported yet: trait bounds on effect sets",
+          )
+          _ -> ()
+        }
+      })
+      if spans.is_empty() { acc } else { acc.append([tp.def]) }
+    }
+  })
+  if f.is_external {
+    sig.params.each(|p| {
+      p.ty match {
+        Some(ty) -> {
+          (effects, set_params) = walk_callbacks(program, ty, constrained, ([], []))
+          if !effects.is_empty() || !set_params.is_empty() {
+            span = program.types.get(ty).and_then(|r| r.span)
+            report(
+              span,
+              "E0416",
+              "callbacks of external function `#{def_of(program, def).name}` must be Immediate",
+            )
+          }
+        }
+        None -> ()
+      }
+    })
+  }
+}
+
+## The non-Immediate effects and unconstrained set type parameters in the `uses` clauses of the
+## function types inside `ty`.
+fn walk_callbacks(
+  program: Program,
+  ty: Int,
+  constrained: List[Int],
+  found: (List[String], List[String]),
+) -> (List[String], List[String]) {
+  add = |names: List[String], n: String| if names.any(|x| x == n) {
+    names
+  } else {
+    names.append([n])
+  }
+  program.types.get(ty).map(|r| r.kind) match {
+    Some(TPath(_, args)) -> args.fold(found, |acc, a| walk_callbacks(program, a, constrained, acc))
+    Some(TTuple(elems))  -> elems.fold(found, |acc, e| walk_callbacks(program, e, constrained, acc))
+    Some(TFn(params, ret, _, uses)) -> {
+      here = uses.map(|u| u.items).or([]).fold(found, |(effects, sets), item| {
+        item.res match {
+          ResDef(d) -> {
+            data = def_of(program, d)
+            if data.kind == EffectKind && !is_immediate_effect(program, d) {
+              (add(effects, data.name), sets)
+            } else if data.kind == TypeParamKind && !constrained.any(|c| c == d) {
+              (effects, add(sets, data.name))
+            } else {
+              (effects, sets)
+            }
+          }
+          _ -> (effects, sets)
+        }
+      })
+      after_params = params.fold(here, |acc, p| walk_callbacks(program, p, constrained, acc))
+      ret.map(|r| walk_callbacks(program, r, constrained, after_params)).or(after_params)
+    }
+    _                    -> found
+  }
+}
+
+## The type and labels of an effect operation (spec 8.1). Omitted `fails` and `uses` in
+## function-typed parameters are empty. The operation's R is empty; calls through a capability
+## add the effect. The effect's type parameters come first, then the operation's own.
+fn op_signature(eff: Option[Int], sig: FnSig) -> Signature uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  table = lw().table
+  effect_defs = eff.map(|e| effect_params(program, e).map(|tp| tp.def)).or([])
+  defs = effect_defs.append(sig.type_params.map(|tp| tp.def))
+  types = sig.params.filter_map(|p| p.ty).append(sig.ret.map(|r| [r]).or([]))
+  classified = classify_sets(program, table.sets, defs, types).map(
+    |k| if k.is_some() { SetParamKind } else { Ty.TypeParamKind },
+  )
+  kinds = classified.enumerate().map(|(i, k)| {
+    (eff, i < effect_defs.length()) match {
+      (Some(e), True) if set_kind(table, e, i).is_some() -> SetParamKind
+      _                                                  -> k
+    }
+  })
+  (params0, ret, fails) = scoped(defs, kinds, OmitEmpty, True, None, || {
+    ps = sig.params.map(|p| {
+      p.ty match {
+        Some(t) -> lower_in(t, True)
+        None    -> missing_param_type(p)
+      }
+    })
+    r = sig.ret.map(|t| lower_in(t, True)).or(UNIT)
+    f = sig.fails.map(lower_error_set).or(EMPTY_ROW)
+    (ps, r, f)
+  })
+  # A child forked through a built-in effect may use the effect itself (spec 11.2).
+  params = eff match {
+    Some(e) if is_intrinsic_effect(program, e) -> {
+      own = own_tag(table, e, effect_defs.length())
+      params0.map(|p| with_own_tag(p, own, effect_defs.length()))
+    }
+    _ -> params0
+  }
+  tps = ty_params(program, defs).zip(kinds).map(|(p, k)| TyParam(kind: k, ..p))
+  Signature(Scheme(tps, func(params, ret, fails, EMPTY_ROW)), param_labels(program, sig.params))
+}
+
+## The same effect listed again is E0451; an operation or member name an earlier effect also has
+## is E0450.
+fn check_listed_effect(owner: Int, earlier: List[Tag], tag: Tag, span: Span) -> ()
+  uses { State[TyLower] } {
+  program = lw().program
+  hname = def_of(program, owner).name
+  if earlier.any(|t| t == tag) {
+    report(Some(span), "E0451", "handler `#{hname}` lists `#{def_of(program, tag.def).name}` twice")
+  } else {
+    names = |e: Int| effect_ops(program, e).append(effect_members(program, e)).map(
+      |d| def_of(program, d).name,
+    )
+    own = names(tag.def)
+    earlier.each(|other| {
+      names(other.def).each(|n| {
+        if own.any(|o| o == n) {
+          report(
+            Some(span),
+            "E0450",
+            "handler `#{hname}` implements `#{n}` of both `#{def_of(program, other.def).name}` and `#{def_of(program, tag.def).name}`",
+          )
+        }
+      })
+    })
+  }
+}
+
+## The type of opening a handler member: a function from the init's parameters to the capability
+## of the handler opened, with the member's `fails` as E and the declaring effect as R.
+fn member_signature(eff: Option[Int], m: MemberItem) -> Signature
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  sig = op_signature(eff, m.sig)
+  defs = eff.map(|e| effect_params(program, e).map(|tp| tp.def)).or([])
+  kinds = defs.map(|_| Ty.TypeParamKind)
+  provided = scoped(defs, kinds, OmitEmpty, False, None, || {
+    m.effects.fold(Some([]), |acc, e| {
+      tag = e.res match {
+        ResDef(d) -> effect_tag(d, e.args, Some(e.span), None)
+        _         -> None
+      }
+      (tag, acc) match {
+        (Some(t), Some(ts)) -> Some(ts.append([t]))
+        _                   -> None
+      }
+    })
+  })
+  ret = provided.and_then(|ts| if ts.is_empty() { None } else { Some(cap(ts)) }).or(TyError)
+  ty = sig.scheme.ty match {
+    TyFn(f) -> {
+      uses = eff.map(|e| row_of([RTag(Tag(e, List.range(0, defs.length()).map(TyBound)))])).or(
+        f.uses,
+      )
+      TyFn(FnTy(ret:, uses:, ..f))
+    }
+    t -> t
+  }
+  Signature(scheme: Scheme(ty:, ..sig.scheme), ..sig)
+}
+
+## A built-in effect applied to its own type parameters (`Scope[E, R]`).
+fn own_tag(table: TyTable, eff: Int, n: Int) -> Tag {
+  Tag(
+    eff,
+    List.range(0, n).map(|i| {
+      set_kind(table, eff, i) match {
+        Some(k) -> TySet(k, row_of([RBound(i)]))
+        None    -> TyBound(i)
+      }
+    }),
+  )
+}
+
+## Adds `own` to the `use` of a function type that names one of the effect's set type parameters
+## (the first `n` scheme parameters).
+fn with_own_tag(ty: Ty, own: Tag, n: Int) -> Ty {
+  ty match {
+    TyFn(f) -> {
+      names_param = f.uses.elems.any(|e| {
+        e match {
+          RBound(i) -> i < n
+          _         -> False
+        }
+      })
+      if names_param { TyFn(FnTy(uses: insert(f.uses, RTag(own)), ..f)) } else { ty }
+    }
+    _ -> ty
+  }
+}
+
+## Effect type parameters are ordinary types only (E0424), and operations cannot have their own
+## (E0426). Built-in effects may have both.
+fn check_effect_params(eff: Int) -> () uses { State[TyLower] } {
+  program = lw().program
+  table = lw().table
+  if !is_intrinsic_effect(program, eff) {
+    ops = program.items.get(eff) match {
+      Some(IEffect(e)) -> e.ops
+      _                -> []
+    }
+    ops.each(|op| {
+      program.items.get(op) match {
+        Some(IOp(o)) -> o.sig.type_params.head() match {
+          Some(first) -> report(
+            def_of(program, first.def).span,
+            "E0426",
+            "operation `#{def_of(program, op).name}` cannot have type parameters",
+          )
+          None -> ()
+        }
+        _ -> ()
+      }
+    })
+    params = effect_params(program, eff)
+    if !params.is_empty() {
+      sets = classify_sets(
+        program,
+        table.sets,
+        params.map(|tp| tp.def),
+        effect_op_types(program, eff),
+      )
+      params.zip(sets).each(|(tp, set)| {
+        if set.is_some() {
+          report(
+            def_of(program, tp.def).span,
+            "E0424",
+            "type parameter `#{def_of(program, tp.def).name}` of effect `#{def_of(program, eff).name}` must be a type",
+          )
+        }
+      })
+    }
+  }
+}
+
+pub fn param_labels(program: Program, params: List[Param]) -> List[Option[String]] {
+  params.map(|p| program.locals.get(p.local).map(|l| l.name))
+}
+
+## A fn's type parameters: the written ones (their kind decided by where they are used), with
+## `Self` first for a trait's function.
+pub type FnParams(
+  defs: List[Int],
+  kinds: List[ParamKind],
+  declared: List[TyParam],
+  self_ty: Option[Ty],
+  immediate: Bool,
+)
+
+pub fn fn_params(f: FnItem, trait_def: Option[Int]) -> FnParams uses { State[TyLower] } {
+  program = lw().program
+  table = lw().table
+  sig = f.sig
+  own = sig.type_params.map(|tp| tp.def)
+  defs = trait_def.map(|t| [t]).or([]).append(own)
+  types = sig.params.filter_map(|p| p.ty).append(sig.ret.map(|r| [r]).or([]))
+  classified = classify_fn_sets(program, table.sets, defs, types, sig.uses).map(
+    |k| if k.is_some() { SetParamKind } else { Ty.TypeParamKind },
+  )
+  # `Self` is an ordinary type parameter.
+  kinds = trait_def match {
+    Some(_) -> [Ty.TypeParamKind].append(classified.drop(1))
+    None    -> classified
+  }
+  skip = defs.length() - own.length()
+  own_params = ty_params(program, own).zip(kinds.drop(skip)).zip(sig.type_params).map(
+    |((p, k), tp)| {
+      q = TyParam(kind: k, ..p)
+      k match {
+        SetParamKind -> if immediate_bounds(program, tp).is_empty() {
+          q
+        } else {
+          TyParam(bounds: q.bounds.append(["Immediate"]), ..q)
+        }
+        _ -> with_traits(program, q, tp)
+      }
+    },
+  )
+  declared = trait_def.map(|t| [self_param(program, t)]).or([]).append(own_params)
+  FnParams(defs, kinds, declared, trait_def.map(|_| TyBound(0)), f.is_external)
+}
+
+## Runs `f` in the fn's scope with omitted clauses empty.
+fn in_fn[A](fp: FnParams, f: fn() -> A uses { State[TyLower], State[Infer] }) -> A
+  uses { State[TyLower], State[Infer] } {
+  scoped(fp.defs, fp.kinds, OmitEmpty, True, fp.self_ty, f)
+}
+
+## The parameter types. Function types with clauses omitted get invisible set type parameters;
+## parameters without a type are E0316.
+pub fn lower_params(fp: FnParams, params: List[Param]) -> List[Ty]
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  begin_hidden(fp.defs.length(), fp.immediate)
+  params.map(|p| {
+    is_self = program.locals.get(p.local).map(|l| l.kind == SelfLocal) == Some(True)
+    (p.ty, fp.self_ty) match {
+      (None, Some(s)) if is_self -> s
+      (None, _)                  -> missing_param_type(p)
+      (Some(t), _) -> {
+        start_param(program.locals.get(p.local).map(|l| l.name).or(""))
+        scoped(fp.defs, fp.kinds, OmitHidden, True, fp.self_ty, || lower_in(t, True))
+      }
+    }
+  })
+}
+
+fn missing_param_type(p: Param) -> Ty uses { State[TyLower] } {
+  program = lw().program
+  program.locals.get(p.local) match {
+    Some(l) -> report(Some(l.span), "E0316", "parameter `#{l.name}` needs a type")
+    None    -> ()
+  }
+  TyError
+}
+
+## The declared E: the written `fails` united with the invisible sets in positive positions.
+pub fn declared_fails(fp: FnParams, sig: FnSig) -> Row uses { State[TyLower], State[Infer] } {
+  written = sig.fails.map(|set| in_fn(fp, || lower_error_set(set))).or(EMPTY_ROW)
+  union(written, lw().hidden.positive)
+}
+
+## The declared R: the written `uses` united with the invisible effect sets in positive positions.
+pub fn declared_uses(fp: FnParams, sig: FnSig) -> Row uses { State[TyLower], State[Infer] } {
+  written = sig.uses.map(|set| in_fn(fp, || lower_effect_set(set))).or(EMPTY_ROW)
+  union(written, lw().hidden.positive_uses)
+}
+
+## The written type parameters followed by the invisible set type parameters.
+pub fn all_params(fp: FnParams) -> List[TyParam] uses { State[TyLower] } {
+  fp.declared.append(lw().hidden.params)
+}
+
+## The type and labels of a constructor of `owner` (type, enum, error or handler). A constructor
+## without fields is a value of the type itself.
+fn ctor_signature(owner: Int, fields: Fields) -> Option[Signature]
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  table = lw().table
+  self_ty(table, owner).map(|ret_ty| {
+    defs = type_param_defs(program, owner)
+    (field_tys, labels) = fields match {
+      NoFields            -> ([], [])
+      PositionalFields(t) -> (t, t.map(|_| None))
+      NamedFields(fs)     -> (fs.map(|f| f.ty), fs.map(|f| Some(f.name)))
+    }
+    params = con_of(table, owner).and_then(|id| table.cons.get(id)).map(|c| c.params).or(
+      ty_params(program, defs),
+    )
+    kinds = params.map(|p| p.kind)
+    ty = fields match {
+      NoFields -> ret_ty
+      _ -> scoped(
+        defs,
+        kinds,
+        OmitEmpty,
+        True,
+        None,
+        || func(field_tys.map(|t| lower_in(t, True)), ret_ty, EMPTY_ROW, EMPTY_ROW),
+      )
+    }
+    Signature(Scheme(params, ty), labels)
+  })
+}
+
+## The parameters of a handler's init. Their types must be written (E0316).
+fn init_params(owner: Int, params: List[Param]) -> InitParams
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  tys = params.map(|p| {
+    p.ty match {
+      Some(t) -> lower([], t)
+      None -> {
+        program.locals.get(p.local) match {
+          Some(l) -> report(
+            Some(l.span),
+            "E0316",
+            "parameter `#{l.name}` of the init of `#{def_of(program, owner).name}` needs a type",
+          )
+          None -> ()
+        }
+        TyError
+      }
+    }
+  })
+  InitParams(tys, param_labels(program, params))
+}
+
+## Adds the trait constraints written on an ordinary type parameter (`A: Ord + Show`).
+pub fn with_traits(program: Program, param: TyParam, tp: TypeParam) -> TyParam {
+  immediate = prelude_def(program, "Immediate")
+  tp.bounds.fold(param, |p, (res, _)| {
+    res match {
+      ResDef(t) if def_of(program, t).kind == TraitKind
+        && immediate != Some(t)
+        && !p.traits.any(|x| x == t) -> {
+        TyParam(
+          traits: p.traits.append([t]),
+          bounds: p.bounds.append([def_of(program, t).name]),
+          ..p,
+        )
+      }
+      _ -> p
+    }
+  })
+}
+
+## `Self` of a trait's functions, constrained by the trait.
+pub fn self_param(program: Program, trait_def: Int) -> TyParam {
+  TyParam(traits: [trait_def], bounds: [def_of(program, trait_def).name], ..ty_param("Self"))
+}

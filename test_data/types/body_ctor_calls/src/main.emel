@@ -1,0 +1,9 @@
+type User(id: Int, name: String)
+
+fn f() -> Option[User] {
+  u = User(1, "a")
+  s = Some(1)
+  t = Some("x")
+  n = None
+  Some(u)
+}

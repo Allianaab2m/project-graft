@@ -1,0 +1,5 @@
+fn f(count: Int) -> Int {
+  a = if count > 0 { 1 }
+  b = if count { 1 } else { 2 }
+  count
+}

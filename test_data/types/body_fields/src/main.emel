@@ -1,0 +1,16 @@
+type User(id: Int, name: String)
+type Pair[A, B](first: A, second: B)
+error NotFound(id: Int)
+enum Shape {
+  Circle(radius: Float)
+}
+
+fn f(u: User, p: Pair[Int, String], e: NotFound, s: Shape, n: Int) -> String {
+  a = u.id
+  b = p.second
+  c = e.id
+  d = u.nmae
+  g = s.radius
+  h = n.name
+  u.name
+}

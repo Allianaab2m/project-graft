@@ -1,0 +1,17 @@
+import Std.State.{State}
+
+fn modify[S](f: fn(S) -> S fails {} uses {}) -> S uses { State[S] } {
+  st = use State[S]
+  st.update(f)
+  st.get()
+}
+
+fn bump() { modify(|n| n + 1) }
+
+fn run_bump() { State.run(41, || bump()) }
+
+fn shout() { State.run("a", || modify(|s| String.append(s, "!"))) }
+
+fn peek() { modify(|x| x) }
+
+fn peek_int() { State.run(1, || peek()) }

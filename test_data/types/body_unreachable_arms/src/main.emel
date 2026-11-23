@@ -1,0 +1,19 @@
+const MAX = 10
+
+fn f(o: Option[Int], n: Int) -> Int {
+  a = o match {
+    _ -> 0
+    Some(x) -> x
+  }
+  b = n match {
+    MAX -> 1
+    MAX -> 2
+    _ -> 3
+  }
+  c = o match {
+    Some(x) if x > 0 -> x
+    Some(x) -> x
+    None -> 0
+  }
+  a
+}

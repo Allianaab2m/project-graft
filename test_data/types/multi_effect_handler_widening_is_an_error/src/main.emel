@@ -1,0 +1,9 @@
+fn read_write(rw: use Query + Execute) -> () { rw.execute("a") }
+
+fn widen(q: use Query) -> () { read_write(q) }
+
+fn other(q: use Query + Audit) -> () { read_write(q) }
+
+fn narrowed(q: use Query) -> () { q.execute("a") }
+
+fn back(rw: use Query + Execute) -> use Query + Execute + Audit { rw }

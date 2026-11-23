@@ -1,0 +1,19 @@
+fn lengths(xs: List[String]) {
+  xs.map(|s| s.length()).fold(from: 0, f: |a, b| a + b)
+}
+
+fn first_line(s: String) {
+  s.split("\n").head().or("")
+}
+
+fn joined(xs: List[String]) {
+  xs.join(", ")
+}
+
+fn digits(n: Int) {
+  n.to_string().length()
+}
+
+fn not_strings(xs: List[Int]) -> String {
+  xs.join(", ")
+}

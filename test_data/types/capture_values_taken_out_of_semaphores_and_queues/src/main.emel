@@ -1,0 +1,42 @@
+fn taken() -> Int fails QueueClosed {
+  Fiber.scope(|| {
+    q: Queue[Int] = Fiber.queue(1)
+    q.offer(1)
+    q.take()
+  })
+}
+
+fn polled() -> Option[Int] {
+  Fiber.scope(|| {
+    q: Queue[Int] = Fiber.queue(1)
+    q.try_offer(1)
+    q.poll()
+  })
+}
+
+fn permitted[A](f: fn() -> A) -> A {
+  Fiber.scope(|| Fiber.semaphore(1).with_permit(f))
+}
+
+fn tried[A](f: fn() -> A) -> Option[A] {
+  Fiber.scope(|| Fiber.semaphore(1).try_with_permit(f))
+}
+
+fn counted() -> Int {
+  Fiber.scope(|| Fiber.semaphore(2).available())
+}
+
+fn queue_of_a_queue() -> Queue[Int] fails QueueClosed {
+  Fiber.scope(|| {
+    qq: Queue[Queue[Int]] = Fiber.queue(1)
+    qq.offer(Fiber.queue(1))
+    qq.take()
+  })
+}
+
+fn other_roots() -> fn() -> () {
+  with ConsoleLogger {
+    log = use Logger
+    Fiber.scope(|| Fiber.semaphore(1).with_permit(|| || log.info("x")))
+  }
+}

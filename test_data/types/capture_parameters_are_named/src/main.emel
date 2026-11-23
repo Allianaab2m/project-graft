@@ -1,0 +1,11 @@
+fn outer() -> Int {
+  fn wrap(f: fn() -> Int) -> fn() -> Int {
+    g = f
+    g
+  }
+  h = |k: fn() -> Int| {
+    m = k
+    m
+  }
+  wrap(h(|| 1))()
+}

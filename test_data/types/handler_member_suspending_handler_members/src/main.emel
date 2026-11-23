@@ -1,0 +1,40 @@
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+}
+
+effect Slow {
+  suspend handler Open(path: String): ReadFile
+}
+
+effect Quick {
+  handler Open(path: String): ReadFile
+}
+
+handler BadQuick: Quick {
+  handler Open(path: String): ReadFile {
+    init(path: String) {
+      (use Clock).sleep(1)
+      Self(path:)
+    }
+    release { (use Clock).sleep(1) }
+    fn read(max) { max }
+  }
+}
+
+handler GoodSlow: Slow {
+  handler Open(path: String): ReadFile {
+    init(path: String) {
+      (use Clock).sleep(1)
+      Self(path:)
+    }
+    release { (use Clock).sleep(1) }
+    fn read(max) { max }
+  }
+}
+
+fn on_click[R: Immediate](f: fn() -> () uses { R }) -> () { () }
+
+fn g() -> () uses { Quick, Slow } {
+  on_click(|| with f = Quick.Open("a") { () })
+  on_click(|| with f = Slow.Open("a") { () })
+}

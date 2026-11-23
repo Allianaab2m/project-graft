@@ -1,0 +1,44 @@
+import Std.Fiber.{Fiber, Scope}
+
+type User(name: String)
+
+effect Users {
+  fn find(id: Int) -> User
+}
+
+handler PostgresUsers: Users {
+  fn find(id) { User(name: "alice") }
+}
+
+fn main() {
+  Fiber.scope(|| {
+    s = use Scope
+    with PostgresUsers {
+      s.fork(|| (use Users).find(1))
+    }
+    ()
+  })
+}
+
+fn fixed() -> () uses { Async } {
+  with PostgresUsers {
+    Fiber.scope(|| {
+      Fiber.fork(|| (use Users).find(1))
+      ()
+    })
+  }
+}
+
+fn body_itself() -> () uses { Async } {
+  Fiber.scope(|| {
+    (use Users).find(1)
+    ()
+  })
+}
+
+fn test_forked() {
+  Fiber.scope(|| {
+    Fiber.fork(|| (use Users).find(1))
+    ()
+  })
+}

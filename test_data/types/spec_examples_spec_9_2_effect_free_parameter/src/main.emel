@@ -1,0 +1,14 @@
+effect Logger {  # 補
+  fn info(msg: String) -> ()
+}
+
+fn run_pure(f: fn() -> Int uses {}) -> Int { f() }  # 補
+fn run_any(f: fn() -> Int) -> Int { f() }  # 補
+
+fn callers() {  # 補
+  a = run_any(|| { (use Logger).info("a")
+  1 })
+  b = run_pure(|| { (use Logger).info("b")
+  1 })
+  (a, b)
+}

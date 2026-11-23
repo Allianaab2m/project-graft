@@ -1,0 +1,20 @@
+type Box(f: fn() -> Int uses { Db })
+
+fn data() {
+  with PrimaryDb {
+    p = use Db
+    t = (1, || p.query("t"))
+    o = Some(|| p.query("o"))
+    fn local() -> Int { p.query("l") }
+    n = p.query("n")
+    (t, o, local, n)
+  }
+}
+
+fn plain() -> Int {
+  with PrimaryDb {
+    p = use Db
+    f = || p.query("x")
+    f()
+  }
+}

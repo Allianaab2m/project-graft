@@ -1,0 +1,42 @@
+error Boom
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+fn risky() -> () fails Boom { fail Boom }
+
+handler Counter(n: Int): Logger {
+  init { Counter(n: 0) }
+  release { risky() }
+  fn info(msg) {
+    next = Counter(n: self.n + 1)
+    ()
+  }
+}
+
+handler Careful(n: Int): Logger {
+  init { Careful(n: 1) }
+  release { risky() escape { Boom -> () } }
+  fn info(msg) { () }
+}
+
+handler NoInit(n: Int): Logger {
+  fn info(msg) { () }
+}
+
+handler WrongInit(n: Int): Logger {
+  init { 1 }
+  fn info(msg) { self.m }
+}
+
+handler Plain: Logger {
+  fn info(msg) {
+    me = self
+    ()
+  }
+}
+
+fn make() { Counter(n: 1) }
+
+fn lambda() { || Counter(n: 1) }

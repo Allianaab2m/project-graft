@@ -1,0 +1,13 @@
+type User(id: Int, name: String)
+  derive Show
+
+fn rename(user: User, name: String) -> User { User(name:, ..user) }  # 補
+
+fn names(xs: List[User], f: fn(User) -> String) -> List[String] {  # 補
+  xs.map(f)
+}
+
+fn shown(user: User) -> String {  # 補
+  Show.show(user) == user.show()
+  user.rename("b").name
+}

@@ -1,0 +1,22 @@
+effect Slow {
+  suspend fn wait() -> Int
+}
+
+effect Quick {
+  fn get() -> Int
+}
+
+handler Through(inner: use Slow): Quick {
+  init(inner: use Slow) { Self(inner:) }
+  fn get() { self.inner.wait() }
+}
+
+handler Closing(inner: use Slow): Console {
+  init(inner: use Slow) { Self(inner:) }
+  release { _ = self.inner.wait() }
+  fn print_line(s) { () }
+}
+
+fn closing(s: use Slow) -> () {
+  with Closing(inner: s) { (use Console).print_line("x") }
+}

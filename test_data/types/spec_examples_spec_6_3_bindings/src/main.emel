@@ -1,0 +1,9 @@
+fn is_even(n: Int) -> Bool { n % 2 == 0 }  # 補
+
+fn bindings(xs: List[Int], names: List[String]) -> Int {
+  count = 0
+  count = count + 1            # 同名での束縛し直し
+  (evens, odds) = List.partition(xs, is_even)
+  pairs: List[(String, Int)] = List.zip(names, xs)
+  count
+}

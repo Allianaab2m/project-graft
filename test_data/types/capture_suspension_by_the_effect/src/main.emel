@@ -1,0 +1,13 @@
+import Std.Clock.{Clock}
+
+effect Tick {
+  fn tick() -> ()
+}
+
+handler Ticking: Tick {
+  fn tick() {
+    clock = use Clock
+    f = || clock.sleep(1)
+    f()
+  }
+}

@@ -1,0 +1,37 @@
+fn pass[A](x: A) -> A { x }
+
+fn logger() -> fn() -> () {
+  log = use Logger
+  || log.info("hi")
+}
+
+fn keep(f: fn() -> Int) -> fn() -> Int { f }
+
+fn by_param() -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    pass(|| p.query("x"))
+  }
+}
+
+fn by_caller() -> fn() -> () {
+  with ConsoleLogger { logger() }
+}
+
+fn by_pipe() -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    (|| p.query("x")) |> keep()
+  }
+}
+
+fn countdown(n: Int, f: fn() -> Int) -> fn() -> Int {
+  if n == 0 { f } else { countdown(n - 1, f) }
+}
+
+fn recursive() -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    countdown(3, || p.query("x"))
+  }
+}

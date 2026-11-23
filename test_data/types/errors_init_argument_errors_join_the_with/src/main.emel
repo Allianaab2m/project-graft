@@ -1,0 +1,28 @@
+error Bad
+
+effect Kv {
+  fn get(key: String) -> String
+}
+
+handler RemoteKv(url: String): Kv {
+  init(url: String) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+handler FakeKv: Kv {
+  fn get(key) { "" }
+}
+
+fn url() -> String fails Bad { fail Bad }
+
+fn live() -> String fails Bad {
+  with RemoteKv(url: url()) { (use Kv).get("a") }
+}
+
+fn overridden() -> String {
+  with RemoteKv(url: url()), FakeKv { (use Kv).get("a") }
+}
+
+layer Failing {
+  RemoteKv(url: url())
+}

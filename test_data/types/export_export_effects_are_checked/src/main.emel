@@ -1,0 +1,6 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+@export(js, "f")
+pub fn f() { (use Logger).info("x") }

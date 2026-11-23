@@ -1,0 +1,8 @@
+type Config(port: Int)  # 補
+
+const MAX_RETRY = 3
+const DEFAULT_CONFIG = Config(port: 8080)
+
+fn port() -> Int {
+  DEFAULT_CONFIG.port + MAX_RETRY
+}

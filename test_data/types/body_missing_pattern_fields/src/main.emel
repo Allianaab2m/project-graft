@@ -1,0 +1,7 @@
+type Account(id: Int, name: String, email: String)
+
+fn f(a: Account) -> Int {
+  Account(name:) = a
+  Account(name:, ..) = a
+  1
+}

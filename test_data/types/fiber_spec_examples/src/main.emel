@@ -1,0 +1,54 @@
+import Std.Fiber.{Fiber, Scope}
+import Std.Deferred.{Deferred}
+
+error NotFound(id: Int)
+
+type User(name: String)
+type Order(id: Int)
+type Profile(user: User, orders: List[Order])
+
+effect Users {
+  suspend fn find(id: Int) -> User fails NotFound
+}
+
+fn fetch_user(id: Int) -> User fails NotFound uses { Users } {
+  (use Users).find(id)
+}
+
+fn fetch_orders(id: Int) -> List[Order] {
+  [Order(id:)]
+}
+
+fn profile() {
+  Fiber.scope(|| {
+    s = use Scope
+    a = s.fork(|| fetch_user(1))
+    b = s.fork(|| fetch_orders(1))
+    Profile(user: Fiber.join(a), orders: Fiber.join(b))
+  })
+}
+
+fn wrapped() {
+  Fiber.scope(|| {
+    a = Fiber.fork(|| fetch_user(1))
+    Fiber.join(a)
+  })
+}
+
+fn pairs() {
+  (user, orders) = Fiber.both(|| fetch_user(1), || fetch_orders(1))
+  users = Fiber.map([1, 2], |id| fetch_user(id))
+  firsts = Fiber.all([|| fetch_user(1), || fetch_user(2)])
+  fastest = Fiber.race([|| fetch_user(1), || fetch_user(2)])
+  (user, users)
+}
+
+fn signal() -> Int uses { Async } {
+  Fiber.scope(|| {
+    ready = Fiber.deferred()
+    Fiber.fork(|| Deferred.complete(ready, 1))
+    n = Deferred.await(ready)
+    peek = Deferred.poll(ready)
+    n
+  })
+}

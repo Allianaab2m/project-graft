@@ -1,0 +1,8 @@
+fn f(c: Bool, n: Int) -> String {
+  a = if c { 1 } else { 2 }
+  b = if c { "x" } else { panic("no") }
+  d = if c { todo() } else { (n, "y") }
+  e = if c { () }
+  g = if c { panic("stop") }
+  "ok"
+}

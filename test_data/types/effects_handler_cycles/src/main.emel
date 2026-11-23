@@ -1,0 +1,19 @@
+effect Ping {
+  fn ping() -> ()
+}
+
+effect Pong {
+  fn pong() -> ()
+}
+
+handler HPing: Ping {
+  fn ping() { (use Pong).pong() }
+}
+
+handler HPong: Pong {
+  fn pong() { (use Ping).ping() }
+}
+
+fn f() {
+  with HPing, HPong { (use Ping).ping() }
+}

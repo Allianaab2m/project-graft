@@ -1,0 +1,4 @@
+error Timeout
+
+@export(js, "default", "serve")
+pub fn serve(app: fn(Int) -> Int fails {} uses {}) -> Int { app(1) }

@@ -1,0 +1,10 @@
+type User(id: Int, name: String)
+
+fn f(us: List[User], ps: List[(Int, Bool)], os: List[Option[Int]]) -> List[Int] {
+  a = List.map(us, |User(id:, ..)| id)
+  b = List.map(ps, |(n, _)| n)
+  c = List.map(os, |Some(x)| x)
+  d = List.map(ps, |(n, True)| n)
+  e = List.fold(ps, from: 0, f: |acc, (n, _): (Int, Bool)| acc + n)
+  List.flatten([a, b, c, d, [e]])
+}

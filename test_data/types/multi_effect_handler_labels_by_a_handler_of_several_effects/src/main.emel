@@ -1,0 +1,19 @@
+effect Replica of Query
+
+handler Plain: Query + Execute {
+  fn query(sql) { 0 }
+  fn execute(sql) { () }
+}
+
+handler Notes: Audit + Execute {
+  fn note(msg) { () }
+  fn execute(sql) { () }
+}
+
+fn replica() -> Int {
+  with Replica by Plain { (use Replica).query("a") }
+}
+
+fn wrong() -> Int {
+  with Replica by Notes { (use Replica).query("a") }
+}

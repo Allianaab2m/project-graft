@@ -1,0 +1,21 @@
+handler Everything: Query + Execute + Audit {
+  fn query(sql) { 0 }
+  fn execute(sql) { () }
+  fn note(msg) { () }
+}
+
+fn read_only(q: use Query) -> Int { q.query("a") }
+
+fn read_write(rw: use Query + Execute) -> Int {
+  rw.execute("b")
+  read_only(rw)
+}
+
+fn audited(c: use Audit + Query + Execute) -> Int {
+  c.note("c")
+  read_write(c) + read_only(c)
+}
+
+fn all() -> Int {
+  with e = Everything { audited(e) }
+}

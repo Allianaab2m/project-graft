@@ -1,0 +1,19 @@
+error NotFound(id: Int)  # 補
+
+fn greet(id: Int) -> String fails NotFound { fail NotFound(id:) }  # 補
+
+@test
+fn greet_fails_for_unknown_id() {
+  result = Some(greet(999)) escape { NotFound(_) -> None }
+  assert result == None
+}
+
+@test
+fn greet_returns_user() {
+  name = greet(1)
+  assert name == "alice"
+}
+
+fn main() {
+  greet(1)
+}

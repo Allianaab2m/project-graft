@@ -1,0 +1,18 @@
+effect Marker {
+  fn mark() -> ()
+}
+
+@external(js, "./x.mjs", "a")
+fn with_marker() -> () uses { Marker }
+
+@external(js, "./x.mjs", "b")
+fn with_async() -> () uses { Async }
+
+@external(js, "./x.mjs", "c")
+fn with_set[R](f: fn() -> () uses { R }) -> () uses { R }
+
+@external(js, "./x.mjs", "d")
+fn with_host() -> () uses { ProcessHost, PageHost }
+
+@external(js, "./x.mjs", "e")
+fn pure() -> () uses {}

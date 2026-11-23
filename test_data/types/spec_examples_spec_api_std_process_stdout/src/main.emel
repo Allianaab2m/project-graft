@@ -1,0 +1,21 @@
+import Std.Process.{Process, Stderr, StderrText, Stdout, StdoutText, TestStderr, TestStdout}
+import Std.State.{State}
+
+fn main() {
+  with Process {
+    (use Stdout).print("Hello, ")
+    (use Stdout).print_line("alice!")
+  }
+}
+
+fn greet(name: String) -> () uses { Stdout, Stderr } {
+  (use Stdout).print_line("Hello, #{name}!")
+  (use Stderr).print_line("greeted #{name}")
+}
+
+fn greets() -> Bool {
+  ((_, err), out) = State.run(StdoutText(text: ""), || {
+    State.run(StderrText(text: ""), || with TestStdout, TestStderr { greet("alice") })
+  })
+  out.text == "Hello, alice!\n" && err.text == "greeted alice\n"
+}

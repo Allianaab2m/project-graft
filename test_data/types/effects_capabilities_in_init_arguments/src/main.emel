@@ -1,0 +1,27 @@
+effect Config {
+  fn url() -> String
+}
+
+effect Kv {
+  fn get(key: String) -> String
+}
+
+handler LazyKv(url: fn() -> String uses { Config }): Kv {
+  init(url: fn() -> String uses { Config }) { LazyKv(url:) }
+  fn get(key) { (self.url)() }
+}
+
+handler TakesString(url: String): Kv {
+  init(url: String) { TakesString(url:) }
+  fn get(key) { self.url }
+}
+
+fn closure() {
+  c = use Config
+  with LazyKv(url: || c.url()) { (use Kv).get("a") }
+}
+
+fn value() {
+  c = use Config
+  with TakesString(url: c) { (use Kv).get("a") }
+}

@@ -1,0 +1,3 @@
+fn connect(host: String, port: Int) -> () uses {} { todo() }
+fn map[A, B](xs: List[A], f: fn(A) -> B) -> List[B] uses {} { todo() }
+fn inferred(x: Int) { x }

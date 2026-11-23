@@ -1,0 +1,4 @@
+import Std.Process.{EXIT_SUCCESS, ExitCode}
+
+@export(js, "f")
+pub fn f() -> ExitCode { EXIT_SUCCESS }

@@ -1,0 +1,42 @@
+effect Log {
+  fn info(msg: String) -> ()
+}
+
+fn inferred() {
+  fn say(m: String) {
+    log = use Log
+    log.info(m)
+  }
+  say("a")
+}
+
+fn never_called() -> Int {
+  fn say(m: String) {
+    log = use Log
+    log.info(m)
+  }
+  1
+}
+
+fn declared() uses { Log } {
+  fn say(m: String) -> () uses { Log } {
+    log = use Log
+    log.info(m)
+  }
+  say("a")
+}
+
+fn undeclared() {
+  fn say(m: String) -> () uses {} {
+    log = use Log
+    log.info(m)
+  }
+  say("a")
+}
+
+fn returns_capability() {
+  fn get() {
+    use Log
+  }
+  get()
+}

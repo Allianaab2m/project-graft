@@ -1,0 +1,11 @@
+type User(id: Int, name: String)
+type Pair[A, B](first: A, second: B)
+enum Shape {
+  Circle(radius: Float)
+  Empty
+}
+error NotFound(id: Int)
+
+fn user(u: User) -> Pair[User, Shape] uses {} { todo() }
+fn option(x: Option[Int]) -> Option[Option[String]] uses {} { todo() }
+fn err(e: NotFound) -> NotFound uses {} { todo() }

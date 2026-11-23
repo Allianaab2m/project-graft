@@ -1,0 +1,39 @@
+error Boom
+
+effect Logger {
+  fn info(msg: String) -> ()
+  fn warn(msg: String) -> () fails Boom
+}
+
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+}
+
+handler Half: Logger {
+  fn info(msg) { () }
+}
+
+handler Twice: Logger {
+  fn info(msg) { () }
+  fn info(msg) { () }
+  fn warn(a, b) { () }
+}
+
+handler Fails: Logger {
+  fn info(msg) { fail Boom }
+  fn warn(msg) { fail Boom }
+}
+
+handler Typed: Logger {
+  fn info(msg) { msg + 1 }
+  fn warn(msg) { self }
+}
+
+handler Stateful(n: Int): Logger {
+  fn info(msg) { () }
+  fn warn(msg) { () }
+}
+
+handler Sleepy: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+}

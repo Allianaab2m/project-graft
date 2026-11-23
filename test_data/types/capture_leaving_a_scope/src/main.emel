@@ -1,0 +1,29 @@
+import Std.Fiber.{Fiber, Scope}
+
+fn scope_closure() -> fn() -> Fiber[Int] {
+  Fiber.scope(|| {
+    s = use Scope
+    || s.fork(|| 1)
+  })
+}
+
+fn handle_in_a_closure() -> fn() -> Int {
+  Fiber.scope(|| {
+    h = Fiber.fork(|| 1)
+    || Fiber.join(h)
+  })
+}
+
+fn deferred_in_a_list() -> List[fn() -> Option[Int]] {
+  Fiber.scope(|| {
+    d = Fiber.deferred()
+    [|| d.poll()]
+  })
+}
+
+fn piped() -> fn() -> Fiber[Int] {
+  (|| {
+    s = use Scope
+    || s.fork(|| 1)
+  }) |> Fiber.scope()
+}

@@ -1,0 +1,40 @@
+effect Config {
+  fn url() -> String
+}
+
+effect Kv {
+  fn get(key: String) -> String
+}
+
+effect AuditKv of Kv
+
+handler EnvConfig: Config {
+  fn url() { "kv://" }
+}
+
+handler RemoteKv(url: String): Kv {
+  init(url: String) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+handler FakeKv: Kv {
+  fn get(key) { "" }
+}
+
+fn own_config() {
+  with EnvConfig, RemoteKv(url: (use Config).url()) { (use Kv).get("a") }
+}
+
+fn overridden() {
+  with RemoteKv(url: (use Config).url()), FakeKv { (use Kv).get("a") }
+}
+
+fn label() {
+  with AuditKv by RemoteKv(url: (use Config).url()) { (use AuditKv).get("a") }
+}
+
+fn main() {
+  with EnvConfig {
+    with EnvConfig, RemoteKv((use Config).url()) { (use Kv).get("a") }
+  }
+}

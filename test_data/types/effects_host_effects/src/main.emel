@@ -1,0 +1,46 @@
+effect Files {
+  fn read(path: String) -> String
+}
+
+@external(js, "./fs.mjs", "readText")
+fn read_host(path: String) -> String uses { ProcessHost }
+
+@external(js, "./dom.mjs", "title")
+fn title_host() -> String uses { PageHost }
+
+handler SystemFiles: Files {
+  fn read(path) { read_host(path) }
+}
+
+handler PageFiles: Files {
+  fn read(path) { title_host() }
+}
+
+handler Process: ProcessHost {
+}
+
+handler Page: PageHost {
+}
+
+fn grab() { use ProcessHost }
+
+fn declared() -> Int uses { ProcessHost } { 1 }
+
+fn outside() { read_host("x") }
+
+fn load() -> String { with SystemFiles { (use Files).read("a") } }
+
+fn in_page() -> String { with PageFiles { (use Files).read("a") } }
+
+fn provided() -> Int { with Process { declared() } }
+
+fn main() {
+  load()
+  declared()
+  in_page()
+}
+
+fn test_load() {
+  load()
+  in_page()
+}

@@ -1,0 +1,16 @@
+effect Kv {
+  fn get(key: String) -> String
+}
+
+handler RemoteKv(url: String): Kv {
+  init(url: String) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+fn ok() {
+  with RemoteKv(url: "a") { (use Kv).get("a") }
+}
+
+fn bad() {
+  RemoteKv(url: "a")
+}

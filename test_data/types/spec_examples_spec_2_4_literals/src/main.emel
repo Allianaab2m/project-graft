@@ -1,0 +1,13 @@
+fn literals(id: Int) -> String {
+  hex = 0xFF
+  bin = 0b1010
+  big: Int64 = 0xFFFF_FFFF
+  million = 1_000_000
+  ratio = 1.0e9
+  query = """
+    SELECT *
+    FROM users
+    WHERE id = #{id}
+    """
+  query
+}

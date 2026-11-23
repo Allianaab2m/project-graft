@@ -1,0 +1,20 @@
+error Boom
+error Bad
+
+fn fx() -> Int fails Boom { fail Boom }
+fn fy() -> Int fails Bad { fail Bad }
+
+fn pick(c: Bool) {
+  f = if c { fx } else { fy }
+  f()
+}
+
+fn all() {
+  fs = [fx, fy]
+  fs
+}
+
+fn annotated() {
+  h: fn() -> Int = fx
+  h()
+}

@@ -1,0 +1,53 @@
+error NotFound(id: Int)
+error DbError
+error Other
+
+fn load(id: Int) -> Int fails NotFound | DbError { fail DbError }
+
+fn all() {
+  load(1) escape { _ -> 0 }
+}
+
+fn after_ctor() {
+  load(1) escape {
+    NotFound(id: 1) -> 1
+    _ -> 0
+  }
+}
+
+fn arm_fails() {
+  load(1) escape { _ -> fail Other }
+}
+
+fn or_else[A, E](f: fn() -> A fails E, default: A) -> A {
+  f() escape { _ -> default }
+}
+
+fn hidden[A](f: fn() -> A, default: A) -> A {
+  f() escape { _ -> default }
+}
+
+fn set_param[E](f: fn() -> Int fails E) -> Int {
+  f() escape { _ -> 0 }
+}
+
+fn error_param[E](err: E) -> Int {
+  { fail err } escape { _ -> 0 }
+}
+
+fn inferred() {
+  |g| g() escape { _ -> 0 }
+}
+
+fn local() {
+  f = || load(2)
+  f() escape { _ -> 0 }
+}
+
+fn caller() -> Int {
+  or_else(|| load(3), 0) + set_param(|| load(4)) + inferred()(|| load(5))
+}
+
+fn hidden_caller() {
+  hidden(|| load(6), 0)
+}

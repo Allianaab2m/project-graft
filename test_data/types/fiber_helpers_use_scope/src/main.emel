@@ -1,0 +1,44 @@
+import Std.Fiber.{Fiber, Scope}
+
+error Boom
+error Bust
+
+effect Log {
+  fn info(msg: String) -> ()
+}
+
+fn boom() -> Int fails Boom { fail Boom }
+
+fn bust() -> Int fails Bust { fail Bust }
+
+fn spawn_boom() {
+  Fiber.fork(|| boom())
+}
+
+fn spawn_log() {
+  (use Scope).fork(|| (use Log).info("hi"))
+}
+
+fn declared() -> Fiber[Int] uses { Scope[Bust, {}] } {
+  Fiber.fork(|| bust())
+}
+
+fn both_helpers() {
+  Fiber.scope(|| {
+    a = spawn_boom()
+    b = spawn_log()
+    c = declared()
+    Fiber.join(a)
+  })
+}
+
+fn outer_scope() {
+  Fiber.scope(|| {
+    outer = use Scope
+    Fiber.scope(|| {
+      outer.fork(|| boom())
+      Fiber.fork(|| (use Log).info("inner"))
+      ()
+    })
+  })
+}

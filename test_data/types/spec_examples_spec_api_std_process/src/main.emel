@@ -1,0 +1,22 @@
+import Std.Console.{Console}
+import Std.Process.{Args, Stdin, InvalidInput, Process, StdinFailure}
+
+fn quote(prefix: String) -> () fails InvalidInput | StdinFailure uses { Console, Stdin } {
+  (use Stdin).read_line() match {
+    None -> ()
+    Some(line) -> {
+      (use Console).print_line("#{prefix}#{line}")
+      quote(prefix)
+    }
+  }
+}
+
+fn main() {
+  with Process {
+    prefix = (use Args).get(0) match {
+      Some(p) -> p
+      None    -> "> "
+    }
+    quote(prefix)
+  }
+}

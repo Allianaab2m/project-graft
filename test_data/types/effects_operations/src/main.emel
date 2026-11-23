@@ -1,0 +1,16 @@
+error NotFound(id: Int)
+
+effect Users {
+  fn find(id: Int) -> String fails NotFound
+}
+
+fn by_label() {
+  users = use Users
+  users.find(id: 1)
+}
+
+fn wrong() {
+  users = use Users
+  a = users.find("x")
+  users.fnd(1)
+}

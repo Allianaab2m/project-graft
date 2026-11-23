@@ -1,0 +1,40 @@
+trait Area {
+  fn area(self) -> Int
+}
+
+trait Shape: Area {
+  fn name(self) -> String
+}
+
+type Square(side: Int)
+  derive Show
+
+type Greeter(greet: fn(String) -> String)
+
+impl Square: Area {
+  fn area(self) { self.side * self.side }
+}
+
+impl Square: Shape {
+  fn name(self) { "square" }
+}
+
+fn call_field(g: Greeter) {
+  g.greet("hi")
+}
+
+fn traits(s: Square) {
+  "#{s.show()} #{s.area()} #{s.name()}"
+}
+
+fn total[A: Area](xs: List[A]) -> Int {
+  xs.fold(from: 0, f: |n, x| n + x.area())
+}
+
+fn through_super[A: Shape](x: A) -> Int {
+  x.area()
+}
+
+fn unbounded[A](x: A) -> Int {
+  x.area()
+}

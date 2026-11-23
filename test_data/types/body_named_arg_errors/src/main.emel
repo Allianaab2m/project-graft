@@ -1,0 +1,10 @@
+fn connect(host: String, port: Int) -> Bool { todo() }
+
+fn f(g: fn(Int) -> Int) -> Int {
+  a = connect("x", prot: 1)
+  b = connect("x", host: "y")
+  c = connect(port: "no")
+  d = Some(value: 1)
+  e = g(x: 1)
+  1
+}

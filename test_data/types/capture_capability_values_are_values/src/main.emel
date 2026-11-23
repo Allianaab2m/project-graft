@@ -1,0 +1,32 @@
+type Pair(first: use Db, second: use Db)
+
+fn copy(from: use Db, to: use Db) -> Int {
+  to.query("#{from.query("...")}")
+}
+
+fn pick(primary: use Db, replica: use Db, write: Bool) -> use Db {
+  if write { primary } else { replica }
+}
+
+fn first(dbs: List[use Db]) -> Option[use Db] {
+  dbs match {
+    [db, ..] -> Some(db)
+    _ -> None
+  }
+}
+
+fn pass[A](x: A) -> A { x }
+
+fn caller() -> Int {
+  with PrimaryDb {
+    primary = use Db
+    with ReplicaDb {
+      replica = use Db
+      pair = Pair(first: primary, second: replica)
+      both = [primary, replica]
+      chosen = pick(primary, replica, True)
+      same = pass(replica)
+      copy(replica, primary) + chosen.query("x") + same.query("y") + pair.first.query("z")
+    }
+  }
+}

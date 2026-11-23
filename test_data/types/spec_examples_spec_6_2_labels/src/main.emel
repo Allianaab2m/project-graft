@@ -1,0 +1,7 @@
+fn connect(host: String, port: Int) { () }
+
+fn calls() {
+  connect("localhost", 5432)
+  connect("localhost", port: 5432)
+  connect(host: "localhost", port: 5432)
+}

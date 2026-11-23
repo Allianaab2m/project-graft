@@ -1,0 +1,23 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int { f(x) }
+
+fn update[A, R](x: A, f: fn(A) -> A uses { R }) -> A uses { R } { f(x) }
+
+fn make() {
+  || (use Logger).info("later")
+}
+
+fn callers() {
+  a = apply(|n| { (use Logger).info("n")
+  n }, 1)
+  b = update(1, |n| n + 1)
+  c = List.map([1], |n| (use Logger).info("m"))
+  f = make()
+}
+
+fn caller() {
+  |g| g()
+}

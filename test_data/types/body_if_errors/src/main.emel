@@ -1,0 +1,6 @@
+fn f(n: Int) -> Int {
+  a = if n { 1 } else { 2 }
+  b = if True { 1 } else { "a" }
+  c = if True { 1 }
+  n
+}

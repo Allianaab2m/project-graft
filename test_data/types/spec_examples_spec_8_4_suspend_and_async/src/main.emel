@@ -1,0 +1,33 @@
+type Instant(ms: Int)  # 補
+
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+  fn now() -> Instant
+}
+
+@external(js, "setTimeout")  # 補
+fn set_timeout(ms: Int, f: fn() -> ()) -> ()
+
+@external(js, "Date.now")  # 補
+fn date_now() -> Instant
+
+handler SystemClock: Clock {
+  suspend fn sleep(ms, resume) {
+    set_timeout(ms, || resume(()))
+  }
+  fn now() { date_now() }
+}
+
+handler InstantClock: Clock {  # 補
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() { Instant(ms: 0) }
+}
+
+fn nap() {  # 補
+  (use Clock).sleep(1000)
+  (use Clock).now()
+}
+
+fn real() { with SystemClock { nap() } }  # 補
+
+fn instant() { with InstantClock { nap() } }  # 補

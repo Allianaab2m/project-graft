@@ -1,0 +1,4 @@
+fn f(x: Int) -> String {
+  y = dbg(x)
+  todo()
+}

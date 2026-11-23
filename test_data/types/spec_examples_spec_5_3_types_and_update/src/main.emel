@@ -1,0 +1,16 @@
+type User(id: Int, name: String)
+
+type Pair[A, B](first: A, second: B)
+
+type Todo(
+  id:        Int,
+  title:     String,
+  completed: Bool,
+)
+
+fn update(user: User, todo: Todo, p: Pair[Int, Bool]) -> Pair[String, Bool] {
+  renamed = User(name: "b", ..user)
+  fixed   = Todo(title: "Buy milk", completed: True, ..todo)
+  name = renamed.name
+  Pair(first: "s", ..p)
+}

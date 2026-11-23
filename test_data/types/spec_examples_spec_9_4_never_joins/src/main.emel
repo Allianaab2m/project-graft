@@ -1,0 +1,8 @@
+fn pick(c: Bool, n: Int) -> Int {
+  a = if c { n } else { panic("no") }
+  b = c match {
+    True -> todo()
+    False -> n
+  }
+  a + b
+}

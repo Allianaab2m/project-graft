@@ -1,0 +1,9 @@
+error NotFound(id: Int)
+error Unauthorized
+
+fn values() -> Int {  # 補
+  e = NotFound(id: 1)
+  es = [e, NotFound(id: 2)]
+  u = Unauthorized
+  e.id
+}

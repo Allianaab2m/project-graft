@@ -1,0 +1,33 @@
+effect Clock {
+  suspend fn wait() -> Int
+  fn now() -> Int
+}
+
+effect Kv {
+  fn get(key: String) -> String
+}
+
+handler Slow(ms: Int): Kv {
+  init(ms: Int) { Slow(ms:) }
+  fn get(key) { "" }
+}
+
+handler Kept(k: fn(Int) -> ()): Kv {
+  init(k: fn(Int) -> ()) { Kept(k:) }
+  fn get(key) { "" }
+}
+
+handler Fast: Kv {
+  fn get(key) { "" }
+}
+
+handler Ticking: Clock {
+  suspend fn wait(resume) {
+    with Kept(k: resume), Fast { resume(1) }
+  }
+  fn now() {
+    (use Clock).wait()
+    with Slow(ms: (use Clock).wait()), Fast { (use Kv).get("a") }
+    1
+  }
+}

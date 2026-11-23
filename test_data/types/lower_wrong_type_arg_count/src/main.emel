@@ -1,0 +1,6 @@
+type Pair[A, B](first: A, second: B)
+
+fn too_many(x: List[Int, Int]) -> Int[String] uses {} { todo() }
+fn too_few(x: List) -> Option uses {} { todo() }
+fn pair(p: Pair[Int]) -> Bool[Int] uses {} { todo() }
+fn param[Item](x: Item[Int]) -> Int uses {} { todo() }

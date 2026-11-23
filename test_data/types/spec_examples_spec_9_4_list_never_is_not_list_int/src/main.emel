@@ -1,0 +1,6 @@
+fn nothing() -> List[Never] { [] }
+
+fn f() -> Int {
+  xs: List[Int] = nothing()
+  1
+}

@@ -21,6 +21,7 @@ import Syntax.Cst.{
 import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, lookup, is_core}
 import Syntax.Parse
 import Resolve
+import Typeck
 import Syntax.Sink
 import Syntax.Source.{slice}
 import Syntax.Tree.{Diagnostic, Import, ImportList, Error}
@@ -171,10 +172,24 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
     []
   } else {
     resolved = Resolve.resolve(map, reads.map_values(|r| (r.src, r.parsed.tree)))
-    resolved.diagnostics.map(|d| {
+    resolve_diagnostics = resolved.diagnostics.map(|d| {
       file = get(map, d.module).map(|m| m.file).or("")
       Checked(if d.warning { "warning" } else { "error" }, d.code, file, Some((d.start, d.end)))
     })
+    # Type checking runs on the program even when name resolution reported errors.
+    type_diagnostics = Typeck.check(resolved.program).map(|d| {
+      severity = if d.warning { "warning" } else { "error" }
+      d.span match {
+        Some(s) -> Checked(
+          severity,
+          d.code,
+          get(map, s.module).map(|m| m.file).or(""),
+          Some((s.start, s.end)),
+        )
+        None -> Checked(severity, d.code, "-", None)
+      }
+    })
+    resolve_diagnostics.append(type_diagnostics)
   }
   first.append(per_module).append(not_module).append(graph_diagnostics).append(checked)
 }

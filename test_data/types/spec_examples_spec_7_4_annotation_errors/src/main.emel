@@ -1,0 +1,14 @@
+error NotFound  # 補
+error DbError  # 補
+
+fn find() -> Int fails NotFound { fail NotFound }  # 補
+
+fn strict() -> Int {
+  find()
+}
+
+fn wrong() -> Int fails DbError {
+  find()
+}
+
+const VALUE: Int = find()  # 5.6 const の値は失敗できない

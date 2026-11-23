@@ -1,0 +1,27 @@
+error Boom
+error Bad(n: Int)
+
+fn steady() -> Int { 1 }
+fn fy(n: Int) -> Int fails Bad { fail Bad(n:) }
+
+fn never_raised() -> Int {
+  steady() escape { Boom -> 0 }
+}
+
+fn unknown[A](f: fn() -> A) -> A {
+  f() escape { Boom -> f() }
+}
+
+fn redundant() -> Int {
+  fy(1) escape {
+    Bad(_) -> 0
+    Bad(n: 1) -> 1
+  }
+}
+
+fn guarded() -> Int {
+  fy(1) escape {
+    Bad(n:) if n > 0 -> n
+    Bad(_) -> 0
+  }
+}

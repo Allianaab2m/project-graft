@@ -1,0 +1,11 @@
+error Invalid(input: String)  # 補
+
+fn label(count: Int) -> String {
+  label = if count > 0 { "あり" } else { "なし" }
+  label
+}
+
+fn validate(input: String, valid: Bool) -> String fails Invalid {  # 補
+  if !valid { fail Invalid(input:) }
+  input
+}

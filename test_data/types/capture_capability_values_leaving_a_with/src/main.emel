@@ -1,0 +1,43 @@
+fn pass[A](x: A) -> A { x }
+
+fn pick(primary: use Db, replica: use Db) -> use Db { primary }
+
+fn bare() -> use Db {
+  with PrimaryDb { use Db }
+}
+
+fn bound() -> use Db {
+  with PrimaryDb {
+    p = use Db
+    p
+  }
+}
+
+fn in_a_list() -> List[use Db] {
+  with PrimaryDb {
+    p = use Db
+    [p]
+  }
+}
+
+fn through_a_call() -> use Db {
+  with PrimaryDb {
+    p = use Db
+    with ReplicaDb {
+      r = use Db
+      pick(p, r)
+    }
+  }
+}
+
+fn through_pass() -> use Db {
+  with PrimaryDb { pass(use Db) }
+}
+
+fn outer_is_fine() -> Int {
+  with PrimaryDb {
+    p = use Db
+    q = with ReplicaDb { p }
+    q.query("x")
+  }
+}

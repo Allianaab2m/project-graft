@@ -1,0 +1,14 @@
+error Boom
+
+fn make() {
+  || fail Boom
+}
+
+fn call_local() {
+  f = || fail Boom
+  f()
+}
+
+fn call_made() {
+  make()()
+}

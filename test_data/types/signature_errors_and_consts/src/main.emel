@@ -1,0 +1,4 @@
+error NotFound(id: Int)
+error Timeout
+const MAX_RETRY: Int = 3
+const INFERRED = 3

@@ -1,0 +1,15 @@
+fn take64(n: Int64) -> Int64 { n }
+
+fn f() -> Int {
+  a = 1
+  b: Int64 = 3_000_000_000
+  c = take64(42)
+  d: Int = 2147483647
+  e: Int = 2147483648
+  g: Int = 0xFFFF_FFFF
+  h: Int64 = 0xFFFF_FFFF
+  i: Int = 0b1010
+  j: Float = 1
+  k: String = 2
+  a
+}

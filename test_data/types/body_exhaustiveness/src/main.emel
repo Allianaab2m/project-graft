@@ -1,0 +1,57 @@
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+
+fn area(s: Shape) -> Float {
+  s match {
+    Circle(radius:) -> radius
+    Rect(w, h) -> w * h
+  }
+}
+
+fn guarded(o: Option[Int]) -> Int {
+  o match {
+    Some(x) if x > 0 -> x
+    None -> 0
+  }
+}
+
+fn nested(o: Option[Option[Bool]]) -> Int {
+  o match {
+    Some(Some(True)) -> 1
+    None -> 0
+  }
+}
+
+fn lists(xs: List[Int]) -> Int {
+  xs match {
+    [] -> 0
+    [x] -> x
+  }
+}
+
+fn bools(a: Bool, b: Bool) -> Int {
+  (a, b) match {
+    (True, _) -> 1
+    (False, True) -> 2
+    (False, False) -> 3
+  }
+}
+
+fn literals(n: Int) -> String {
+  n match {
+    0 -> "zero"
+    1 -> "one"
+  }
+}
+
+fn named(u: Option[Shape]) -> Int {
+  u match {
+    Some(Circle(radius: _)) -> 1
+    Some(Rect(..)) -> 2
+    Some(Empty) -> 3
+    None -> 4
+  }
+}

@@ -1,0 +1,42 @@
+effect Log {
+  fn log(msg: String) -> ()
+}
+
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+}
+
+effect Audit of Log
+effect Debug of Log default
+effect Other of Log
+effect Ticks of Clock
+
+handler PrintLog: Log {
+  fn log(msg) { () }
+}
+
+handler Tagged: Log {
+  fn log(msg) { (use Other).log(msg) }
+}
+
+fn a() { (use Log).log("a") }
+
+fn c() {
+  with Audit { a() }
+  with Debug { a() }
+}
+
+fn direct() { (use Audit).log("x") }
+
+fn run_hidden(f: fn() -> ()) { with PrintLog { f() } }
+
+fn main() {
+  with PrintLog, Audit by Log { c() }
+  with PrintLog, Audit by PrintLog, Debug by Tagged, Other by Log { c() }
+  with Audit by PrintLog { direct() }
+  with PrintLog, Audit by Log { with Other by Audit { run_hidden(|| (use Other).log("y")) } }
+}
+
+fn ticks[R: Immediate](f: fn() -> () uses { R }) { f() }
+
+fn sleeps() { ticks(|| (use Ticks).sleep(1)) }

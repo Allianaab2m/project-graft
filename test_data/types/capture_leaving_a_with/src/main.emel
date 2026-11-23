@@ -1,0 +1,35 @@
+fn make_greeter() -> fn() -> () {
+  with FileLogger {
+    log = use Logger
+    || log.info("hi")
+  }
+}
+
+fn nested() {
+  with PrimaryDb {
+    p = use Db
+    with ReplicaDb {
+      r = use Db
+      f = || r.query("...")
+      [f]
+    }
+  }
+}
+
+fn used_up(names: List[String]) {
+  with ConsoleLogger {
+    log = use Logger
+    names.map(|n| log.info(n))
+  }
+}
+
+fn outer_is_fine() {
+  with PrimaryDb {
+    p = use Db
+    with ReplicaDb { || p.query("...") }
+  }
+}
+
+fn unbound() -> fn() -> () {
+  with ConsoleLogger { || (use Logger).info("hi") }
+}

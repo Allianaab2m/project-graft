@@ -1,0 +1,26 @@
+error NotFound  # 補
+
+fn or_fail[A, E](opt: Option[A], err: E) -> A fails E {  # 補
+  opt match {
+    Some(a) -> a
+    None -> fail err
+  }
+}
+
+fn not_error() {
+  fail 1
+}
+
+fn not_error_type() {
+  or_fail(Some(1), "no")
+}
+
+fn flaky() -> Int fails NotFound { fail NotFound }  # 補
+
+fn catch_variable() -> Int {
+  flaky() escape { e -> 1 }
+}
+
+fn catch_all_guarded(c: Bool) -> Int {
+  flaky() escape { _ if c -> 1 }
+}

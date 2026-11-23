@@ -1,0 +1,9 @@
+enum Shape {
+  Circle(radius: Float)     # 名前付き
+  Rect(Float, Float)        # 位置引数
+  Empty                     # 中身なし
+}
+
+fn shapes() -> List[Shape] {
+  [Circle(1.0), Circle(radius: 2.0), Rect(1.0, 2.0), Empty]
+}

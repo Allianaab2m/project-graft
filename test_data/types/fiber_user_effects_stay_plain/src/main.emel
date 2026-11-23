@@ -1,0 +1,16 @@
+effect Wrap {
+  fn wrap[A](x: A) -> List[A]
+}
+
+effect Raise[E] {
+  fn run(f: fn() -> () fails E) -> ()
+}
+
+@intrinsic
+effect Mine[E] {
+  fn go(f: fn() -> () fails E) -> ()
+}
+
+fn wrapped() -> List[Int] uses { Wrap } {
+  (use Wrap).wrap(1)
+}

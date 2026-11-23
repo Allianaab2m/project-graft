@@ -1,0 +1,45 @@
+import Std.Fiber.{Fiber, Scope}
+import Std.Console.{Console, SystemConsole}
+
+error Boom
+
+fn boom() -> Int fails Boom { fail Boom }
+
+fn main() {
+  with SystemConsole {
+    Fiber.scope(|| {
+      Fiber.fork(|| {
+        Fiber.fork(|| (use Console).print_line("x"))
+        ()
+      })
+      ()
+    })
+  }
+}
+
+fn through_capability() {
+  Fiber.scope(|| {
+    s = use Scope
+    s.fork(|| {
+      s.fork(|| boom())
+      ()
+    })
+    ()
+  })
+}
+
+fn spawn_tree(depth: Int) -> () uses { Scope[Boom, {}] } {
+  if depth > 0 {
+    Fiber.fork(|| {
+      spawn_tree(depth - 1)
+      boom()
+    })
+    ()
+  } else {
+    ()
+  }
+}
+
+fn recursive() {
+  Fiber.scope(|| spawn_tree(3))
+}

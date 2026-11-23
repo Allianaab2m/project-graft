@@ -1,0 +1,11 @@
+type User(id: Int, name: String)
+
+fn f(o: Option[Int], xs: List[Int], u: User, p: (Int, Bool)) -> Int {
+  Some(x) = o
+  [y, ..rest] = xs
+  0 = x
+  User(id:, ..) = u
+  (n, True) = p
+  (m, b) = p
+  id
+}

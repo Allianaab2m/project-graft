@@ -1,0 +1,7 @@
+fn g(x: Int, s: String) {
+  y = x
+  (y, s, 1.0)
+}
+fn unit() {
+  x = 1
+}

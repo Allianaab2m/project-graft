@@ -1,0 +1,20 @@
+error NotFound(id: Int)
+
+fn or_fail[A, E](opt: Option[A], err: E) -> A fails E {
+  opt match {
+    Some(a) -> a
+    None -> fail err
+  }
+}
+
+fn first(xs: List[Int]) {
+  xs |> List.head |> or_fail(NotFound(id: 0))
+}
+
+fn raise_any[E](err: E) {
+  fail err
+}
+
+fn use_raise() {
+  raise_any(NotFound(id: 1))
+}

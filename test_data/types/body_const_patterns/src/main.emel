@@ -1,0 +1,91 @@
+enum Shape {
+  Circle(Int)
+  Rect(w: Int, h: Int)
+  Empty
+}
+
+const NOTHING = Empty
+const ORIGIN = Circle(0)
+const SQUARE = Rect(h: 1, w: 1)
+const PAIR = (NOTHING, -1)
+const MINUS_ONE = -1
+const ALSO_MINUS_ONE = MINUS_ONE
+const DIGITS = [1, 2]
+const MORE = [0, ..DIGITS]
+const COMPUTED = Circle(zero())
+const LIMIT = zero() + 10
+
+fn zero() -> Int { 0 }
+
+fn known(s: Shape) -> Int {
+  s match {
+    NOTHING -> 0
+    Circle(_) -> 1
+    Rect(..) -> 2
+  }
+}
+
+fn known_redundant(s: Shape) -> Int {
+  s match {
+    Circle(_) -> 1
+    Rect(w: 1, h: 1) -> 2
+    SQUARE -> 3
+    ORIGIN -> 4
+    _ -> 5
+  }
+}
+
+fn tuples(p: (Shape, Int)) -> Int {
+  p match {
+    (Circle(_), _) -> 0
+    (Rect(..), _) -> 1
+    (Empty, 0) -> 2
+    PAIR -> 3
+    (Empty, _) -> 4
+    (NOTHING, _) -> 5
+  }
+}
+
+fn negatives(n: Int) -> Int {
+  n match {
+    MINUS_ONE -> 0
+    ALSO_MINUS_ONE -> 1
+    _ -> 2
+  }
+}
+
+fn lists(xs: List[Int]) -> Int {
+  xs match {
+    MORE -> 0
+    [0, 1, 2] -> 1
+    _ -> 2
+  }
+}
+
+fn computed_not_counted(s: Shape) -> Int {
+  s match {
+    COMPUTED -> 0
+    Rect(..) -> 1
+  }
+}
+
+fn computed_covers_nothing(s: Shape) -> Int {
+  s match {
+    COMPUTED -> 0
+    Circle(_) -> 1
+    Rect(..) -> 2
+    Empty -> 3
+  }
+}
+
+fn computed_redundant(n: Int) -> Int {
+  n match {
+    _ -> 0
+    LIMIT -> 1
+  }
+}
+
+fn computed_binding(s: Shape) -> Int {
+  COMPUTED = s
+  0
+}

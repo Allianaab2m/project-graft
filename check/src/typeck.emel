@@ -1,0 +1,22 @@
+## Type checking of a resolved program. Follows `check.rs` of the reference type checker: builds
+## the table of named types, collects the declared signatures, then infers the bodies.
+##
+## So far only the declarations are checked.
+import Hir.{Program}
+import Signature
+import Tylower.{TyDiag, new_table}
+
+## The diagnostics of type checking, sorted by module and start position (stable), as the
+## reference reports them. Those without a location come first.
+pub fn check(program: Program) -> List[TyDiag] {
+  table = new_table(program)
+  (_, diags) = Signature.collect(program, table)
+  diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
+}
+
+fn position(d: TyDiag) -> (Int, Int, Int) {
+  d.span match {
+    Some(s) -> (1, s.module, s.start)
+    None    -> (0, 0, 0)
+  }
+}

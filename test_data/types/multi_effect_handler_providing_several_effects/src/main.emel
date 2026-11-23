@@ -1,0 +1,21 @@
+handler Counter(n: Int): Store[Int] + Audit {
+  init { Counter(n: 0) }
+  fn load() { self.n }
+  fn note(msg) { () }
+}
+
+fn both() -> Int uses { Query, Execute } {
+  (use Execute).execute("x")
+  (use Query).query("y")
+}
+
+fn run_both() -> Int {
+  with SystemTx(url: "db") { both() }
+}
+
+fn counted() -> Int {
+  with Counter {
+    (use Audit).note("a")
+    (use Store[Int]).load()
+  }
+}

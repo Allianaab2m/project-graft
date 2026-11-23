@@ -1,0 +1,78 @@
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+  fn now() -> Int
+}
+
+effect Ask {
+  suspend fn ask() -> Int
+}
+
+@external(js, "setTimeout")
+fn set_timeout(ms: Int, f: fn() -> ()) -> ()
+
+fn later(f: fn(()) -> ()) { () }
+
+handler InstantClock: Clock {
+  suspend fn sleep(ms, resume) { resume(()) }
+  fn now() { 0 }
+}
+
+handler SystemClock: Clock {
+  suspend fn sleep(ms, resume) {
+    set_timeout(ms, || resume(()))
+  }
+  fn now() { 0 }
+}
+
+handler Stored: Clock {
+  suspend fn sleep(ms, resume) {
+    r = resume
+    r(())
+  }
+  fn now() { 0 }
+}
+
+handler Passed: Clock {
+  suspend fn sleep(ms, resume) { later(resume) }
+  fn now() { 0 }
+}
+
+handler Piped: Ask {
+  suspend fn ask(resume) { 42 |> resume }
+}
+
+handler WrongValue: Ask {
+  suspend fn ask(resume) { resume("x") }
+}
+
+handler ReturnsValue: Ask {
+  suspend fn ask(resume) { 42 }
+}
+
+handler NoResume: Ask {
+  suspend fn ask() { () }
+}
+
+handler Mismatched: Clock {
+  fn sleep(ms) { () }
+  suspend fn now(resume) { resume(0) }
+}
+
+fn nap() {
+  (use Clock).sleep(10)
+  (use Clock).now()
+}
+
+fn instant() { with InstantClock { nap() } }
+
+fn waits() { with SystemClock { nap() } }
+
+fn pure_only() -> Int uses {} { with SystemClock { nap() } }
+
+fn main() {
+  with SystemClock { nap() }
+}
+
+fn test_waits() {
+  with SystemClock { nap() }
+}

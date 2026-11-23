@@ -1,0 +1,2 @@
+type User(id: Int, name: String)
+type Pair[A, B](first: A, second: B)

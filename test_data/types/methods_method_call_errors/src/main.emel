@@ -1,0 +1,25 @@
+type User(name: String)
+
+fn rename(u: User, name: String) -> User {
+  User(name:, ..u)
+}
+
+fn too_few(u: User) {
+  u.rename()
+}
+
+fn not_called(u: User) {
+  u.rename
+}
+
+fn misspelled(u: User) {
+  u.renmae("a")
+}
+
+fn tuple(p: (Int, Int)) {
+  p.first()
+}
+
+fn unknown() {
+  |x| x.rename("a")
+}

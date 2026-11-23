@@ -1,0 +1,28 @@
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+
+fn area(s: Shape) -> Float {
+  s match {
+    Circle(radius:) if True -> radius
+    Rect(w, h) -> w
+    Empty -> panic("empty")
+  }
+}
+
+fn first(xs: List[Int]) -> Option[Int] {
+  xs match {
+    [] -> None
+    [x, ..] -> Some(x)
+  }
+}
+
+fn label(n: Int) -> String {
+  r = n match {
+    0 -> "zero"
+    _ -> "many"
+  }
+  r
+}

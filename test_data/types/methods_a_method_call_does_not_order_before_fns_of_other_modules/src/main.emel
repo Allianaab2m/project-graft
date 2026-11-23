@@ -1,0 +1,11 @@
+fn run(f: fn() -> Int) -> Int {
+  [f()].get(0).or(0)
+}
+
+fn get(url: String) -> Int {
+  run(|| url.length())
+}
+
+fn main() -> Int {
+  get("x")
+}

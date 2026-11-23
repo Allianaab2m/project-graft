@@ -1,0 +1,28 @@
+effect Logger {  # 補
+  fn info(msg: String) -> ()
+}
+
+effect Clock {  # 補
+  fn now() -> Int
+}
+
+@external(js, "console.log")  # 補
+fn console_log(msg: String) -> ()
+
+handler ConsoleLogger: Logger {
+  fn info(msg) { console_log(msg) }
+}
+
+handler FixedClock: Clock {  # 補
+  fn now() { 0 }
+}
+
+fn greet(id: Int) {  # 補
+  (use Logger).info("hello")
+  (use Clock).now()
+}
+
+fn run() {  # 補．ConsoleLogger だけでは Clock が残る
+  with ConsoleLogger { greet(1) }
+  with ConsoleLogger, FixedClock { greet(1) }
+}

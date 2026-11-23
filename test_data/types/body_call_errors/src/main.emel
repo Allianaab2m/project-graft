@@ -1,0 +1,9 @@
+fn add(x: Int, y: Int) -> Int { x }
+
+fn f(n: Int) -> Int {
+  a = add(1)
+  b = add(1, 2, 3)
+  c = add("one", 2)
+  d = n(1)
+  a
+}

@@ -1,0 +1,28 @@
+fn count(f: use ReadFile) -> Int { f.read(1) }
+
+fn by_effect(path: String) {
+  with f = Files.Open(path), g = Files.Open("b") {
+    count(f) + g.read(2)
+  }
+}
+
+fn by_capability(fs: use Files, path: String) {
+  with f = fs.Open(path) {
+    count(f)
+  }
+}
+
+fn in_lambda(path: String) {
+  with f = Files.Open(path) {
+    read = || f.read(1)
+    read()
+  }
+}
+
+fn provided_here() {
+  with MemFiles, f = Files.Open("a") {
+    count(f)
+  } escape {
+    Missing -> 0
+  }
+}

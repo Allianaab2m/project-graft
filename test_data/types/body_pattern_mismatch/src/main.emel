@@ -1,0 +1,6 @@
+fn f(p: (Int, String)) -> Int {
+  (a, b, c) = p
+  (x, y) = 1
+  () = 1
+  1
+}

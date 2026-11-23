@@ -1,0 +1,46 @@
+effect Factory {
+  fn make(n: Int) -> fn() -> Int
+  fn wrap(f: fn() -> Int) -> fn() -> Int
+}
+
+handler Plain: Factory {
+  fn make(n) { || n }
+  fn wrap(f) { f }
+}
+
+fn op_result() -> fn() -> Int {
+  with Plain {
+    m = use Factory
+    m.make(1)
+  }
+}
+
+fn op_argument() -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    with Plain {
+      m = use Factory
+      m.wrap(|| {
+        q = p
+        1
+      })
+    }
+  }
+}
+
+fn call_param(g: fn(fn() -> Int) -> fn() -> Int) -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    g(|| {
+      q = p
+      1
+    })
+  }
+}
+
+fn call_param_without_arguments(g: fn() -> fn() -> Int) -> fn() -> Int {
+  with PrimaryDb {
+    p = use Db
+    g()
+  }
+}

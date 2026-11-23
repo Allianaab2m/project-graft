@@ -1,0 +1,21 @@
+effect Logger {  # 補
+  fn info(msg: String) -> ()
+}
+
+handler ConsoleLogger: Logger {  # 補
+  fn info(msg) { () }
+}
+
+fn make_greeter() {
+  with ConsoleLogger {
+    log = use Logger
+    || log.info("hi") # W0402: leaves the with while holding log (E0444 with `capture-checking`)
+  }
+}
+
+fn used_up(names: List[String]) {  # 補
+  with ConsoleLogger {
+    log = use Logger
+    List.map(names, |n| log.info(n))
+  }
+}

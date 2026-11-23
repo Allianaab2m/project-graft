@@ -1,0 +1,24 @@
+fn f(n: Int) {
+  a = g(1)
+  b = g(2)
+  c = h(n)
+  d = h("s")
+  e = uses_k_twice(n)
+  n
+}
+fn g[A](x: A) {
+  f(1)
+  x
+}
+fn h(x: Int) {
+  f(x)
+}
+fn k(n: Int) {
+  f(n)
+  []
+}
+fn uses_k_twice(n: Int) {
+  xs: List[Int] = k(1)
+  ys: List[String] = k(2)
+  f(n)
+}

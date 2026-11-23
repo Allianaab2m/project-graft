@@ -1,0 +1,14 @@
+type User(id: Int, name: String)
+type Pair[A, B](first: A, second: B)
+
+fn f(u: User, p: Pair[Int, String], o: Option[Bool], xs: List[Int]) -> Int {
+  User(id:, name:) = u
+  User(name: n, ..) = u
+  User(i, s) = u
+  Pair(a, b) = p
+  Some(flag) = o
+  [x, y, ..rest] = xs
+  [z, ..] = xs
+  [] = xs
+  id
+}

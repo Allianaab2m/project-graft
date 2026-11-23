@@ -1,0 +1,15 @@
+fn a[A](x: A, f: fn(A) -> Bool, n: Int) -> Bool {
+  if n == 0 { f(x) } else { b(0, x, f, n - 1) }
+}
+
+fn b[B, A](y: B, x: A, f: fn(A) -> Bool, n: Int) -> Bool {
+  a(x, f, n)
+}
+
+fn c[A](x: A, f: fn(A) -> Bool, n: Int) {
+  if n == 0 { f(x) } else { d(0, x, f, n - 1) }
+}
+
+fn d[B, A](y: B, x: A, f: fn(A) -> Bool, n: Int) {
+  c(x, f, n)
+}

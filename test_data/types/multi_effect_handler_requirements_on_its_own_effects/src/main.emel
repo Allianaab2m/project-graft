@@ -1,0 +1,19 @@
+handler Logged: Query + Audit {
+  fn query(sql) {
+    (use Audit).note(sql)
+    0
+  }
+  fn note(msg) { () }
+}
+
+handler Notes: Audit {
+  fn note(msg) { () }
+}
+
+fn outer() -> Int uses { Audit } {
+  with Logged { (use Query).query("a") }
+}
+
+fn wired() -> Int {
+  with Notes, Logged { (use Query).query("a") }
+}

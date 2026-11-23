@@ -1,0 +1,22 @@
+fn run[A](f: fn() -> A) -> A {
+  Fiber.scope(|| Fiber.join(Fiber.fork(f)))
+}
+
+fn awaited[A](f: fn() -> A) -> A {
+  Fiber.scope(|| {
+    d = Fiber.deferred()
+    Fiber.fork(|| d.complete(f()))
+    d.await()
+  })
+}
+
+fn handle_of_a_handle() -> Fiber[Int] {
+  Fiber.scope(|| Fiber.join(Fiber.fork(|| Fiber.fork(|| 1))))
+}
+
+fn other_roots() -> fn() -> () {
+  with ConsoleLogger {
+    log = use Logger
+    Fiber.scope(|| Fiber.join(Fiber.fork(|| || log.info("x"))))
+  }
+}

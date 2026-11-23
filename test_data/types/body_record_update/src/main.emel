@@ -1,0 +1,11 @@
+type User(id: Int, name: String)
+type Pair[A, B](first: A, second: B)
+
+fn f(u: User, p: Pair[Int, Bool]) -> Int {
+  a = User(name: "b", ..u)
+  b = Pair(first: "s", ..p)
+  c = User(name: 1, ..u)
+  d = User(nmae: "x", ..u)
+  g = User(name: "x", ..p)
+  1
+}

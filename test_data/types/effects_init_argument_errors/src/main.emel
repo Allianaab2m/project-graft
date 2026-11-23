@@ -1,0 +1,41 @@
+effect Kv {
+  fn get(key: String) -> String
+}
+
+effect AuditKv of Kv
+
+handler RemoteKv(url: String): Kv {
+  init(url: String, retries: Int) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+handler FakeKv: Kv {
+  fn get(key) { "" }
+}
+
+handler Untyped(url: String): Kv {
+  init(url) { Untyped(url:) }
+  fn get(key) { self.url }
+}
+
+layer AppLive {
+  FakeKv
+}
+
+layer Missing {
+  RemoteKv
+}
+
+fn f() {
+  with RemoteKv { (use Kv).get("a") }
+  with AuditKv by RemoteKv { (use AuditKv).get("a") }
+  with FakeKv() { (use Kv).get("a") }
+  with FakeKv(1) { (use Kv).get("a") }
+  with AppLive(1) { (use Kv).get("a") }
+  with AuditKv(1) by FakeKv { (use AuditKv).get("a") }
+  with RemoteKv("a") { (use Kv).get("a") }
+  with RemoteKv("a", 1, 2) { (use Kv).get("a") }
+  with RemoteKv(url: "a", tries: 1) { (use Kv).get("a") }
+  with RemoteKv("a", url: "b") { (use Kv).get("a") }
+  with RemoteKv(url: 1, retries: 1), FakeKv { (use Kv).get("a") }
+}

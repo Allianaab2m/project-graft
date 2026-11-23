@@ -1,0 +1,2 @@
+@export(js, "default", "serve")
+pub fn serve(app: fn(List[Int]) -> Int fails {} uses {}, n: List[Int]) -> Int { app(n) }

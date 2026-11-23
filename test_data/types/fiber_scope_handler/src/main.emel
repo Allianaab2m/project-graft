@@ -1,0 +1,14 @@
+import Std.Fiber.{Fiber, Scope}
+
+handler MyScope: Scope[{}, {}] {
+  fn fork(f) { todo() }
+  fn deferred() { todo() }
+  fn semaphore(permits) { todo() }
+  fn queue(capacity) { todo() }
+}
+
+fn provided() {
+  with MyScope {
+    Fiber.fork(|| 1)
+  }
+}

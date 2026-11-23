@@ -1,0 +1,29 @@
+effect Box[T] {
+  fn get() -> T
+}
+
+effect Hits of Box[Int]
+effect Names of Box[String] default
+effect Bare of Box
+
+handler IntBox: Box[Int] {
+  fn get() { 1 }
+}
+
+handler StrBox: Box[String] {
+  fn get() { "s" }
+}
+
+fn hits() -> Int { (use Hits).get() + 1 }
+
+fn name() -> String { (use Names).get() }
+
+fn main() {
+  with Hits by IntBox { hits() }
+  with IntBox, Hits by Box[Int] { hits() }
+  with StrBox { name() }
+  with IntBox { name() }
+  with Hits by StrBox { hits() }
+  with IntBox, Hits by Box[String] { hits() }
+  with IntBox, Hits by Box { hits() }
+}

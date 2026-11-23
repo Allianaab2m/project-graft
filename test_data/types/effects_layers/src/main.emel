@@ -1,0 +1,123 @@
+effect Config {
+  fn db_url() -> String
+}
+
+effect Users {
+  fn find(id: Int) -> String
+}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  fn now() -> Int
+}
+
+effect Ping {
+  fn ping() -> ()
+}
+
+effect Pong {
+  fn pong() -> ()
+}
+
+handler EnvConfig: Config {
+  fn db_url() { "x" }
+}
+
+handler ConsoleLogger: Logger {
+  fn info(msg) { () }
+}
+
+handler SilentLogger: Logger {
+  fn info(msg) { () }
+}
+
+handler FixedClock: Clock {
+  fn now() { 0 }
+}
+
+handler RealClock: Clock {
+  fn now() {
+    (use Logger).info("now")
+    1
+  }
+}
+
+handler DbUsers(url: String): Users {
+  init { DbUsers(url: (use Config).db_url()) }
+  fn find(id) {
+    (use Logger).info(self.url)
+    self.url
+  }
+}
+
+handler HPing: Ping {
+  fn ping() { (use Pong).pong() }
+}
+
+handler HPong: Pong {
+  fn pong() { (use Ping).ping() }
+}
+
+layer Base {
+  ConsoleLogger
+  RealClock
+}
+
+layer AppLive {
+  DbUsers
+  Base
+  EnvConfig
+}
+
+layer Partial {
+  DbUsers
+  ConsoleLogger
+}
+
+layer Dup {
+  ConsoleLogger
+  SilentLogger
+}
+
+layer DupNested {
+  Dup
+  Base
+}
+
+layer Twice { ConsoleLogger, ConsoleLogger }
+
+layer LoopA { LoopB }
+
+layer LoopB { LoopA }
+
+layer PingPong {
+  HPing
+  HPong
+}
+
+fn main() {
+  with AppLive { (use Users).find(1) }
+}
+
+fn partial() {
+  with Partial { (use Users).find(1) }
+}
+
+fn test_override() {
+  with AppLive, FixedClock { (use Clock).now() }
+}
+
+fn later_wins() {
+  with ConsoleLogger, SilentLogger { (use Logger).info("x") }
+}
+
+fn ping_pong() {
+  with PingPong { (use Ping).ping() }
+}
+
+fn loops() {
+  with LoopA { () }
+}

@@ -1,0 +1,9 @@
+enum Shape {
+  Circle(radius: Float)
+  Rect(Float, Float)
+  Empty
+}
+enum Tree[A] {
+  Leaf
+  Node(Tree[A], A, Tree[A])
+}

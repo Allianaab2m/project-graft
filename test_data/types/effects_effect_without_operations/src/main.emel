@@ -1,0 +1,7 @@
+effect Marker {}
+
+effect Console {
+  fn print(text: String) -> ()
+}
+
+effect Audit of Console

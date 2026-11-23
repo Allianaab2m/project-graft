@@ -1,0 +1,21 @@
+error Timeout(ms: Int)  # 補
+error DbError  # 補
+
+fn retry[A](f: fn() -> A) -> A {
+  f() escape { Timeout(_) -> f() }
+}
+
+fn retry_exact[A, E](f: fn() -> A fails Timeout | E) -> A fails Timeout | E {
+  f() escape { Timeout(_) -> f() }
+}
+
+fn flaky() -> Int fails Timeout | DbError { 1 }  # 補
+fn steady() -> Int { 1 }  # 補
+
+fn callers() {  # 補
+  a = retry(flaky)
+  b = retry_exact(flaky)
+  c = retry_exact(steady)
+  d = flaky() escape { Timeout(_) -> 0 }
+  (a, b, c, d)
+}

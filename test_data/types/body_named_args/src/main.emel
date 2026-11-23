@@ -1,0 +1,10 @@
+type User(id: Int, name: String)
+fn connect(host: String, port: Int) -> Bool { todo() }
+
+fn f(id: Int) -> User {
+  a = connect("localhost", 5432)
+  b = connect("localhost", port: 5432)
+  c = connect(port: 5432, host: "localhost")
+  u = User(name: "a", id:)
+  u
+}

@@ -1,0 +1,1033 @@
+## Converts HIR type expressions into types (`Ty`). Follows `lower.rs` of the reference type
+## checker: registers type, enum, error and handler definitions in the table of named types, then
+## looks type expressions up in it.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  DefData,
+  DefKind,
+  FnKind,
+  TypeKind,
+  EnumKind,
+  CtorKind,
+  ErrorKind,
+  EffectKind,
+  OpKind,
+  MemberKind,
+  HandlerKind,
+  TypeParamKind,
+  BuiltinTypeKind,
+  BuiltinPrelude,
+  Res,
+  ResDef,
+  Span,
+  TypeRef,
+  TPath,
+  TSelf,
+  TUnit,
+  TTuple,
+  TFn,
+  TCap,
+  TErrorSet,
+  TEffectSet,
+  TMissing,
+  ErrorSet,
+  EffectSet,
+  EffectRef,
+  TypeParam,
+  Fields,
+  NoFields,
+  NamedFields,
+  PositionalFields,
+  Item,
+  IType,
+  IEnum,
+  ICtor,
+  IEffect,
+  IOp,
+  IMember,
+}
+import Infer.{Infer, new_row_var}
+import Ty.{
+  Ty,
+  TyPrim,
+  TyNever,
+  TyBound,
+  TyFn,
+  TyTuple,
+  TyList,
+  TyNamed,
+  TySet,
+  TyCap,
+  TyError,
+  Row,
+  RowElem,
+  RTag,
+  RBound,
+  ROf,
+  Tag,
+  SetKind,
+  Errors,
+  Effects,
+  TyParam,
+  TyCon,
+  TyConKind,
+  ConType,
+  ConEnum,
+  ConError,
+  ConHandler,
+  ParamKind,
+  SetParamKind,
+  EMPTY_ROW,
+  BOOL,
+  FLOAT,
+  INT,
+  INT64,
+  STRING,
+  UNIT,
+  cap,
+  func,
+  insert,
+  row_of,
+  set_param,
+  tag_row,
+  ty_param,
+  union,
+  var_row,
+}
+
+## A diagnostic of type checking. `code` is `-` for the reference's diagnostics without a code
+## (`Unsupported`).
+pub type TyDiag(span: Option[Span], code: String, message: String, warning: Bool)
+
+const NO_DEF = DefData("", FnKind, BuiltinPrelude, None, None, False, False)
+
+pub fn def_of(program: Program, id: Int) -> DefData {
+  program.defs.get(id).or(NO_DEF)
+}
+
+## A definition of the Prelude by name (`Bool`, `Some`, `Immediate`).
+pub fn prelude_def(program: Program, name: String) -> Option[Int] {
+  program.prelude.find(|d| def_of(program, d).name == name)
+}
+
+# ---------------------------------------------------------------------------------------------
+# The table of named types
+
+## Built from type, enum, error and handler definitions. `cons` is indexed by the named type's id.
+pub type TyTable(
+  cons: Map[Int, TyCon],
+  by_def: Map[Int, Int],
+  def_of_con: Map[Int, Int],
+  ## The Prelude's Bool enum. Not registered; it is the primitive Bool.
+  bool_def: Option[Int],
+  ## The set kinds of the type parameters of types, enums and built-in effects.
+  sets: Map[Int, List[Option[SetKind]]],
+  ## The names of errors and effects, for display.
+  tag_names: Map[Int, String],
+)
+
+pub fn new_table(program: Program) -> TyTable {
+  bool_def = prelude_def(program, "Bool")
+  sets = decl_sets(program)
+  start = TyTable(Map.empty(), Map.empty(), Map.empty(), bool_def, sets, Map.empty())
+  program.defs.fold(start, |t, def, data| {
+    kind = data.kind match {
+      TypeKind    -> Some(ConType)
+      EnumKind    -> Some(ConEnum)
+      ErrorKind   -> Some(ConError)
+      HandlerKind -> Some(ConHandler)
+      _           -> None
+    }
+    named = if data.kind == ErrorKind || data.kind == EffectKind {
+      TyTable(tag_names: t.tag_names.insert(def, data.name), ..t)
+    } else {
+      t
+    }
+    (kind, bool_def == Some(def)) match {
+      (Some(k), False) -> {
+        id = named.cons.size()
+        params = decl_params(program, def, sets.get(def).or([]))
+        TyTable(
+          cons: named.cons.insert(id, TyCon(data.name, k, params)),
+          by_def: named.by_def.insert(def, id),
+          def_of_con: named.def_of_con.insert(id, def),
+          ..named,
+        )
+      }
+      _ -> named
+    }
+  })
+}
+
+## The set kind of the `i`-th type parameter of a type, enum or built-in effect, if it is a set.
+pub fn set_kind(table: TyTable, def: Int, i: Int) -> Option[SetKind] {
+  table.sets.get(def).and_then(|s| s.get(i)).and_then(|k| k)
+}
+
+## None for Bool and for definitions other than type, enum, error and handler.
+pub fn con_of(table: TyTable, def: Int) -> Option[Int] {
+  table.by_def.get(def)
+}
+
+pub fn con_def(table: TyTable, con: Int) -> Int {
+  table.def_of_con.get(con).or(-1)
+}
+
+## Named error type → that error's definition.
+pub fn error_tags(table: TyTable) -> Map[Int, Int] {
+  table.cons.fold(
+    Map.empty(),
+    |m, id, c| if c.kind == ConError { m.insert(id, con_def(table, id)) } else { m },
+  )
+}
+
+## The type a type, enum, error or handler definition names, with type arguments `TyBound(0)`,
+## `TyBound(1)`, .... Bool is the primitive Bool.
+pub fn self_ty(table: TyTable, def: Int) -> Option[Ty] {
+  if table.bool_def == Some(def) {
+    Some(BOOL)
+  } else {
+    con_of(table, def).map(|id| {
+      n = table.cons.get(id).map(|c| c.params.length()).or(0)
+      TyNamed(
+        id,
+        List.range(0, n).map(|i| {
+          set_kind(table, def, i) match {
+            Some(k) -> TySet(k, row_of([RBound(i)]))
+            None    -> TyBound(i)
+          }
+        }),
+      )
+    })
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering state
+
+## What omitted `fails` and `uses` clauses on a function type mean (spec 9.2).
+pub enum Omitted {
+  ## Inside a declaration (fields, consts, ...): empty.
+  OmitEmpty
+  ## Inside a top-level fn's parameter types: an invisible set type parameter.
+  OmitHidden
+  ## Return types, binding annotations, lambda parameters: a fresh set variable.
+  OmitFresh
+  ## A local fn's parameter types: a fresh set variable, also added to the declared E and R when
+  ## in a positive position.
+  OmitLocal
+}
+
+## Invisible set type parameters inside parameter types, placed after the written ones.
+pub type Hidden(
+  base: Int,
+  params: List[TyParam],
+  ## The current parameter's name, to name them (`E(f)`, `R(f)`).
+  param: String,
+  ## How many error sets and effect sets were added for the current parameter.
+  in_errors: Int,
+  in_effects: Int,
+  ## In positive positions (functions the body can call); included in the declared E and R.
+  positive: Row,
+  positive_uses: Row,
+  ## Whether invisible effect sets get an `Immediate` bound (callbacks of external functions).
+  immediate: Bool,
+)
+
+pub fn new_hidden(base: Int) -> Hidden {
+  Hidden(base, [], "", 0, 0, EMPTY_ROW, EMPTY_ROW, False)
+}
+
+## The context of reading type expressions: type parameters (`params[i]` is `TyBound(i)`), their
+## kinds, what an omitted clause means, whether set type parameters may be written, and what
+## `Self` stands for.
+pub type TyLower(
+  program: Program,
+  table: TyTable,
+  params: List[Int],
+  kinds: List[ParamKind],
+  omitted: Omitted,
+  sets: Bool,
+  self_ty: Option[Ty],
+  hidden: Hidden,
+  local_fails: Row,
+  local_uses: Row,
+  ## Newest first.
+  diags: List[TyDiag],
+)
+
+pub fn new_lower(program: Program, table: TyTable, params: List[Int]) -> TyLower {
+  TyLower(
+    program,
+    table,
+    params,
+    params.map(|_| Ty.TypeParamKind),
+    OmitEmpty,
+    False,
+    None,
+    new_hidden(0),
+    EMPTY_ROW,
+    EMPTY_ROW,
+    [],
+  )
+}
+
+pub fn lw() -> TyLower uses { State[TyLower] } {
+  (use State[TyLower]).get()
+}
+
+fn upd(f: fn(TyLower) -> TyLower) -> () uses { State[TyLower] } {
+  s = use State[TyLower]
+  s.set(f(s.get()))
+}
+
+pub fn report(span: Option[Span], code: String, message: String) -> () uses { State[TyLower] } {
+  upd(|l| TyLower(diags: [TyDiag(span, code, message, False), ..l.diags], ..l))
+}
+
+## Runs `f` with the given scope: type parameters (`params[i]` is `TyBound(i)`), their kinds,
+## what an omitted clause means, whether set type parameters may be written, and `Self`.
+pub fn scoped[A](
+  params: List[Int],
+  kinds: List[ParamKind],
+  omitted: Omitted,
+  sets: Bool,
+  self_ty: Option[Ty],
+  f: fn() -> A uses { State[TyLower], State[Infer] },
+) -> A uses { State[TyLower], State[Infer] } {
+  saved = lw()
+  upd(|l| TyLower(params:, kinds:, omitted:, sets:, self_ty:, ..l))
+  out = f()
+  upd(
+    |l| TyLower(
+      params: saved.params,
+      kinds: saved.kinds,
+      omitted: saved.omitted,
+      sets: saved.sets,
+      self_ty: saved.self_ty,
+      ..l,
+    ),
+  )
+  out
+}
+
+## Reads a type as inside a declaration: omitted clauses are empty and `params` are ordinary type
+## parameters.
+pub fn lower(params: List[Int], ty: Int) -> Ty uses { State[TyLower], State[Infer] } {
+  scoped(params, params.map(|_| Ty.TypeParamKind), OmitEmpty, False, None, || lower_in(ty, True))
+}
+
+## Starts collecting the invisible set type parameters of a fn, after `base` written ones.
+pub fn begin_hidden(base: Int, immediate: Bool) -> () uses { State[TyLower] } {
+  upd(|l| TyLower(hidden: Hidden(immediate:, ..new_hidden(base)), ..l))
+}
+
+## Starts a parameter for naming invisible set type parameters.
+pub fn start_param(name: String) -> () uses { State[TyLower] } {
+  upd(|l| TyLower(hidden: Hidden(param: name, in_errors: 0, in_effects: 0, ..l.hidden), ..l))
+}
+
+## The set for an omitted `fails` clause (`uses` if `effects`).
+fn omitted_row(positive: Bool, effects: Bool) -> Row uses { State[TyLower], State[Infer] } {
+  lw().omitted match {
+    OmitEmpty -> EMPTY_ROW
+    OmitHidden -> {
+      h = lw().hidden
+      count = if effects { h.in_effects + 1 } else { h.in_errors + 1 }
+      prefix = if effects { "R" } else { "E" }
+      name = if count == 1 { "#{prefix}(#{h.param})" } else { "#{prefix}(#{h.param}, #{count})" }
+      i = h.base + h.params.length()
+      p = set_param(name)
+      param = if effects && h.immediate {
+        TyParam(bounds: p.bounds.append(["Immediate"]), ..p)
+      } else {
+        p
+      }
+      row = row_of([RBound(i)])
+      next = Hidden(
+        params: h.params.append([param]),
+        in_errors: if effects { h.in_errors } else { count },
+        in_effects: if effects { count } else { h.in_effects },
+        positive: if positive && !effects { union(h.positive, row) } else { h.positive },
+        positive_uses: if positive && effects {
+          union(h.positive_uses, row)
+        } else {
+          h.positive_uses
+        },
+        ..h,
+      )
+      upd(|l| TyLower(hidden: next, ..l))
+      row
+    }
+    OmitFresh -> var_row(new_row_var())
+    OmitLocal -> {
+      row = var_row(new_row_var())
+      if positive {
+        if effects {
+          upd(|l| TyLower(local_uses: union(l.local_uses, row), ..l))
+        } else {
+          upd(|l| TyLower(local_fails: union(l.local_fails, row), ..l))
+        }
+      }
+      row
+    }
+  }
+}
+
+fn type_ref(id: Int) -> TypeRef uses { State[TyLower] } {
+  lw().program.types.get(id).or(TypeRef(TMissing, None))
+}
+
+fn pdef(id: Int) -> DefData uses { State[TyLower] } {
+  def_of(lw().program, id)
+}
+
+fn position(id: Int) -> Option[Int] uses { State[TyLower] } {
+  lw().params.enumerate().find(|(_, p)| p == id).map(|(i, _)| i)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Lowering
+
+## Converts in the current context. `positive` tells whether the position receives values as
+## seen from the body (it flips inside parameter types); it decides whether invisible set type
+## parameters join the declared E and R.
+pub fn lower_in(ty: Int, positive: Bool) -> Ty uses { State[TyLower], State[Infer] } {
+  r = type_ref(ty)
+  r.kind match {
+    TMissing         -> TyError
+    # Sets may only be written as set type arguments of named types.
+    TErrorSet(_)     -> set_as_type(r.span)
+    TEffectSet(_)    -> set_as_type(r.span)
+    TUnit            -> UNIT
+    TSelf            -> lw().self_ty.or(TyError)
+    TTuple(elems)    -> TyTuple(elems.map(|e| lower_in(e, positive)))
+    TFn(params, ret, fails, uses) -> {
+      # Invisible set type parameters are numbered from the outer function type.
+      f = fails match {
+        Some(set) -> lower_error_set(set)
+        None      -> omitted_row(positive, False)
+      }
+      u = uses match {
+        Some(set) -> lower_effect_set(set)
+        None      -> omitted_row(positive, True)
+      }
+      ret_ty = ret.map(|t| lower_in(t, positive)).or(TyError)
+      param_tys = params.map(|p| lower_in(p, !positive))
+      func(param_tys, ret_ty, f, u)
+    }
+    TPath(res, args) -> lower_path(r, res, args, positive)
+    TCap(effects) -> {
+      found = effects.fold(Some([]), |acc, e| {
+        acc.and_then(|tags| {
+          e.res match {
+            ResDef(d) if pdef(d).kind == EffectKind -> effect_tag(
+              d,
+              e.args,
+              Some(e.span),
+              None,
+            ).map(|t| tags.append([t]))
+            _ -> None
+          }
+        })
+      })
+      found.map(cap).or(TyError)
+    }
+  }
+}
+
+fn set_as_type(span: Option[Span]) -> Ty uses { State[TyLower] } {
+  report(
+    span,
+    "E0324",
+    "expected a type, found a set: sets can only be passed to set type parameters",
+  )
+  TyError
+}
+
+## The set of a `fails` clause: errors become tags, set type parameters `RBound`, and type
+## parameters also used as values the error type (`ROf`).
+pub fn lower_error_set(set: ErrorSet) -> Row uses { State[TyLower] } {
+  set.items.fold(EMPTY_ROW, |row, (res, sp)| {
+    res match {
+      ResDef(d) -> {
+        k = pdef(d).kind
+        if k == ErrorKind {
+          insert(row, RTag(Tag(d, [])))
+        } else if k == TypeParamKind {
+          position(d) match {
+            None -> row
+            Some(i) -> lw().kinds.get(i) match {
+              Some(SetParamKind) -> if lw().sets {
+                insert(row, RBound(i))
+              } else {
+                report(
+                  Some(sp),
+                  "-",
+                  "not supported yet: error set type parameters on type declarations",
+                )
+                row
+              }
+              _ -> insert(row, ROf(TyBound(i)))
+            }
+          }
+        } else {
+          row
+        }
+      }
+      _ -> row
+    }
+  })
+}
+
+## The set of a `uses` clause: effects become tags, set type parameters `RBound`.
+pub fn lower_effect_set(set: EffectSet) -> Row uses { State[TyLower], State[Infer] } {
+  set.items.fold(EMPTY_ROW, |row, item| {
+    item.res match {
+      ResDef(d) -> {
+        k = pdef(d).kind
+        if k == EffectKind {
+          effect_tag(d, item.args, Some(item.span), None).map(|t| insert(row, RTag(t))).or(row)
+        } else if k == TypeParamKind {
+          position(d) match {
+            None -> row
+            Some(i) -> lw().kinds.get(i) match {
+              Some(SetParamKind) if lw().sets -> insert(row, RBound(i))
+              Some(SetParamKind) -> {
+                report(
+                  Some(item.span),
+                  "-",
+                  "not supported yet: effect set type parameters on type declarations",
+                )
+                row
+              }
+              _ -> {
+                report(
+                  Some(item.span),
+                  "-",
+                  "not supported yet: type parameters used both as a type and in `use`",
+                )
+                row
+              }
+            }
+          }
+        } else {
+          row
+        }
+      }
+      _ -> row
+    }
+  })
+}
+
+## The tag of an effect with its type arguments (spec 8.1). Missing type arguments are E0423, a
+## wrong count E0304; both give a tag with error types as arguments.
+pub fn effect_tag(
+  eff: Int,
+  args: List[Int],
+  span: Option[Span],
+  owner: Option[String],
+) -> Option[Tag]
+  uses { State[TyLower], State[Infer] } {
+  program = lw().program
+  params = effect_params(program, eff)
+  name = pdef(eff).name
+  if params.is_empty() && args.is_empty() {
+    Some(Tag(eff, []))
+  } else if args.is_empty() {
+    names = String.join(params.map(|tp| def_of(program, tp.def).name), ", ")
+    report(span, "E0423", "effect `#{name}` needs its type arguments `#{name}[#{names}]`")
+    Some(Tag(eff, params.map(|_| TyError)))
+  } else if !check_arity(name, params.length(), args, span) {
+    Some(Tag(eff, params.map(|_| TyError)))
+  } else {
+    # Type arguments are read as in a declaration; set type parameters of built-in effects take
+    # sets.
+    saved = lw()
+    upd(|l| TyLower(omitted: OmitEmpty, self_ty: None, ..l))
+    lowered = args.enumerate().map(|(i, a)| {
+      set_kind(saved.table, eff, i) match {
+        Some(kind) -> lower_set_arg(eff, i, kind, a)
+        None       -> lower_in(a, True)
+      }
+    })
+    upd(|l| TyLower(omitted: saved.omitted, self_ty: saved.self_ty, ..l))
+    Some(Tag(eff, lowered))
+  }
+}
+
+## Named types (`Int`, `List[A]`, `Option[Int]`, `A`).
+fn lower_path(r: TypeRef, res: Res, args: List[Int], positive: Bool) -> Ty
+  uses { State[TyLower], State[Infer] } {
+  res match {
+    ResDef(def) -> {
+      data = pdef(def)
+      table = lw().table
+      if data.kind == EffectKind {
+        report(r.span, "E0221", "effect `#{data.name}` cannot be used as a type")
+        TyError
+      } else {
+        expected = if data.kind == BuiltinTypeKind && data.name == "List" {
+          1
+        } else if data.kind == TypeKind || data.kind == EnumKind || data.kind == ErrorKind {
+          con_of(table, def).and_then(|id| table.cons.get(id)).map(|c| c.params.length()).or(0)
+        } else {
+          0
+        }
+        if !check_arity(data.name, expected, args, r.span) {
+          TyError
+        } else if table.bool_def == Some(def) {
+          BOOL
+        } else if data.kind == TypeParamKind {
+          position(def).map(TyBound).or(TyError)
+        } else if data.kind == BuiltinTypeKind {
+          data.name match {
+            "Int"    -> INT
+            "Int64"  -> INT64
+            "Float"  -> FLOAT
+            "String" -> STRING
+            "Never"  -> TyNever
+            "List"   -> TyList(args.head().map(|a| lower_in(a, positive)).or(TyError))
+            _ -> {
+              report(r.span, "-", "not supported yet: builtin type")
+              TyError
+            }
+          }
+        } else if data.kind == TypeKind || data.kind == EnumKind || data.kind == ErrorKind {
+          con_of(table, def) match {
+            None -> TyError
+            Some(id) -> TyNamed(
+              id,
+              args.enumerate().map(|(i, a)| {
+                set_kind(table, def, i) match {
+                  Some(kind) -> lower_set_arg(def, i, kind, a)
+                  None       -> lower_in(a, positive)
+                }
+              }),
+            )
+          }
+        } else {
+          TyError
+        }
+      }
+    }
+    _ -> TyError
+  }
+}
+
+## Whether the type argument count is `expected`; otherwise reports E0304.
+fn check_arity(name: String, expected: Int, args: List[Int], span: Option[Span]) -> Bool
+  uses { State[TyLower] } {
+  if args.length() != expected {
+    report(
+      span,
+      "E0304",
+      "wrong number of type arguments: `#{name}` takes #{expected}, found #{args.length()}",
+    )
+    False
+  } else {
+    True
+  }
+}
+
+fn set_arg_mismatch(decl: Int, index: Int, kind: SetKind, span: Option[Span], found: String) -> ()
+  uses { State[TyLower] } {
+  program = lw().program
+  param = type_param_defs(program, decl).get(index).map(|p| def_of(program, p).name).or("")
+  what = if kind == Effects { "an effect set" } else { "an error set" }
+  report(span, "E0323", "`#{param}` of `#{pdef(decl).name}` takes #{what}, found #{found}")
+}
+
+## Converts what is written as a set type argument of a named type into a set. Elements may be
+## tags of the right kind and set type parameters; anything else is E0323 and is skipped.
+fn lower_set_arg(decl: Int, index: Int, kind: SetKind, arg: Int) -> Ty
+  uses { State[TyLower], State[Infer] } {
+  r = type_ref(arg)
+  mismatch = |found: String| {
+    set_arg_mismatch(decl, index, kind, r.span, found)
+    TySet(kind, EMPTY_ROW)
+  }
+  items = (r.kind, kind) match {
+    (TErrorSet(set), Errors)   -> Some(set.items.map(|(res, sp)| (res, [], sp)))
+    (TEffectSet(set), Effects) -> Some(set.items.map(|e| (e.res, e.args, e.span)))
+    (TEffectSet(set), Errors) if set.items.is_empty() -> Some([])
+    _                          -> None
+  }
+  items match {
+    Some(elems) -> TySet(
+      kind,
+      elems.fold(
+        EMPTY_ROW,
+        |row, (res, a, sp)| union(row, set_elem(decl, index, kind, res, a, Some(sp))),
+      ),
+    )
+    None -> (r.kind, kind) match {
+      (TErrorSet(_), Effects)  -> mismatch("an error set")
+      (TEffectSet(_), Errors)  -> mismatch("an effect set")
+      (TMissing, _)            -> TySet(kind, EMPTY_ROW)
+      (TPath(res, a), _) if a.is_empty() || (kind == Effects && is_effect(res)) -> {
+        TySet(kind, set_elem(decl, index, kind, res, a, r.span))
+      }
+      (TPath(ResDef(d), _), _) -> mismatch("type `#{pdef(d).name}`")
+      _                        -> mismatch("a type")
+    }
+  }
+}
+
+fn is_effect(res: Res) -> Bool uses { State[TyLower] } {
+  res match {
+    ResDef(d) -> pdef(d).kind == EffectKind
+    _         -> False
+  }
+}
+
+## One set element: a tag of the right kind or a set type parameter.
+fn set_elem(
+  decl: Int,
+  index: Int,
+  kind: SetKind,
+  res: Res,
+  args: List[Int],
+  span: Option[Span],
+) -> Row
+  uses { State[TyLower], State[Infer] } {
+  res match {
+    ResDef(d) -> {
+      data = pdef(d)
+      mismatch = |found: String| {
+        set_arg_mismatch(decl, index, kind, span, found)
+        EMPTY_ROW
+      }
+      (data.kind, kind) match {
+        (ErrorKind, Errors) -> tag_row(d)
+        (EffectKind, Effects) -> effect_tag(d, args, span, None).map(|t| row_of([RTag(t)])).or(
+          EMPTY_ROW,
+        )
+        (TypeParamKind, _) -> {
+          is_set = position(d).and_then(|i| lw().kinds.get(i)) == Some(SetParamKind)
+          (position(d), is_set, lw().sets) match {
+            (Some(i), True, True) -> row_of([RBound(i)])
+            (Some(_), True, False) -> {
+              report(span, "-", "not supported yet: set type parameters here")
+              EMPTY_ROW
+            }
+            _                     -> mismatch("type parameter `#{data.name}`")
+          }
+        }
+        (EffectKind, _)     -> mismatch("effect `#{data.name}`")
+        (ErrorKind, _)      -> mismatch("error `#{data.name}`")
+        _                   -> mismatch("type `#{data.name}`")
+      }
+    }
+    _ -> EMPTY_ROW
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Declarations
+
+## Type parameters of a type or enum declaration. Set type parameters become set parameters, with
+## an Immediate bound on effect sets if written.
+fn decl_params(program: Program, def: Int, sets: List[Option[SetKind]]) -> List[TyParam] {
+  tps = program.items.get(def) match {
+    Some(IType(t)) -> t.type_params
+    Some(IEnum(e)) -> e.type_params
+    _              -> []
+  }
+  tps.enumerate().map(|(i, tp)| {
+    name = def_of(program, tp.def).name
+    sets.get(i).and_then(|k| k) match {
+      Some(kind) -> {
+        p = set_param(name)
+        if kind == Effects && !immediate_bounds(program, tp).is_empty() {
+          TyParam(bounds: p.bounds.append(["Immediate"]), ..p)
+        } else {
+          p
+        }
+      }
+      None -> ty_param(name)
+    }
+  })
+}
+
+## Type parameter definitions of a type, enum or effect.
+pub fn type_param_defs(program: Program, def: Int) -> List[Int] {
+  tps = program.items.get(def) match {
+    Some(IType(t))   -> t.type_params
+    Some(IEnum(e))   -> e.type_params
+    Some(IEffect(e)) -> e.type_params
+    _                -> []
+  }
+  tps.map(|tp| tp.def)
+}
+
+## Effect type parameters (spec 8.1).
+pub fn effect_params(program: Program, eff: Int) -> List[TypeParam] {
+  program.items.get(eff) match {
+    Some(IEffect(e)) -> e.type_params
+    _                -> []
+  }
+}
+
+## The names given to schemes and type declarations, from type parameter definitions.
+pub fn ty_params(program: Program, defs: List[Int]) -> List[TyParam] {
+  defs.map(|d| ty_param(def_of(program, d).name))
+}
+
+## The spans of a type parameter's bounds that refer to the built-in Immediate.
+pub fn immediate_bounds(program: Program, tp: TypeParam) -> List[Span] {
+  immediate = prelude_def(program, "Immediate")
+  tp.bounds.filter_map(|(res, sp)| {
+    res match {
+      ResDef(d) if Some(d) == immediate -> Some(sp)
+      _                                 -> None
+    }
+  })
+}
+
+pub fn is_intrinsic_effect(program: Program, eff: Int) -> Bool {
+  program.items.get(eff) match {
+    Some(IEffect(e)) -> e.is_intrinsic
+    _                -> False
+  }
+}
+
+## The set kind of each type parameter of a named type declaration, decided from where it is used
+## (spec 9.2).
+pub fn classify_sets(
+  program: Program,
+  decls: Map[Int, List[Option[SetKind]]],
+  params: List[Int],
+  types: List[Int],
+) -> List[Option[SetKind]] {
+  classify_fn_sets(program, decls, params, types, None)
+}
+
+## A type parameter written only in `fails` or `uses` clauses, or as a set type argument, is a set;
+## one written as a value type too is an ordinary type. Also counts the set type arguments of
+## built-in effects in a fn's own `uses`.
+pub fn classify_fn_sets(
+  program: Program,
+  decls: Map[Int, List[Option[SetKind]]],
+  params: List[Int],
+  types: List[Int],
+  uses: Option[EffectSet],
+) -> List[Option[SetKind]] {
+  start = Marks(params.map(|_| False), params.map(|_| None))
+  typed = types.fold(start, |m, t| mark_params(program, decls, params, t, m))
+  marks = uses.map(|u| u.items).or([]).fold(typed, |m, item| {
+    item.res match {
+      ResDef(eff) -> decls.get(eff) match {
+        Some(sets) -> item.args.enumerate().fold(m, |acc, (j, a)| {
+          sets.get(j).and_then(|k| k) match {
+            Some(kind) -> mark_set_arg(program, params, kind, a, acc)
+            None       -> acc
+          }
+        })
+        None -> m
+      }
+      _ -> m
+    }
+  })
+  marks.in_type.zip(marks.in_set).map(|(t, s)| if t { None } else { s })
+}
+
+type Marks(in_type: List[Bool], in_set: List[Option[SetKind]])
+
+fn pos_in(params: List[Int], res: Res) -> Option[Int] {
+  res match {
+    ResDef(d) -> params.enumerate().find(|(_, p)| p == d).map(|(i, _)| i)
+    _         -> None
+  }
+}
+
+fn mark_type(m: Marks, i: Int) -> Marks {
+  Marks(m.in_type.enumerate().map(|(j, t)| t || j == i), m.in_set)
+}
+
+## Keeps the first kind found.
+fn mark_set(m: Marks, i: Int, kind: SetKind) -> Marks {
+  Marks(
+    m.in_type,
+    m.in_set.enumerate().map(|(j, s)| if j == i && s.is_none() { Some(kind) } else { s }),
+  )
+}
+
+fn mark_params(
+  program: Program,
+  decls: Map[Int, List[Option[SetKind]]],
+  params: List[Int],
+  ty: Int,
+  m: Marks,
+) -> Marks {
+  program.types.get(ty).map(|r| r.kind) match {
+    Some(TPath(res, args)) -> {
+      here = pos_in(params, res).map(|i| mark_type(m, i)).or(m)
+      sets = res match {
+        ResDef(d) -> decls.get(d)
+        _         -> None
+      }
+      args.enumerate().fold(here, |acc, (j, a)| {
+        kind = sets.and_then(|s| s.get(j)).and_then(|k| k)
+        as_set = (kind, program.types.get(a).map(|r| r.kind)) match {
+          (Some(k), Some(TPath(r2, []))) -> pos_in(params, r2).map(|i| mark_set(acc, i, k))
+          _                              -> None
+        }
+        as_set match {
+          Some(marked) -> marked
+          None         -> mark_params(program, decls, params, a, acc)
+        }
+      })
+    }
+    Some(TTuple(elems)) -> elems.fold(m, |acc, e| mark_params(program, decls, params, e, acc))
+    Some(TFn(ps, ret, fails, uses)) -> {
+      a1 = ps.fold(m, |acc, p| mark_params(program, decls, params, p, acc))
+      a2 = ret.map(|r| mark_params(program, decls, params, r, a1)).or(a1)
+      a3 = fails.map(|f| f.items).or([]).fold(
+        a2,
+        |acc, (res, _)| pos_in(params, res).map(|i| mark_set(acc, i, Errors)).or(acc),
+      )
+      uses.map(|u| u.items).or([]).fold(
+        a3,
+        |acc, item| mark_effect(program, decls, params, item, acc),
+      )
+    }
+    Some(TErrorSet(set)) -> set.items.fold(
+      m,
+      |acc, (res, _)| pos_in(params, res).map(|i| mark_set(acc, i, Errors)).or(acc),
+    )
+    Some(TEffectSet(set)) -> set.items.fold(
+      m,
+      |acc, item| mark_effect(program, decls, params, item, acc),
+    )
+    Some(TCap(effects)) -> effects.fold(m, |acc, e| mark_effect(program, decls, params, e, acc))
+    _                   -> m
+  }
+}
+
+## Elements of an effect set: a type parameter itself is a set; an effect's type arguments are
+## ordinary types, except at the set type parameters of a built-in effect.
+fn mark_effect(
+  program: Program,
+  decls: Map[Int, List[Option[SetKind]]],
+  params: List[Int],
+  item: EffectRef,
+  m: Marks,
+) -> Marks {
+  here = pos_in(params, item.res).map(|i| mark_set(m, i, Effects)).or(m)
+  sets = item.res match {
+    ResDef(d) -> decls.get(d)
+    _         -> None
+  }
+  item.args.enumerate().fold(here, |acc, (j, a)| {
+    sets.and_then(|s| s.get(j)).and_then(|k| k) match {
+      Some(kind) -> mark_set_arg(program, params, kind, a, acc)
+      None       -> mark_params(program, decls, params, a, acc)
+    }
+  })
+}
+
+## Type parameters written in a set type argument of a built-in effect are sets of that kind.
+fn mark_set_arg(program: Program, params: List[Int], kind: SetKind, arg: Int, m: Marks) -> Marks {
+  program.types.get(arg).map(|r| r.kind) match {
+    Some(TPath(res, [])) -> pos_in(params, res).map(|i| mark_set(m, i, kind)).or(m)
+    Some(TErrorSet(set)) -> set.items.fold(
+      m,
+      |acc, (res, _)| pos_in(params, res).map(|i| mark_set(acc, i, kind)).or(acc),
+    )
+    Some(TEffectSet(set)) -> set.items.fold(
+      m,
+      |acc, item| pos_in(params, item.res).map(|i| mark_set(acc, i, kind)).or(acc),
+    )
+    _                    -> m
+  }
+}
+
+## The set kinds of the type parameters of types and enums, and of built-in effects. A parameter
+## passed as a set type argument of a named type is a set too, so this repeats until nothing
+## changes.
+fn decl_sets(program: Program) -> Map[Int, List[Option[SetKind]]] {
+  decls = program.defs.fold([], |acc, def, d| {
+    if d.kind == TypeKind || d.kind == EnumKind {
+      acc.append([(def, type_param_defs(program, def), field_types(program, def))])
+    } else {
+      acc
+    }
+  })
+  effects = program.defs.fold(Map.empty(), |sets, def, _| {
+    if is_intrinsic_effect(program, def) {
+      sets.insert(
+        def,
+        classify_sets(program, sets, type_param_defs(program, def), effect_op_types(program, def)),
+      )
+    } else {
+      sets
+    }
+  })
+  settle(program, decls, effects)
+}
+
+fn settle(
+  program: Program,
+  decls: List[(Int, List[Int], List[Int])],
+  sets: Map[Int, List[Option[SetKind]]],
+) -> Map[Int, List[Option[SetKind]]] {
+  (next, changed) = decls.fold((sets, False), |(s, changed), (def, params, types)| {
+    kinds = classify_sets(program, s, params, types)
+    if s.get(def) != Some(kinds) { (s.insert(def, kinds), True) } else { (s, changed) }
+  })
+  if changed { settle(program, decls, next) } else { next }
+}
+
+## The parameter and return type expressions of an effect's operations.
+pub fn effect_op_types(program: Program, eff: Int) -> List[Int] {
+  ops = program.items.get(eff) match {
+    Some(IEffect(e)) -> e.ops
+    _                -> []
+  }
+  ops.flat_map(|op| {
+    program.items.get(op) match {
+      Some(IOp(o)) -> o.sig.params.filter_map(|p| p.ty).append(o.sig.ret.map(|r| [r]).or([]))
+      _            -> []
+    }
+  })
+}
+
+## The field type expressions of a type or enum's constructors.
+fn field_types(program: Program, def: Int) -> List[Int] {
+  of_fields = |f: Fields| f match {
+    NoFields            -> []
+    PositionalFields(t) -> t
+    NamedFields(fs)     -> fs.map(|fd| fd.ty)
+  }
+  ctor_fields = |c: Int| program.items.get(c) match {
+    Some(ICtor(ci)) -> of_fields(ci.fields)
+    _               -> []
+  }
+  program.items.get(def) match {
+    Some(IType(t)) -> t.ctor.map(ctor_fields).or([])
+    Some(IEnum(e)) -> e.variants.flat_map(ctor_fields)
+    _              -> []
+  }
+}
+
+## Whether the type expression contains a function type with `fails` omitted (`uses` with
+## `effects`). Then the return type's E (R) is inferred from the body (spec 9.2).
+pub fn has_omitted(program: Program, ty: Int, effects: Bool) -> Bool {
+  program.types.get(ty).map(|r| r.kind) match {
+    Some(TPath(_, args)) -> args.any(|a| has_omitted(program, a, effects))
+    Some(TTuple(elems))  -> elems.any(|e| has_omitted(program, e, effects))
+    Some(TCap(es))       -> es.flat_map(|e| e.args).any(|a| has_omitted(program, a, effects))
+    Some(TFn(ps, ret, fails, uses)) -> {
+      omitted = if effects { uses.is_none() } else { fails.is_none() }
+      (
+        omitted
+          || ps.any(|p| has_omitted(program, p, effects))
+          || ret.map(|r| has_omitted(program, r, effects)) == Some(True)
+      )
+    }
+    _                    -> False
+  }
+}

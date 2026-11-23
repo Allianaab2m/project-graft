@@ -1,0 +1,10 @@
+fn f(x: Int) -> String {
+  x
+}
+fn id[A](x: A) -> A {
+  1
+}
+fn ok[A](x: A) -> A {
+  y = x
+  y
+}

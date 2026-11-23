@@ -1,0 +1,9 @@
+fn f(x: Int) -> Int {
+  fn go(n) -> Int { 1 }
+  fn sub(a: Int, b: Int) -> Int { a - b }
+  fn double(n: Int) -> Int { n * 2 }
+  a = sub(c: 1, b: 2)
+  b = sub(1)
+  c = x.double()
+  go(1)
+}

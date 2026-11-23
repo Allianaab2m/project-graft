@@ -1,0 +1,17 @@
+fn count(n: Int) {
+  if n == 0 { 0 } else { count(n - 1) }
+}
+
+fn is_even(n: Int) {
+  if n == 0 { True } else { is_odd(n - 1) }
+}
+fn is_odd(n: Int) {
+  if n == 0 { False } else { is_even(n - 1) }
+}
+
+fn length[A](xs: List[A]) -> Int {
+  xs match {
+    [] -> 0
+    [_, ..rest] -> 1 + length(rest)
+  }
+}

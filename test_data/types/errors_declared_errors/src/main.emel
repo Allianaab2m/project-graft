@@ -1,0 +1,19 @@
+error Boom
+
+fn pure() -> Int fails {} { 1 }
+
+fn impure() -> Int fails {} {
+  fail Boom
+}
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn apply_x(f: fn(Int) -> Int, x: Int) -> Int fails Boom {
+  if x > 0 { f(x) } else { fail Boom }
+}
+
+fn use_apply() {
+  apply(|n| if n > 0 { n } else { fail Boom }, 1)
+}

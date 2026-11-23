@@ -1,0 +1,24 @@
+effect Http {
+  suspend fn get(url: String) -> String
+}
+
+@external(js, "./ffi.mjs", "fetchText")
+suspend fn fetch_text(url: String) -> String
+
+handler JsHttp: Http {
+  suspend fn get(url, resume) { resume(fetch_text(url)) }
+}
+
+effect Blocking {
+  fn get(url: String) -> String
+}
+
+handler AwaitingInFn: Blocking {
+  fn get(url) { fetch_text(url) }
+}
+
+fn outside() { fetch_text("x") }
+
+fn main() {
+  with JsHttp { (use Http).get("x") }
+}

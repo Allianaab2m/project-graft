@@ -1,0 +1,43 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  fn now() -> Int
+}
+
+handler Quiet: Logger {
+  fn info(msg) { () }
+}
+
+handler Stamped: Logger {
+  fn info(msg) {
+    t = (use Clock).now()
+    ()
+  }
+}
+
+handler Fixed: Clock {
+  fn now() { 0 }
+}
+
+fn greet() {
+  (use Logger).info("hi")
+  (use Clock).now()
+}
+
+fn partly() {
+  with Quiet { greet() }
+}
+
+fn needs_clock() {
+  with Stamped { (use Logger).info("x") }
+}
+
+fn sibling() {
+  with Stamped, Fixed { greet() }
+}
+
+fn main() {
+  with Quiet, Fixed { greet() }
+}

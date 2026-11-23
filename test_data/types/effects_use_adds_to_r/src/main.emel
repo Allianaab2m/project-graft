@@ -1,0 +1,20 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  fn now() -> Int
+}
+
+fn log(msg: String) {
+  (use Logger).info(msg)
+}
+
+fn maybe(c: Bool) -> Int {
+  if c { (use Clock).now() } else { 0 }
+}
+
+fn both() {
+  log("a")
+  maybe(True)
+}

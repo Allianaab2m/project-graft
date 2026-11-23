@@ -1,0 +1,27 @@
+handler TracedFiles: Files {
+  handler Open(inner: use ReadFile): ReadFile {
+    init(path: String) { Self(inner: Files.Open(path)) }
+    fn read(max) {
+      (use Console).print_line("read")
+      self.inner.read(max)
+    }
+  }
+}
+
+handler Opener(f: use ReadFile): Console {
+  init {
+    fs = use Files
+    Self(f: fs.Open("a"))
+  }
+  fn print_line(s) { () }
+}
+
+fn traced() -> Int fails Missing uses { Files, Console } {
+  with TracedFiles {
+    with f = Files.Open("a") { f.read(1) }
+  }
+}
+
+fn opener() -> () fails Missing uses { Files } {
+  with Opener { (use Console).print_line("x") }
+}

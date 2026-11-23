@@ -1,0 +1,42 @@
+type Request(path: String)
+type Response(body: String)
+
+error NotFound
+error Timeout
+
+effect Db {
+  fn query(q: String) -> String
+}
+
+effect Log {
+  fn info(msg: String) -> ()
+}
+
+type Handler[E, R](run: fn(Request) -> Response fails E uses { R })
+
+fn both() -> Handler[NotFound | Timeout, { Db, Log }] {
+  Handler(run: |req| {
+    (use Log).info(req.path)
+    if req.path == "/" { fail Timeout }
+    body = (use Db).query(req.path)
+    if body == "" { fail NotFound }
+    Response(body:)
+  })
+}
+
+fn pure() -> Handler[{}, {}] {
+  Handler(run: |req| Response(body: req.path))
+}
+
+fn too_much() -> Handler[{}, {}] {
+  Handler(run: |req| fail NotFound)
+}
+
+fn wrap[E, R](h: Handler[E, R]) -> Handler[E | Timeout, { R, Log }] {
+  Handler(run: |req| {
+    (use Log).info("wrap")
+    h.run(req)
+  })
+}
+
+fn misplaced(a: Handler[{ Db }, Db], b: Handler[NotFound, NotFound | Timeout], c: List[{}], d: Handler[NotFound | Db, {}]) { () }

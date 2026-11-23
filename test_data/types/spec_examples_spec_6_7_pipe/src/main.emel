@@ -1,0 +1,8 @@
+fn is_valid(n: Int) -> Bool { n >= 0 }  # 補
+fn add(acc: Int, n: Int) -> Int { acc + n }  # 補
+
+fn total(scores: List[Int]) -> Int {
+  scores
+    |> List.filter(is_valid)
+    |> List.fold(from: 0, f: add)
+}

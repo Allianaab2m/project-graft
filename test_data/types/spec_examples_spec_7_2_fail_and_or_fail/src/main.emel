@@ -1,0 +1,18 @@
+type User(id: Int, name: String)  # 補
+error NotFound(id: Int)
+
+fn or_fail[A, E](opt: Option[A], err: E) -> A fails E {
+  opt match {
+    Some(a) -> a
+    None    -> fail err
+  }
+}
+
+fn find(users: List[User], id: Int) {  # 補
+  user = List.find(users, |u| u.id == id) |> or_fail(NotFound(id:))
+  user
+}
+
+fn raise(id: Int) {  # 補
+  fail NotFound(id:)
+}

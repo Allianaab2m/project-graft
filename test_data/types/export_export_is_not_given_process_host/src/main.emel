@@ -1,0 +1,13 @@
+@external(js, "./fs.mjs", "readText")
+fn read_host(path: String) -> String uses { ProcessHost }
+
+effect Files {
+  fn read(path: String) -> String
+}
+
+handler SystemFiles: Files {
+  fn read(path) { read_host(path) }
+}
+
+@export(js, "f")
+pub fn f() -> String { with SystemFiles { (use Files).read("a") } }

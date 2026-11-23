@@ -1,0 +1,9 @@
+error Boom
+
+fn a(n: Int) {
+  if n > 0 { b(n - 1) } else { fail Boom }
+}
+
+fn b(n: Int) {
+  a(n) escape { Boom -> 0 }
+}

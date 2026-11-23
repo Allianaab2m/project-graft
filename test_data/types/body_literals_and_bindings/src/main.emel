@@ -1,0 +1,8 @@
+fn f(n: Int) -> (Int, String) {
+  a = 1
+  b = 2.5
+  c = "s"
+  d = (a, c)
+  e = ()
+  (n, c)
+}

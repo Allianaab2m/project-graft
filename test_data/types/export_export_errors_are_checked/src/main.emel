@@ -1,0 +1,4 @@
+error Timeout
+
+@export(js, "f")
+pub fn f() -> Int fails Timeout { fail Timeout }

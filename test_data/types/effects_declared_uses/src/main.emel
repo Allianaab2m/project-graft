@@ -1,0 +1,28 @@
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  fn now() -> Int
+}
+
+fn declared() -> () uses { Logger } {
+  (use Logger).info("a")
+}
+
+fn too_many() -> () uses { Logger } {
+  (use Clock).now()
+  ()
+}
+
+fn pure_only() -> () uses {} {
+  (use Logger).info("a")
+}
+
+fn run_pure(f: fn() -> () uses {}) { f() }
+
+fn callers() {
+  run_pure(|| ())
+  run_pure(|| (use Logger).info("x"))
+  run_pure(declared)
+}

@@ -1,0 +1,38 @@
+type User(name: String)  # 補
+type Data(n: Int)  # 補
+error NotFound(id: Int)  # 補
+error DbError(message: String)  # 補
+error Unavailable(reason: String)  # 補
+
+fn find_user(id: Int) -> User fails NotFound { fail NotFound(id:) }  # 補
+fn guest_user() -> User { User(name: "guest") }  # 補
+fn load(id: Int) -> Data fails NotFound | DbError { fail DbError(message: "down") }  # 補
+fn default_data() -> Data { Data(n: 0) }  # 補
+
+fn recover(id: Int) {
+  user = find_user(id) escape {
+    NotFound(_) -> guest_user()
+  }
+  user
+}
+
+fn partial(id: Int) {
+  data = load(id) escape {
+    NotFound(_) -> default_data()
+  }
+  data
+}
+
+fn convert(id: Int) {
+  data = load(id) escape {
+    DbError(message:) -> fail Unavailable(reason: message)
+  }
+  data
+}
+
+fn as_value(id: Int) {
+  found = Some(find_user(id)) escape {
+    NotFound(_) -> None
+  }
+  found
+}

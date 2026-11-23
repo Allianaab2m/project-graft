@@ -1,0 +1,33 @@
+import Std.Fiber.{Fiber, Scope}
+import Std.Queue.{Queue}
+
+fn handle() {
+  Fiber.scope(|| Fiber.fork(|| 1))
+}
+
+fn optional() {
+  Fiber.scope(|| Some(Fiber.fork(|| 1)))
+}
+
+fn deferred() {
+  Fiber.scope(|| (Fiber.deferred(), 1))
+}
+
+fn joined() {
+  Fiber.scope(|| Fiber.join(Fiber.fork(|| 1)))
+}
+
+fn piped() {
+  (|| Fiber.fork(|| 1)) |> Fiber.scope()
+}
+
+fn semaphore() {
+  Fiber.scope(|| Fiber.semaphore(2))
+}
+
+fn queue() {
+  Fiber.scope(|| {
+    q: Queue[Int] = Fiber.queue(1)
+    [q]
+  })
+}

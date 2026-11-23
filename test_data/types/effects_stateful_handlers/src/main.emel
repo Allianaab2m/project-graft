@@ -1,0 +1,64 @@
+error DbDown
+
+type Connection(url: String)
+
+effect Config {
+  fn db_url() -> String
+}
+
+effect Users {
+  fn find(id: Int) -> String
+}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+effect Clock {
+  suspend fn sleep(ms: Int) -> ()
+}
+
+fn connect(url: String) -> Connection fails DbDown {
+  if url == "" { fail DbDown } else { Connection(url:) }
+}
+
+handler PostgresUsers(conn: Connection): Users {
+  init {
+    config = use Config
+    PostgresUsers(conn: connect(config.db_url()))
+  }
+
+  release {
+    (use Logger).info(self.conn.url)
+    (use Clock).sleep(10)
+  }
+
+  fn find(id) { self.conn.url }
+}
+
+handler EnvConfig: Config {
+  fn db_url() { "postgres://" }
+}
+
+handler Quiet: Logger {
+  init { Quiet }
+  release { () }
+  fn info(msg) { () }
+}
+
+handler Unit(): Logger {
+  init { Unit() }
+  fn info(msg) { () }
+}
+
+fn lookup() {
+  with EnvConfig, PostgresUsers { (use Users).find(1) }
+}
+
+fn reversed() {
+  with PostgresUsers, EnvConfig { (use Users).find(1) }
+}
+
+fn logged() {
+  with Quiet, EnvConfig, PostgresUsers { (use Users).find(1) }
+}

@@ -1,0 +1,28 @@
+handler FixedQuery: Query {
+  fn query(sql) { 7 }
+}
+
+layer Both {
+  SystemTx(url: "db")
+  FixedQuery
+}
+
+handler Plain: Query + Execute {
+  fn query(sql) { 0 }
+  fn execute(sql) { () }
+}
+
+layer Fine {
+  Plain
+}
+
+fn overridden() -> Int {
+  with Plain, FixedQuery {
+    (use Execute).execute("a")
+    (use Query).query("b")
+  }
+}
+
+fn from_layer() -> Int {
+  with Fine { (use Query).query("c") }
+}

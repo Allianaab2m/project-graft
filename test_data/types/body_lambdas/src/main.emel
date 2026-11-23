@@ -1,0 +1,13 @@
+type User(id: Int, name: String)
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int { f(x) }
+fn names(users: List[User], f: fn(User) -> String) -> List[String] { todo() }
+
+fn f(users: List[User]) -> Int {
+  inc = |x| x + 1
+  typed = |x: Int| x * 2
+  a = apply(|n| n * 3, 1)
+  b = names(users, |u| u.name)
+  c = inc(1)
+  a
+}

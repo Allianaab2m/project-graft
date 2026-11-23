@@ -1,0 +1,13 @@
+type Request(path: String)  # 補
+type Response(body: String)  # 補
+error NotFound  # 補
+
+type Handler[E, R](run: fn(Request) -> Response fails E uses { R })
+
+fn serve[E, R](h: Handler[E, R], req: Request) -> Response fails E uses { R } {  # 補
+  h.run(req)
+}
+
+fn not_found() -> Handler[NotFound, Never] {  # 補．効果の集合の位置に型を書くと E0323
+  Handler(run: |req| fail NotFound)
+}

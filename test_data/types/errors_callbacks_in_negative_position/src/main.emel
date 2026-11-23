@@ -1,0 +1,9 @@
+error Boom
+
+fn with_callback(f: fn(fn() -> Int) -> Int) -> Int {
+  f(|| 1)
+}
+
+fn bad_callback(f: fn(fn() -> Int) -> Int) -> Int {
+  f(|| fail Boom)
+}

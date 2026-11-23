@@ -1,0 +1,11 @@
+fn f(o: Option[Int]) -> Int {
+  a = o match {
+    Some(x) -> x
+    None -> "none"
+  }
+  b = o match {
+    Some(x) if x -> 1
+    "s" -> 2
+  }
+  1
+}

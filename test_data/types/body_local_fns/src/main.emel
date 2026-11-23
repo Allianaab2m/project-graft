@@ -1,0 +1,32 @@
+pub fn range(from: Int, to: Int) -> List[Int] {
+  fn onto(to: Int, acc: List[Int]) -> List[Int] {
+    if to <= from { acc } else { onto(to - 1, [to - 1, ..acc]) }
+  }
+  onto(to, [])
+}
+
+fn first[A](xs: List[A], fallback: A) -> A {
+  fn go(ys: List[A]) -> A {
+    ys match {
+      [y, ..] -> y
+      [] -> fallback
+    }
+  }
+  go(xs)
+}
+
+fn inferred(x: Int) {
+  fn twice(n: Int) { n * 2 }
+  twice(x)
+}
+
+fn named(x: Int) -> Int {
+  fn sub(a: Int, b: Int) -> Int { a - b }
+  sub(b: 1, a: x)
+}
+
+fn as_value() -> fn(Int) -> Int {
+  fn inc(n: Int) -> Int { n + 1 }
+  f = inc
+  f
+}

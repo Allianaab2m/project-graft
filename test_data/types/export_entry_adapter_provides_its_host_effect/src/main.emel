@@ -1,0 +1,27 @@
+@external(js, "./fs.mjs", "readText")
+fn read_host(path: String) -> String uses { ProcessHost }
+
+@external(js, "./dom.mjs", "title")
+fn title_host() -> String uses { PageHost }
+
+effect Files {
+  fn read(path: String) -> String
+}
+
+handler SystemFiles: Files {
+  fn read(path) { read_host(path) }
+}
+
+handler PageFiles: Files {
+  fn read(path) { title_host() }
+}
+
+@export(js, "default", "fetch")
+pub fn serve(app: fn(String) -> String fails {} uses { Async, ProcessHost }, req: String) -> String
+  uses { Async, ProcessHost } {
+  with SystemFiles { (use Files).read(req) }
+  app(req)
+}
+
+@entry(serve)
+pub fn app(req: String) -> String { with SystemFiles { (use Files).read(req) } }

@@ -1,0 +1,9 @@
+fn add(x: Int, y: Int) -> Int { x }
+fn pair[A, B](a: A, b: B) -> (A, B) { (a, b) }
+
+fn f() -> Int {
+  a = add(1, 2)
+  p = pair(1, "s")
+  q = pair("t", 2.0)
+  a
+}

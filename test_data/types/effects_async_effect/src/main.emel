@@ -1,0 +1,10 @@
+handler MyAsync: Async {
+}
+
+fn grab() { use Async }
+
+fn declared() -> Int uses { Async } { 1 }
+
+fn main() {
+  with MyAsync { declared() }
+}

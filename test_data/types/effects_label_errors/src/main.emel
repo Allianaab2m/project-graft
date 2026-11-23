@@ -1,0 +1,43 @@
+effect Log {
+  fn log(msg: String) -> ()
+}
+
+effect Other {
+  fn other() -> ()
+}
+
+effect Audit of Log
+effect Nested of Audit
+effect Bad of Async
+
+handler PrintLog: Log {
+  fn log(msg) { () }
+}
+
+handler OtherH: Other {
+  fn other() { () }
+}
+
+handler AuditH: Audit {
+  fn log(msg) { () }
+}
+
+fn a() { (use Log).log("a") }
+
+fn uses_audit() { (use Audit).log("x") }
+
+fn main() {
+  with Log { a() }
+  with Log by PrintLog { a() }
+  with PrintLog, Audit by OtherH { uses_audit() }
+  with PrintLog, Audit by PrintLog, Audit by Log { uses_audit() }
+}
+
+fn undefault() {
+  with PrintLog { uses_audit() }
+}
+
+fn unused(f: fn() -> ()) {
+  with PrintLog, Audit by PrintLog { a() }
+  with PrintLog, Audit by PrintLog { f() }
+}

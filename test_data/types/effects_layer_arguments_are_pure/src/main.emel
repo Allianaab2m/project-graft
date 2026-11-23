@@ -1,0 +1,28 @@
+effect Config {
+  fn url() -> String
+}
+
+effect Kv {
+  fn get(key: String) -> String
+}
+
+handler RemoteKv(url: String): Kv {
+  init(url: String) { RemoteKv(url:) }
+  fn get(key) { self.url }
+}
+
+const HOST: String = "kv"
+
+fn url_of(host: String) -> String { "kv://#{host}" }
+
+layer Pure {
+  RemoteKv(url: url_of(HOST))
+}
+
+layer Impure {
+  RemoteKv(url: (use Config).url())
+}
+
+fn main() {
+  with Pure { (use Kv).get("a") }
+}

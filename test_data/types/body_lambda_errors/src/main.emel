@@ -1,0 +1,9 @@
+fn apply(f: fn(Int) -> Int, x: Int) -> Int { f(x) }
+
+fn f() -> Int {
+  a = apply(|n| "s", 1)
+  b = apply(|n, m| n, 1)
+  c = apply(|n: String| 1, 1)
+  g = |u| u.name
+  1
+}

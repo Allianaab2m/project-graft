@@ -1,0 +1,89 @@
+import Std.Fiber.{Fiber, Scope}
+import Std.Semaphore.{Semaphore}
+import Std.Queue.{Queue, QueueClosed}
+
+error NotFound(id: Int)
+
+type User(id: Int)
+type Job(id: Int)
+
+effect Users {
+  fn find(id: Int) -> User fails NotFound
+}
+
+fn load(id: Int) -> User fails NotFound uses { Users } {
+  (use Users).find(id)
+}
+
+fn load_all(ids: List[Int]) {
+  Fiber.scope(|| {
+    db = Fiber.semaphore(10)
+    Fiber.map(ids, |id| db.with_permit(|| load(id)))
+  })
+}
+
+fn weighted(s: Semaphore, n: Int) {
+  s.with_permits(n, || load(n))
+}
+
+fn tried(s: Semaphore) {
+  s.try_with_permit(|| load(1))
+}
+
+fn tried_n(s: Semaphore) {
+  s.try_with_permits(2, || 1)
+}
+
+fn counted(s: Semaphore) {
+  s.available()
+}
+
+fn run(jobs: List[Job]) {
+  Fiber.scope(|| {
+    q = Fiber.queue(100)
+    Fiber.fork(|| {
+      jobs.each(|job| q.offer(job))
+      q.close()
+    })
+    work(q)
+  })
+}
+
+fn work(q: Queue[Job]) {
+  next = Some(q.take()) escape {
+    QueueClosed -> None
+  }
+  next match {
+    Some(job) -> work(q)
+    None -> ()
+  }
+}
+
+fn taken(q: Queue[Job]) {
+  q.take()
+}
+
+fn others(q: Queue[Job]) {
+  (q.try_offer(Job(id: 1)), q.poll(), q.size())
+}
+
+fn query(sql: String) -> List[String] {
+  [sql]
+}
+
+fn spec_11_9(sql: String) {
+  Fiber.scope(|| {
+    db = Fiber.semaphore(10) # Semaphore, belongs to the scope
+    rows = db.with_permit(|| query(sql))
+    rows
+  })
+}
+
+fn spec_11_10(job: Job) {
+  Fiber.scope(|| {
+    q = Fiber.queue(100) # Queue[A], belongs to the scope
+    q.offer(job)
+    taken = q.take()
+    taken
+  })
+}

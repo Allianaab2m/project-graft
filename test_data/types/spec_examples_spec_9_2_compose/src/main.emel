@@ -1,0 +1,8 @@
+fn compose[A, B, C](f: fn(A) -> B, g: fn(B) -> C) -> fn(A) -> C {
+  |x| g(f(x))
+}
+
+fn use_it() -> String {
+  h = compose(|n: Int| n + 1, |n| "#{n}")
+  h(1)
+}

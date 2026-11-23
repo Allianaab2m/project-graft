@@ -1,0 +1,18 @@
+const A = B + 1
+const B = {
+  x = C
+  x * A
+}
+const C = 1
+const SELF = SELF
+const P = (Q, 1)
+const Q = [P]
+const BRANCH = if True { OTHER } else { 0 }
+const OTHER = BRANCH
+const LAZY = False && LAZY2
+const LAZY2 = LAZY
+const LAMBDA = || LAMBDA2()
+const LAMBDA2 = LAMBDA
+const CALL = f()
+
+fn f() -> Int { CALL }

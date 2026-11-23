@@ -1,0 +1,53 @@
+effect Quiet {
+  fn hush() -> ()
+}
+
+effect Logger {
+  fn info(msg: String) -> ()
+}
+
+handler Silent: Quiet {
+  fn hush() { () }
+}
+
+fn run[R](f: fn() -> () uses { Quiet, R }) -> () uses { R } {
+  with Silent { f() }
+}
+
+fn run_rev[R](f: fn() -> () uses { R, Quiet }) -> () uses { R } {
+  with Silent { f() }
+}
+
+fn run_inferred[R](f: fn() -> () uses { Quiet, R }) {
+  with Silent { f() }
+}
+
+fn run_hidden(f: fn() -> ()) {
+  with Silent { f() }
+}
+
+fn not_provided[R](f: fn() -> () uses { Quiet, R }) -> () uses { R } {
+  f()
+}
+
+fn wrap[R](f: fn() -> () uses { R }) -> fn() -> () uses { Quiet, R } {
+  || {
+    (use Quiet).hush()
+    f()
+  }
+}
+
+fn forward(g: fn() -> ()) {
+  run(g)
+}
+
+fn callers() {
+  a = run(|| {
+    (use Quiet).hush()
+    (use Logger).info("x")
+  })
+  b = run(|| (use Quiet).hush())
+  c = run(|| ())
+  d = run_hidden(|| (use Quiet).hush())
+  e = run(wrap(|| (use Logger).info("y")))
+}

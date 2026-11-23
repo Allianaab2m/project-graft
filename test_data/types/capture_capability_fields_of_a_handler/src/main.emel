@@ -1,0 +1,22 @@
+effect Users {
+  fn find(id: Int) -> Int
+}
+
+handler PostgresUsers(db: use Db): Users {
+  init(db: use Db) { PostgresUsers(db:) }
+  fn find(id) { self.db.query("#{id}") }
+}
+
+fn run() -> Int {
+  with PrimaryDb {
+    with PostgresUsers(db: use Db) {
+      (use Users).find(1)
+    }
+  }
+}
+
+fn from_param(db: use Db) -> Int {
+  with PostgresUsers(db:) {
+    (use Users).find(2)
+  }
+}

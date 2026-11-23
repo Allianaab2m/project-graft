@@ -1,0 +1,28 @@
+type Config(name: String)  # 補
+error NotFound  # 補
+error InvalidText  # 補
+
+fn load_config(path: String) -> Config fails NotFound | InvalidText { fail NotFound }  # 補
+fn default_config() -> Config { Config(name: "default") }  # 補
+
+fn fallback(path: String) -> Config {  # 補
+  config = load_config(path) escape {
+    _ -> default_config()
+  }
+  config
+}
+
+fn bundled(path: String) -> Config {  # 補
+  config = load_config(path) escape {
+    _ -> panic("the bundled config must load")
+  }
+  config
+}
+
+fn or_else[A, E](f: fn() -> A fails E, default: A) -> A {
+  f() escape { _ -> default }
+}
+
+fn callers(path: String) -> Config {  # 補
+  or_else(|| load_config(path), default_config())
+}

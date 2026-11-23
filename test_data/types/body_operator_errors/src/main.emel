@@ -1,0 +1,10 @@
+fn f(n: Int, big: Int64, s: String, c: Bool) -> Int {
+  a = n + big
+  b = s + s
+  d = n + 1.5
+  e = -c
+  g = !n
+  h = c && 1
+  i = n == "x"
+  n
+}
