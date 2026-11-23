@@ -130,8 +130,9 @@ pub type BodyState(
 pub type PendingWith(expr: Int, body: Int, entries: List[Entry], deps: List[Row])
 
 ## The scope functions of the built-in effects (`Fiber.scope`) and the types their operations
-## return (`Fiber`, `Deferred`), which cannot leave a scope (E0425).
-pub type Fibers(scope_fns: List[Int], handles: List[Int])
+## return (`Fiber`, `Deferred`), which cannot leave a scope (E0425). `provides` maps each scope
+## function to the effect it provides.
+pub type Fibers(scope_fns: List[Int], handles: List[Int], provides: Map[Int, Int])
 
 ## A set that must be Immediate (E0416): where it was required, and the definition whose type
 ## parameters it may name.

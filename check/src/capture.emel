@@ -1,0 +1,874 @@
+## Capture sets (`[effect.escape]`, `[fiber.escape]`): which capabilities a value may hold, and
+## the check that a value does not leave the `with` or `Fiber.scope` that provides one of them
+## (W0402). Follows `capture.rs` of the reference type checker.
+##
+## - An element of a capture set is a root (`Holder`): the handler of an entry of a `with`, the
+##   Scope of a `Fiber.scope` call, or, inside a function, what its caller passes: a parameter, or
+##   the handler of an effect `use`d where no `with` of the same definition provides it.
+## - A value's capture set is computed from its expression: a closure holds what its captured
+##   variables hold, a data structure what its elements hold, the result of a call what the
+##   callee's return value holds with the parameters replaced by the arguments.
+## - A function value also carries what its return value holds (`FnVal`).
+## - A value whose type cannot contain a capability holds nothing.
+## - The return value of a top-level definition is summarized per definition, in terms of its
+##   parameters and the effects its caller provides. Within a group the summaries are computed
+##   again until they no longer grow.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  Span,
+  Param,
+  WithItem,
+  ResDef,
+  ResLocal,
+  FnKind,
+  CtorKind,
+  ErrorKind,
+  ParamLocal,
+  LambdaParamLocal,
+  OpPipe,
+  SInterp,
+  PBind,
+  PCtor,
+  PTuple,
+  PList,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  SLet,
+  SLocalFn,
+  SExpr,
+  IHandler,
+}
+import Ty.{
+  Ty,
+  TyFn,
+  TyCap,
+  TyBound,
+  TyVar,
+  TyTuple,
+  TyList,
+  TyNamed,
+  ConHandler,
+  SetParamKind,
+  child_types,
+}
+import Tylower.{TyDiag, TyTable, con_def, def_of}
+import Signature
+import Signature.{Signatures}
+import Bodystate.{Fibers, fn_parts}
+import Layer
+import Groups.{item_args}
+
+## A function, closure or local fn, as the owner of parameters and of what its caller provides.
+pub enum Binder {
+  BDef(def: Int)
+  BLambda(expr: Int)
+  BLocalFn(local: Int)
+} derive Eq
+
+## An element of a capture set.
+pub enum Holder {
+  ## The handler of entry `entry` of the `with` expression `with_expr`.
+  HWith(with_expr: Int, entry: Int)
+  ## The handler that item `item` of the `with` expression opens as a handler member.
+  HOpened(with_expr: Int, item: Int)
+  ## The Scope of the call of a scope function.
+  HScope(call: Int)
+  ## What parameter `index` of the binder holds.
+  HParam(binder: Binder, index: Int)
+  ## The handler of the effect that the caller of the binder provides.
+  HCaller(binder: Binder, eff: Int)
+} derive Eq
+
+## What a function value returns when called, with the parameters and caller-provided effects of
+## `binder` to be replaced at the call.
+type FnVal(binder: Binder, ret: List[Holder]) derive Eq
+
+## The abstract value of an expression.
+type Val(holds: List[Holder], call: Option[FnVal])
+
+fn val_of(holds: List[Holder]) -> Val {
+  Val(holds, None)
+}
+
+fn nothing() -> Val {
+  Val([], None)
+}
+
+## What the analysis of a group reads: the program and the settled types of its bodies.
+pub type CaptureInput(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  fibers: Fibers,
+  exprs: Map[Int, Ty],
+  locals: Map[Int, Ty],
+  calls: Map[Int, List[Option[Int]]],
+  ops: Map[Int, Int],
+  methods: Map[Int, Int],
+)
+
+## The state of analyzing one definition.
+type Cx(
+  input: CaptureInput,
+  summaries: Map[Int, List[Holder]],
+  ## Whether to report (the last round).
+  report: Bool,
+  env: Map[Int, Val],
+  ## The enclosing `with` expressions, innermost first, with the effect each entry provides by
+  ## name.
+  withs: List[(Int, List[Option[Int]])],
+  ## The enclosing binders, innermost first.
+  binders: List[Binder],
+  ## Where values leave what provides a root they hold. Newest first.
+  escapes: List[Span],
+)
+
+fn cx() -> Cx uses { State[Cx] } {
+  (use State[Cx]).get()
+}
+
+fn cupd(f: fn(Cx) -> Cx) -> () uses { State[Cx] } {
+  s = use State[Cx]
+  s.set(f(s.get()))
+}
+
+fn inp() -> CaptureInput uses { State[Cx] } {
+  cx().input
+}
+
+# ---------------------------------------------------------------------------------------------
+# Sets of roots: lists without duplicates, in a canonical order
+
+fn when_some[A](o: Option[A], f: fn(A) -> ()) -> () {
+  o match {
+    Some(x) -> f(x)
+    None    -> ()
+  }
+}
+
+fn binder_key(b: Binder) -> (Int, Int) {
+  b match {
+    BDef(d)     -> (0, d)
+    BLambda(e)  -> (1, e)
+    BLocalFn(l) -> (2, l)
+  }
+}
+
+fn key(h: Holder) -> (Int, Int, Int, Int) {
+  h match {
+    HWith(w, i)   -> (0, 0, w, i)
+    HOpened(w, i) -> (1, 0, w, i)
+    HScope(c)     -> (2, 0, c, 0)
+    HParam(b, i) -> {
+      (t, id) = binder_key(b)
+      (3, t, id, i)
+    }
+    HCaller(b, e) -> {
+      (t, id) = binder_key(b)
+      (4, t, id, e)
+    }
+  }
+}
+
+fn add(holds: List[Holder], h: Holder) -> List[Holder] {
+  if holds.any(|x| x == h) {
+    holds
+  } else {
+    k = key(h)
+    before = holds.filter(|x| Ord.compare(key(x), k) == Less)
+    after = holds.filter(|x| Ord.compare(key(x), k) == Greater)
+    before.append([h, ..after])
+  }
+}
+
+fn merge(a: List[Holder], b: List[Holder]) -> List[Holder] {
+  b.fold(a, add)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Groups
+
+## Computes the capture sets of a group and reports W0402 for values that leave the `with` or
+## scope providing a root they hold. Returns the summaries with the group's.
+pub fn check_group(
+  input: CaptureInput,
+  summaries: Map[Int, List[Holder]],
+  group: List[Int],
+) -> (Map[Int, List[Holder]], List[TyDiag]) {
+  program = input.program
+  defs = group.filter(|def| {
+    is_handler = program.items.get(def) match {
+      Some(IHandler(_)) -> True
+      _                 -> False
+    }
+    is_handler || has_body(program, def)
+  })
+  if defs.is_empty() {
+    (summaries, [])
+  } else {
+    final = settle(input, defs, summaries, 16)
+    diags = defs.flat_map(|def| {
+      (_, state) = State.run(new_cx(input, final, True), || analyze_def(def))
+      state.escapes.reverse().map(|s| TyDiag(Some(s), "W0402", "this value leaves its scope", True))
+    })
+    (final, diags)
+  }
+}
+
+fn new_cx(input: CaptureInput, summaries: Map[Int, List[Holder]], report: Bool) -> Cx {
+  Cx(input, summaries, report, Map.empty(), [], [], [])
+}
+
+## Summaries only grow, so this ends; the bound only guards against a mistake.
+fn settle(
+  input: CaptureInput,
+  defs: List[Int],
+  summaries: Map[Int, List[Holder]],
+  rounds: Int,
+) -> Map[Int, List[Holder]] {
+  if rounds == 0 {
+    summaries
+  } else {
+    (next, changed) = defs.fold((summaries, False), |(sums, changed), def| {
+      (ret, _) = State.run(new_cx(input, sums, False), || analyze_def(def))
+      ret match {
+        Some(r) if sums.get(def) != Some(r) -> (sums.insert(def, r), True)
+        _                                   -> (sums, changed)
+      }
+    })
+    if changed { settle(input, defs, next, rounds - 1) } else { next }
+  }
+}
+
+## Analyzes the bodies of a definition. Returns what the return value of a function holds; None
+## for a handler, whose operations are called through their declarations.
+fn analyze_def(def: Int) -> Option[List[Holder]] uses { State[Cx] } {
+  program = inp().program
+  cupd(|c| Cx(binders: [BDef(def), ..c.binders], ..c))
+  program.items.get(def) match {
+    Some(IHandler(item)) -> {
+      item.init.map(|b| [b]).or([]).append(item.release.map(|(_, b)| [b]).or([])).append(
+        item.ops.filter_map(|op| op.body),
+      ).each(|b| {
+        eval(b)
+        ()
+      })
+      None
+    }
+    _ -> fn_parts(program, def).and_then(|(params, body)| {
+      params.enumerate().each(|(i, p)| bind(p.local, val_of([HParam(BDef(def), i)])))
+      body.map(|b| eval(b).holds)
+    })
+  }
+}
+
+fn binder() -> Binder uses { State[Cx] } {
+  cx().binders.head().or(BDef(0))
+}
+
+fn ty_of(expr: Int) -> Option[Ty] uses { State[Cx] } {
+  inp().exprs.get(expr)
+}
+
+## Binds a local, keeping only what its type can hold.
+fn bind(local: Int, val: Val) -> () uses { State[Cx] } {
+  kept = inp().locals.get(local) match {
+    Some(ty) if !may_hold(inp(), ty) -> nothing()
+    _                                -> val
+  }
+  cupd(|c| Cx(env: c.env.insert(local, kept), ..c))
+}
+
+## Binds the variables of a pattern to what the matched value holds.
+fn bind_pat(pat: Int, val: Val) -> () uses { State[Cx] } {
+  program = inp().program
+  inner = val_of(val.holds)
+  program.pats.get(pat).map(|p| p.kind) match {
+    Some(PBind(local))      -> bind(local, val)
+    Some(PCtor(_, args, _)) -> args.or([]).each(|a| bind_pat(a.pat, inner))
+    Some(PTuple(pats))      -> pats.each(|p| bind_pat(p, inner))
+    Some(PList(elems, rest)) -> {
+      elems.each(|p| bind_pat(p, inner))
+      when_some(rest.and_then(|r| r.binding), |local| bind(local, inner))
+    }
+    _                       -> ()
+  }
+}
+
+## The root `use E` refers to here.
+fn use_root(eff: Int) -> Holder uses { State[Cx] } {
+  found = cx().withs.fold(None, |acc, (w, provides)| {
+    acc match {
+      Some(_) -> acc
+      None    -> provides.enumerate().find(|(_, e)| e == Some(eff)).map(|(i, _)| HWith(w, i))
+    }
+  })
+  found.or(HCaller(binder(), eff))
+}
+
+## The value of an expression. Every subexpression is visited, so that the `with`s and scopes
+## inside are checked.
+fn eval(expr: Int) -> Val uses { State[Cx] } {
+  val = eval_kind(expr)
+  ty_of(expr) match {
+    Some(ty) if !may_hold(inp(), ty) -> Val([], val.call)
+    _                                -> val
+  }
+}
+
+fn eval_all(exprs: List[Int]) -> List[Holder] uses { State[Cx] } {
+  exprs.fold([], |acc, e| merge(acc, eval(e).holds))
+}
+
+fn eval_kind(expr: Int) -> Val uses { State[Cx] } {
+  program = inp().program
+  program.exprs.get(expr).map(|e| e.kind) match {
+    None -> nothing()
+    Some(kind) -> kind match {
+      EMissing               -> nothing()
+      ELit(_)                -> nothing()
+      EUnit                  -> nothing()
+      EInterpolated(parts) -> {
+        parts.each(|p| {
+          p match {
+            SInterp(x) -> {
+              eval(x)
+              ()
+            }
+            _ -> ()
+          }
+        })
+        nothing()
+      }
+      EPath(ResLocal(local)) -> cx().env.get(local).or(nothing())
+      EPath(ResDef(def))     -> def_value(def)
+      EPath(_)               -> nothing()
+      EField(base, _) -> {
+        base_val = eval(base)
+        inp().ops.get(expr) match {
+          # An operation not called: calling it gives what its arguments and the handler hold.
+          Some(op) -> Val(base_val.holds, Some(FnVal(BDef(op), default_ret(op, base_val.holds))))
+          None     -> val_of(base_val.holds)
+        }
+      }
+      ECall(callee, args)    -> call(expr, callee, args.map(|a| a.value))
+      EBinary(OpPipe, lhs, rhs) -> {
+        (callee, written) = program.exprs.get(rhs).map(|r| r.kind) match {
+          Some(ECall(c, args)) -> (c, args.map(|a| a.value))
+          _                    -> (rhs, [])
+        }
+        call(expr, callee, [lhs, ..written])
+      }
+      EBinary(_, lhs, rhs) -> {
+        eval(lhs)
+        eval(rhs)
+        nothing()
+      }
+      EUnary(_, operand) -> {
+        eval(operand)
+        nothing()
+      }
+      ETuple(elems)          -> val_of(eval_all(elems))
+      EList(elems, rest)     -> val_of(eval_all(elems.append(rest.map(|r| [r]).or([]))))
+      EUpdate(ctor, fields, base) -> {
+        eval(ctor)
+        holds = eval_all(fields.map(|f| f.value))
+        val_of(merge(holds, eval(base).holds))
+      }
+      EBlock(block) -> {
+        block.stmts.each(|stmt| {
+          stmt match {
+            SLet(pat, _, value) -> {
+              val = eval(value)
+              bind_pat(pat, val)
+            }
+            SLocalFn(f) -> local_fn(f.local, f.sig.params, f.body)
+            SExpr(x) -> {
+              eval(x)
+              ()
+            }
+          }
+        })
+        block.tail.map(eval).or(nothing())
+      }
+      EIf(c, t, el) -> {
+        eval(c)
+        val = eval(t)
+        el.map(|e| join(val, eval(e))).or(val)
+      }
+      EMatch(scrutinee, arms) -> {
+        s = eval(scrutinee)
+        val_of(
+          arms.fold([], |acc, arm| {
+            bind_pat(arm.pat, s)
+            when_some(arm.guard, |g| {
+              eval(g)
+              ()
+            })
+            merge(acc, eval(arm.body).holds)
+          }),
+        )
+      }
+      EEscape(inner, arms) -> {
+        start = eval(inner).holds
+        val_of(
+          arms.fold(start, |acc, arm| {
+            bind_pat(arm.pat, nothing())
+            when_some(arm.guard, |g| {
+              eval(g)
+              ()
+            })
+            merge(acc, eval(arm.body).holds)
+          }),
+        )
+      }
+      EFail(x) -> {
+        eval(x)
+        nothing()
+      }
+      EAssert(x) -> {
+        eval(x)
+        nothing()
+      }
+      EUse(ResDef(eff), _)   -> val_of([use_root(eff)])
+      EUse(_, _)             -> nothing()
+      EWith(items, body)     -> with_val(expr, items, body)
+      ELambda(params, body)  -> closure(BLambda(expr), params.map(|p| p.local), body)
+    }
+  }
+}
+
+## The value of a closure: what its captured variables hold, and what its body returns.
+fn closure(b: Binder, params: List[Int], body: Int) -> Val uses { State[Cx] } {
+  program = inp().program
+  inside = bound_in(program, body, params)
+  captured = captured_by(program, body, inside)
+  cupd(|c| Cx(binders: [b, ..c.binders], ..c))
+  params.enumerate().each(|(i, p)| bind(p, val_of([HParam(b, i)])))
+  ret = eval(body).holds
+  cupd(|c| Cx(binders: c.binders.drop(1), ..c))
+  Val(captured, Some(FnVal(b, ret)))
+}
+
+## What the variables used inside `expr` and bound outside it hold.
+fn captured_by(program: Program, expr: Int, inside: List[Int]) -> List[Holder] uses { State[Cx] } {
+  here = program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EPath(ResLocal(local))) if !inside.any(|l| l == local) -> cx().env.get(local).map(
+      |v| v.holds,
+    ).or([])
+    _ -> []
+  }
+  children(program, expr).fold(here, |acc, c| merge(acc, captured_by(program, c, inside)))
+}
+
+## A local fn. It may call itself, so its value is computed until what it returns no longer
+## grows.
+fn local_fn(local: Int, params: List[Param], body: Int) -> () uses { State[Cx] } {
+  locals = params.map(|p| p.local)
+  b = BLocalFn(local)
+  report = cx().report
+  cupd(|c| Cx(report: False, env: c.env.insert(local, Val([], Some(FnVal(b, [])))), ..c))
+  fixed = local_rounds(local, locals, b, body, 16, nothing())
+  cupd(|c| Cx(report:, ..c))
+  # Once more to report what is inside.
+  val = if report { closure(b, locals, body) } else { fixed }
+  bind(local, val)
+}
+
+fn local_rounds(local: Int, params: List[Int], b: Binder, body: Int, rounds: Int, last: Val) -> Val
+  uses { State[Cx] } {
+  if rounds == 0 {
+    last
+  } else {
+    val = closure(b, params, body)
+    old = cx().env.get(local)
+    same = old.map(|o| o.call == val.call && o.holds == val.holds).or(False)
+    cupd(|c| Cx(env: c.env.insert(local, val), ..c))
+    if same { val } else { local_rounds(local, params, b, body, rounds - 1, val) }
+  }
+}
+
+## A reference to a top-level definition.
+fn def_value(def: Int) -> Val uses { State[Cx] } {
+  kind = def_of(inp().program, def).kind
+  if kind == FnKind || kind == CtorKind || kind == ErrorKind {
+    Val([], Some(FnVal(BDef(def), summary(def))))
+  } else {
+    nothing()
+  }
+}
+
+## What the return value of a definition holds. A definition without a body returns what its
+## arguments hold.
+fn summary(def: Int) -> List[Holder] uses { State[Cx] } {
+  cx().summaries.get(def) match {
+    Some(h) -> h
+    None    -> if has_body(inp().program, def) { [] } else { default_ret(def, []) }
+  }
+}
+
+## The return value of a declaration without a body: what its arguments hold, and `extra`.
+fn default_ret(def: Int, extra: List[Holder]) -> List[Holder] uses { State[Cx] } {
+  n = Signature.get(inp().sigs, def).map(|s| s.scheme.ty) match {
+    Some(TyFn(f)) -> f.params.length()
+    _             -> 0
+  }
+  merge(List.range(0, n).map(|i| HParam(BDef(def), i)), extra)
+}
+
+## A call. `written` are the arguments as written (for a pipe, the left side first).
+fn call(expr: Int, callee: Int, written: List[Int]) -> Val uses { State[Cx] } {
+  input = inp()
+  program = input.program
+  order = input.calls.get(expr).or(written.map(|w| Some(w)))
+  method = input.methods.get(callee)
+  op = input.ops.get(callee)
+  callee_kind = program.exprs.get(callee).map(|e| e.kind)
+  (callee_val, base_holds) = (callee_kind, method, op) match {
+    (Some(EField(_, _)), Some(_), _)       -> (nothing(), [])
+    (Some(EField(base, _)), None, Some(_)) -> (nothing(), eval(base).holds)
+    _                                      -> (eval(callee), [])
+  }
+  args = order.map(|e| e.map(eval).or(nothing()))
+  # Arguments written but not placed (an error elsewhere) are still visited.
+  written.each(|w| {
+    if !order.any(|o| o == Some(w)) {
+      eval(w)
+      ()
+    }
+  })
+  arg_tys = order.map(|e| e.and_then(|x| input.exprs.get(x)))
+  ret_ty = input.exprs.get(expr)
+  named = callee_kind match {
+    Some(EPath(ResDef(d))) -> Some(d)
+    _                      -> method
+  }
+  scope_effect = named.and_then(|d| input.fibers.provides.get(d))
+  scope_effect match {
+    Some(eff) -> scope_call(expr, callee, eff, args)
+    None -> {
+      known = method match {
+        Some(d) -> Some((BDef(d), summary(d), !has_body(program, d)))
+        None -> op match {
+          Some(o) -> Some((BDef(o), default_ret(o, base_holds), True))
+          None -> callee_val.call.map(|f| {
+            bodyless = f.binder match {
+              BDef(d) -> !has_body(program, d)
+              _       -> False
+            }
+            (f.binder, f.ret, bodyless)
+          })
+        }
+      }
+      known match {
+        Some((b, ret, bodyless)) -> {
+          keep = ret_ty.map(|t| contains_handle(input, t)).or(False)
+          placed = if bodyless && !keep {
+            args.zip(arg_tys).map(|(a, t)| {
+              if t.map(|x| is_handle(input, x)).or(False) {
+                Val(a.holds.filter(|h| !is_scope_root(input, h)), a.call)
+              } else {
+                a
+              }
+            })
+          } else {
+            args
+          }
+          val_of(apply(b, ret, placed))
+        }
+        # A function value whose body is not known. A parameter of function type returns what
+        # its arguments hold; another value may also return what it holds.
+        None -> {
+          is_param = callee_kind match {
+            Some(EPath(ResLocal(l))) -> program.locals.get(l).map(
+              |d| d.kind == ParamLocal || d.kind == LambdaParamLocal,
+            ).or(False)
+            _ -> False
+          }
+          from_args = args.fold([], |acc, a| merge(acc, a.holds))
+          holds = if is_param { from_args } else { merge(from_args, callee_val.holds) }
+          val_of(without_scope_roots_of_handles(input, holds, args, arg_tys, ret_ty))
+        }
+      }
+    }
+  }
+}
+
+## For a call of a function value whose body is not known: drop the roots of scopes that only
+## handles pass on.
+fn without_scope_roots_of_handles(
+  input: CaptureInput,
+  holds: List[Holder],
+  args: List[Val],
+  arg_tys: List[Option[Ty]],
+  ret_ty: Option[Ty],
+) -> List[Holder] {
+  if ret_ty.map(|t| contains_handle(input, t)).or(False) {
+    holds
+  } else {
+    only_from_handles = |h: Holder| {
+      args.zip(arg_tys).filter(|(a, _)| a.holds.any(|x| x == h)).all(
+        |(_, t)| t.map(|x| is_handle(input, x)).or(False),
+      )
+    }
+    holds.filter(|h| !(is_scope_root(input, h) && only_from_handles(h)))
+  }
+}
+
+## Replaces the parameters and the caller-provided effects of `b` in `ret`.
+fn apply(b: Binder, ret: List[Holder], args: List[Val]) -> List[Holder] uses { State[Cx] } {
+  ret.fold([], |out, h| {
+    h match {
+      HParam(x, i) if x == b    -> merge(out, args.get(i).map(|a| a.holds).or([]))
+      HCaller(x, eff) if x == b -> add(out, use_root(eff))
+      _                         -> add(out, h)
+    }
+  })
+}
+
+## A call of a scope function: its body is called with a new Scope. Holding the Scope, or a
+## handle it made, is W0402.
+fn scope_call(expr: Int, callee: Int, eff: Int, args: List[Val]) -> Val uses { State[Cx] } {
+  input = inp()
+  root = HScope(expr)
+  gathered = args.fold([], |acc, a| {
+    with_args = merge(acc, a.holds)
+    a.call.map(|f| {
+      f.ret.fold(with_args, |acc2, h| {
+        h match {
+          HCaller(x, e) if x == f.binder && e == eff -> add(acc2, root)
+          _                                          -> merge(acc2, apply(f.binder, [h], []))
+        }
+      })
+    }).or(with_args)
+  })
+  holds = input.exprs.get(expr) match {
+    Some(ty) if !may_hold(input, ty) -> []
+    _                                -> gathered
+  }
+  if holds.any(|h| h == root) {
+    value = args_body_tail(input.program, expr).or(expr)
+    report_escape(value)
+    val_of(holds.filter(|h| h != root))
+  } else {
+    val_of(holds)
+  }
+}
+
+## `with H1, ..., Hn { body }`.
+fn with_val(expr: Int, items: List[WithItem], body: Int) -> Val uses { State[Cx] } {
+  input = inp()
+  program = input.program
+  # The arguments of init are evaluated outside the `with`.
+  items.each(|item| {
+    item_args(item).each(|a| {
+      eval(a)
+      ()
+    })
+  })
+  entries = Layer.with_entries(program, input.table, input.sigs, items)
+  provides = entries.map(|e| if e.named { Some(e.provided.def) } else { None })
+  # A name bound to an item holds the handler of that item.
+  items.enumerate().each(|(i, item)| {
+    when_some(item.bind, |local| {
+      at = entries.enumerate().find(|(_, e)| e.origin == i && !e.from_layer).map(|(k, _)| k)
+      holder = at.map(|k| HWith(expr, k)).or(HOpened(expr, i))
+      bind(local, val_of([holder]))
+    })
+  })
+  cupd(|c| Cx(withs: [(expr, provides), ..c.withs], ..c))
+  val0 = eval(body)
+  cupd(|c| Cx(withs: c.withs.drop(1), ..c))
+  holds = input.exprs.get(expr) match {
+    Some(ty) if !may_hold(input, ty) -> []
+    _                                -> val0.holds
+  }
+  mine = |h: Holder| {
+    h match {
+      HWith(w, _)   -> w == expr
+      HOpened(w, _) -> w == expr
+      _             -> False
+    }
+  }
+  holds.filter(mine).each(|_| report_escape(tail(program, body)))
+  Val(holds.filter(|h| !mine(h)), val0.call)
+}
+
+## W0402 at `value`, the value of the body.
+fn report_escape(value: Int) -> () uses { State[Cx] } {
+  if cx().report {
+    when_span(inp().program, value, |s| cupd(|c| Cx(escapes: [s, ..c.escapes], ..c)))
+  }
+}
+
+fn when_span(program: Program, expr: Int, f: fn(Span) -> () uses { State[Cx] }) -> ()
+  uses { State[Cx] } {
+  program.exprs.get(expr) match {
+    Some(e) -> f(e.span)
+    None    -> ()
+  }
+}
+
+fn is_scope_root(input: CaptureInput, h: Holder) -> Bool {
+  h match {
+    HScope(_)     -> True
+    HCaller(_, e) -> input.fibers.provides.fold(False, |acc, _, eff| acc || eff == e)
+    _             -> False
+  }
+}
+
+## Whether `ty` belongs to a scope (Fiber, Deferred, ...).
+fn is_handle(input: CaptureInput, ty: Ty) -> Bool {
+  ty match {
+    TyNamed(con, _) -> input.fibers.handles.any(|h| h == con_def(input.table, con))
+    _               -> False
+  }
+}
+
+fn contains_handle(input: CaptureInput, ty: Ty) -> Bool {
+  is_handle(input, ty) || child_types(ty).any(|c| contains_handle(input, c))
+}
+
+fn join(a: Val, b: Val) -> Val {
+  call = (a.call, b.call) match {
+    (Some(x), Some(y)) if x.binder == y.binder -> Some(FnVal(x.binder, merge(x.ret, y.ret)))
+    _                                          -> None
+  }
+  Val(merge(a.holds, b.holds), call)
+}
+
+fn has_body(program: Program, def: Int) -> Bool {
+  fn_parts(program, def).map(|(_, body)| body.is_some()).or(False)
+}
+
+## Whether a value of type `ty` can hold a capability: whether its type contains a function type,
+## a capability, a type parameter, a handle of a scope or a handler value.
+fn may_hold(input: CaptureInput, ty: Ty) -> Bool {
+  ty match {
+    TyFn(_)        -> True
+    TyCap(_)       -> True
+    TyBound(_)     -> True
+    TyVar(_)       -> True
+    TyTuple(elems) -> elems.any(|t| may_hold(input, t))
+    TyList(elem)   -> may_hold(input, elem)
+    TyNamed(con, args) -> {
+      handler_ty = input.table.cons.get(con).map(|c| c.kind == ConHandler).or(False)
+      handle = input.fibers.handles.any(|h| h == con_def(input.table, con))
+      sets = input.table.cons.get(con).map(|c| c.params.any(|p| p.kind == SetParamKind)).or(False)
+      handler_ty || handle || sets || args.any(|t| may_hold(input, t))
+    }
+    _              -> False
+  }
+}
+
+## The expression giving the value of a body, following the last expressions of blocks.
+fn tail(program: Program, expr: Int) -> Int {
+  program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EBlock(block)) -> block.tail.map(|t| tail(program, t)).or(expr)
+    _                   -> expr
+  }
+}
+
+## The value of the body of a closure passed to a scope function.
+fn args_body_tail(program: Program, call: Int) -> Option[Int] {
+  arg = program.exprs.get(call).map(|e| e.kind) match {
+    Some(ECall(_, args))     -> args.head().map(|a| a.value)
+    Some(EBinary(_, lhs, _)) -> Some(lhs)
+    _                        -> None
+  }
+  arg.map(|a| {
+    program.exprs.get(a).map(|e| e.kind) match {
+      Some(ELambda(_, body)) -> tail(program, body)
+      _                      -> a
+    }
+  })
+}
+
+## The locals bound inside `expr`, after `out`.
+fn bound_in(program: Program, expr: Int, out: List[Int]) -> List[Int] {
+  here = program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EBlock(block)) -> block.stmts.fold(out, |acc, stmt| {
+      stmt match {
+        SLet(pat, _, _) -> pat_locals(program, pat, acc)
+        SLocalFn(f)     -> acc.append([f.local, ..f.sig.params.map(|p| p.local)])
+        SExpr(_)        -> acc
+      }
+    })
+    Some(ELambda(params, _)) -> out.append(params.map(|p| p.local))
+    Some(EMatch(_, arms))    -> arms.fold(out, |acc, arm| pat_locals(program, arm.pat, acc))
+    Some(EEscape(_, arms))   -> arms.fold(out, |acc, arm| pat_locals(program, arm.pat, acc))
+    _                        -> out
+  }
+  children(program, expr).fold(here, |acc, c| bound_in(program, c, acc))
+}
+
+fn pat_locals(program: Program, pat: Int, out: List[Int]) -> List[Int] {
+  program.pats.get(pat).map(|p| p.kind) match {
+    Some(PBind(local))      -> out.append([local])
+    Some(PCtor(_, args, _)) -> args.or([]).fold(out, |acc, a| pat_locals(program, a.pat, acc))
+    Some(PTuple(pats))      -> pats.fold(out, |acc, p| pat_locals(program, p, acc))
+    Some(PList(elems, rest)) -> {
+      with_elems = elems.fold(out, |acc, p| pat_locals(program, p, acc))
+      rest.and_then(|r| r.binding).map(|l| with_elems.append([l])).or(with_elems)
+    }
+    _                       -> out
+  }
+}
+
+## The direct subexpressions of `expr`, including the bodies of closures and local fns.
+fn children(program: Program, expr: Int) -> List[Int] {
+  arm_exprs = |arms: List[Hir.Arm]| arms.flat_map(
+    |arm| arm.guard.map(|g| [g]).or([]).append([arm.body]),
+  )
+  program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EInterpolated(parts)) -> parts.filter_map(|p| {
+      p match {
+        SInterp(x) -> Some(x)
+        _          -> None
+      }
+    })
+    Some(EField(base, _))             -> [base]
+    Some(ECall(callee, args))         -> [callee, ..args.map(|a| a.value)]
+    Some(EUnary(_, operand))          -> [operand]
+    Some(EBinary(_, lhs, rhs))        -> [lhs, rhs]
+    Some(ETuple(elems))               -> elems
+    Some(EList(elems, rest))          -> elems.append(rest.map(|r| [r]).or([]))
+    Some(EBlock(block)) -> block.stmts.map(|stmt| {
+      stmt match {
+        SLet(_, _, value) -> value
+        SLocalFn(f)       -> f.body
+        SExpr(x)          -> x
+      }
+    }).append(block.tail.map(|t| [t]).or([]))
+    Some(EIf(c, t, el))               -> [c, t].append(el.map(|x| [x]).or([]))
+    Some(EMatch(s, arms))             -> [s].append(arm_exprs(arms))
+    Some(EEscape(inner, arms))        -> [inner].append(arm_exprs(arms))
+    Some(EFail(x))                    -> [x]
+    Some(EAssert(x))                  -> [x]
+    Some(EUpdate(ctor, fields, base)) -> [ctor].append(fields.map(|f| f.value)).append([base])
+    Some(EWith(items, body))          -> items.flat_map(item_args).append([body])
+    Some(ELambda(_, body))            -> [body]
+    _                                 -> []
+  }
+}

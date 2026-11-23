@@ -9,6 +9,7 @@ import Bodystate.{HandlerFacts, Closed, ClosedMain, ClosedExport, Fibers}
 import Cycles
 import Groups
 import Layer
+import Capture
 import Export
 import Signature.{Signatures, insert_sig}
 import Traits
@@ -34,9 +35,11 @@ pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> L
         sigs,
         collect_used.fold(Map.empty(), |m, k| m.insert(k, True)),
         HandlerFacts(Map.empty(), Map.empty()),
+        Map.empty(),
+        [],
       ),
-      |(known, used, facts), group| {
-        (inferred, group_used, next_facts) = Body.infer_group(
+      |(known, used, facts, summaries, captures), group| {
+        (inferred, group_used, next_facts, types) = Body.infer_group(
           program,
           table,
           traits,
@@ -47,16 +50,34 @@ pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> L
           group,
         )
         next = inferred.fold(known, |acc, (def, sig)| insert_sig(acc, def, sig))
-        (next, group_used.fold(used, |m, k, v| m.insert(k, v)), next_facts)
+        input = Capture.CaptureInput(
+          program,
+          table,
+          next,
+          fibers,
+          types.exprs,
+          types.locals,
+          types.calls,
+          types.ops,
+          types.methods,
+        )
+        (next_summaries, escapes) = Capture.check_group(input, summaries, group)
+        (
+          next,
+          group_used.fold(used, |m, k, v| m.insert(k, v)),
+          next_facts,
+          next_summaries,
+          captures.append(escapes),
+        )
       },
     )
   })
-  (final_sigs, used, facts) = inferred
+  (final_sigs, used, facts, _, captures) = inferred
   diags = sig_diags.append(trait_diags).append(Cycles.check(program)).append(
     lowered.diags.reverse(),
   ).append(Traits.unused_derives(program, traits, used)).append(
     main_value(program, table, final_sigs, entry),
-  ).append(Layer.check_layers(program, sigs, facts.uses))
+  ).append(Layer.check_layers(program, sigs, facts.uses)).append(captures)
   main = entry_main(program, entry).and_then(|d| if is_test(program, d) { None } else { Some(d) })
   checked = Export.check(program, table, final_sigs, entry, main, made, diags).append(entry_diags)
   checked.sort_by(|a, b| Ord.compare(position(a), position(b)))
@@ -205,25 +226,35 @@ fn fibers_of(program: Program) -> Fibers {
   effect_defs = effects.map(|(d, _)| d)
   names_effect = |ty: Int| {
     program.types.get(ty).map(|r| r.kind) match {
-      Some(TFn(_, _, _, Some(uses))) -> uses.items.any(|u| {
-        u.res match {
-          ResDef(d) -> effect_defs.any(|e| e == d)
-          _         -> False
+      Some(TFn(_, _, _, Some(set))) -> set.items.fold(None, |found, u| {
+        (found, u.res) match {
+          (Some(_), _)                                     -> found
+          (None, ResDef(d)) if effect_defs.any(|e| e == d) -> Some(d)
+          _                                                -> None
         }
       })
-      _ -> False
+      _ -> None
     }
   }
-  scope_fns = program.items.fold([], |acc, def, item| {
+  provides = program.items.fold(Map.empty(), |acc, def, item| {
     item match {
       IFn(f) if f.is_intrinsic -> {
         module = def_of(program, def).module
         same = effect_defs.any(|e| def_of(program, e).module == module)
-        provides = f.sig.params.any(|p| p.ty.map(names_effect).or(False))
-        if same && provides { acc.append([def]) } else { acc }
+        provided = f.sig.params.filter_map(|p| p.ty).fold(None, |found, t| {
+          found match {
+            Some(_) -> found
+            None    -> names_effect(t)
+          }
+        })
+        provided match {
+          Some(eff) if same -> acc.insert(def, eff)
+          _                 -> acc
+        }
       }
       _ -> acc
     }
   })
-  Fibers(scope_fns, handles)
+  scope_fns = provides.fold([], |acc, def, _| acc.append([def]))
+  Fibers(scope_fns, handles, provides)
 }

@@ -84,22 +84,22 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   made by breaking corpus files (`scripts/fuzz.py tree`) and 1,600 made by moving their whitespace,
   formatted at random widths from 10 to 140 (`scripts/fuzz.py fmt`). Lexing, parsing and validating the corpus (441 KB) takes 0.31 s on native;
   formatting its largest file (18 KB) takes 50 ms.
-- M3: started. `tools/oracle check <path>` prints the diagnostics of `emela check`. The plan:
+- M3: done. `graft check <path> <emela-core lib>` prints the same diagnostics (codes and
+  positions) as `emela check` on every unit of the corpus (`scripts/check.sh`, 355 units, and
+  Graft itself); `tools/oracle check <path>` prints those of `emela check`. It was built in three
+  steps:
   1. Modules: collecting the files of a single file or a project, the bundled core and std
-     modules, and the import graph (E0201 to E0210). Done: `graft check <path> <emela-core lib>`
-     prints the same syntax, module and import graph diagnostics as `emela check` on every unit
-     of the corpus and on the cases of `test_data/check` (`scripts/check.sh`).
+     modules, and the import graph (E0201 to E0210).
   2. Name resolution: lowering the tree to HIR, where every name points to its definition
-     (E0211 to E0225, W0201, W0202, E0328, E0334). Done: the same diagnostics as `emela check` on
-     the corpus and on the 39 inputs of the name resolution tests of emela-resolve, taken into
-     `test_data/resolve`.
-  3. Type checking, from monomorphic expressions to polymorphism, effects and error sets (E03xx,
-     E04xx). In progress, on the corpus and the 214 inputs of the tests of emela-types
-     (`test_data/types`): the declared signatures, and the types of bodies (expressions,
-     patterns, calls, method calls through the module of a type or a trait, handlers and `with`
-     items), traits and impls, match coverage, and error and effect sets report the same
-     diagnostics as `emela check`, as do suspension, fiber scopes, `with` items, layers and
-     exports. Not yet: captures (W0402).
+     (E0211 to E0225, W0201, W0202, E0328, E0334), on the corpus and the 39 inputs of the name
+     resolution tests of emela-resolve (`test_data/resolve`).
+  3. Type checking (E03xx, E04xx), on the corpus and the 214 inputs of the tests of emela-types
+     (`test_data/types`): declared signatures, the types of bodies, traits and impls, match
+     coverage, error and effect sets, suspension, fiber scopes, `with` items and layers, exports
+     and capture sets.
+
+  Not ported, as the corpus never shows them: the checks of `@test`, `@internal`, `@key` and
+  `@tag` that the driver of `emela check` adds (E0226 to E0229, E0337, E0338).
 
   The corpus for M3 is what is written to be checked: the 87 programs of
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of

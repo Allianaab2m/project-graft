@@ -280,9 +280,10 @@ pub fn infer_group(
   closed: Map[Int, Closed],
   fibers: Fibers,
   group: List[Int],
-) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts) uses { State[TyLower] } {
+) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts, GroupTypes)
+  uses { State[TyLower] } {
   start = new_state(program, table, traits, sigs, facts, closed, fibers)
-  (((inferred, solved), state), _) = State.run(new_infer(), || {
+  (((inferred, solved, types), state), _) = State.run(new_infer(), || {
     set_error_tags(Tylower.error_tags(table))
     State.run(start, || {
       group.each(|def| if Signature.get(sigs, def).is_none() { declare(def) })
@@ -290,8 +291,17 @@ pub fn infer_group(
       finish()
     })
   })
-  (inferred, state.used, solved)
+  (inferred, state.used, solved, types)
 }
+
+## The settled types of a group's bodies and how its calls are placed, for capture sets.
+pub type GroupTypes(
+  exprs: Map[Int, Ty],
+  locals: Map[Int, Ty],
+  calls: Map[Int, List[Option[Int]]],
+  ops: Map[Int, Int],
+  methods: Map[Int, Int],
+)
 
 ## Switches to the definition about to be inferred, taking its module and type parameters.
 fn enter(def: Int) -> () {
@@ -462,7 +472,7 @@ fn set_binder(binder: Option[Int]) -> () {
 
 ## Finishes the group: checks deferred references and numeric types, then generalizes the
 ## definitions without declared types.
-fn finish() -> (List[(Int, Signature)], HandlerFacts) {
+fn finish() -> (List[(Int, Signature)], HandlerFacts, GroupTypes) {
   bs().deferred.reverse().each(|r| {
     pending_of(r.def) match {
       Some(p) -> {
@@ -501,7 +511,15 @@ fn finish() -> (List[(Int, Signature)], HandlerFacts) {
       fails: acc.fails.insert(h, resolve_row(var_row(fails))),
     )
   })
-  (inferred, facts)
+  b = bs()
+  types = GroupTypes(
+    exprs: b.expr_tys.map_values(resolve),
+    locals: b.locals.map_values(resolve),
+    calls: b.calls,
+    ops: b.ops,
+    methods: b.methods,
+  )
+  (inferred, facts, types)
 }
 
 ## `ty` with capability elements replaced by their effects, except the parameters in its R.
