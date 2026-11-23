@@ -1150,6 +1150,7 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
     if def_of(program, m).kind == Hir.MemberKind { Some(m) } else { None }
   })
   (op, member) match {
+    (Some((o, base)), _) if is_fork_op(o) -> fork_call(lower_expr(base), base, o, args)
     (Some((o, base)), _) -> {
       h = lower_expr(base)
       Ir.XOp(
@@ -1168,7 +1169,7 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
       }
       opened_in_init(provider, m, args)
     }
-    _ -> plain_call(expr, callee, target, args)
+    _                                     -> plain_call(expr, callee, target, args)
   }
 }
 
@@ -1269,8 +1270,18 @@ fn builtin_call(callee: Int, def: Int, args: List[Expr]) -> Option[Expr] uses { 
       SourceModule(m) -> program.modules.get(m).map(|items| String.join(items.name, ".")).or("")
       _               -> ""
     }
+    fiber_module = [
+      "Std.Fiber",
+      "Std.Exit",
+      "Std.Deferred",
+      "Std.Semaphore",
+      "Std.Queue",
+      "Std.Cause",
+    ].any(|m| m == module)
     if module == "Std.State" && data.name == "run" {
       Some(state_run(def, ref_args(callee, def), args, expr_type(callee)))
+    } else if fiber_module {
+      Some(fiber_call(module, data.name, callee, args))
     } else {
       Builtins.runtime_name(module, data.name) match {
         Some(name) -> Some(XBuiltin(name, type_args(callee), args))
@@ -1921,4 +1932,217 @@ fn layer_args(lay: Int, hdl: Int) -> List[Hir.Arg] uses { State[Lowering] } {
     ).or([])
     _ -> []
   }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Fibers (`lower/fiber.rs`)
+
+fn fiber(op: String, args: List[Expr], wait: Int) -> Expr {
+  Ir.XFiber(op, args, wait, False, False)
+}
+
+## Whether `op` is fork of the built-in effect Scope.
+fn is_fork_op(op: Int) -> Bool uses { State[Lowering] } {
+  program = st().program
+  data = def_of(program, op)
+  intrinsic = data.parent.map(|e| Tylower.is_intrinsic_effect(program, e)).or(False)
+  intrinsic && data.name == "fork"
+}
+
+## The key of the built-in effect Scope in the evidence table, from the uses of a function type.
+fn scope_key(fn_ty: Option[Ty]) -> String uses { State[Lowering] } {
+  program = st().program
+  tag = fn_ty.and_then(|t| {
+    t match {
+      TyFn(f) -> f.uses.elems.fold(None, |found, e| {
+        (found, e) match {
+          (Some(_), _)                                                        -> found
+          (None, Ty.RTag(tg)) if Tylower.is_intrinsic_effect(program, tg.def) -> Some(tg)
+          _                                                                   -> None
+        }
+      })
+      _ -> None
+    }
+  })
+  tag.map(effect_key).or("Scope")
+}
+
+## `s.fork(f)`: the child is wrapped so that fork's implementation (in Scope's handler value,
+## `scope_call`) calls it with the table at the `Fiber.scope` call, with this capability as its
+## Scope, so that it forks its siblings into the same scope (spec 11.2).
+fn fork_call(cap: Expr, base: Int, op: Int, args: List[Expr]) -> Expr uses { State[Lowering] } {
+  c = fresh_local("cap", CUnit, None)
+  f = fresh_local("f", CUnit, None)
+  ev = fresh_local("ev", Ir.CEvidence, None)
+  key = st().checked.types.exprs.get(base) match {
+    Some(Ty.TyCap(tags)) -> tags.head().map(effect_key).or("Scope")
+    _                    -> "Scope"
+  }
+  f_ty = st().checked.types.exprs.get(base).map(|_| CUnit).or(CUnit)
+  child_call = XCall(Indirect(XVar(f)), [Ir.XProvide(Some(XVar(ev)), [(key, XVar(c))])], True, True)
+  g = XLambda([ev], f_ty, child_call, True)
+  XLet(
+    c,
+    cap,
+    XLet(f, args.head().or(XLit(VUnit)), Ir.XOp(XVar(c), "fork", [g], False, False, False)),
+  )
+}
+
+## `Fiber.scope(body)`: Scope's handler value, built where it is called, whose fork runs a child
+## with the table here; the body called with it.
+fn scope_call(callee: Int, args: List[Expr]) -> Expr uses { State[Lowering] } {
+  callee_ty = st().checked.types.exprs.get(callee)
+  body_ty = callee_ty.and_then(|t| {
+    t match {
+      TyFn(f) -> f.params.head()
+      _       -> None
+    }
+  })
+  key = scope_key(body_ty)
+  fails = may_fail(callee)
+  body_suspends = body_ty.map(|t| fn_suspends(lower_type(t))).or(True)
+  ev = st().ev
+  b = fresh_local("body", CUnit, None)
+  s = fresh_local("s", CUnit, None)
+  hv = fresh_local("scope", CUnit, None)
+  g = fresh_local("g", CUnit, None)
+  n = fresh_local("n", CInt, None)
+  m = fresh_local("n", CInt, None)
+  child = XLambda([], CUnit, XCall(Indirect(XVar(g)), [XVar(ev)], fails, True), True)
+  ops = [
+    ("fork", XLambda([g], CUnit, fiber("$fork", [XVar(s), child], 0), False)),
+    ("deferred", XLambda([], CUnit, fiber("$deferred", [XVar(s)], 0), False)),
+    ("semaphore", XLambda([n], CUnit, fiber("$semaphore", [XVar(s), XVar(n)], 0), False)),
+    ("queue", XLambda([m], CUnit, fiber("$queue", [XVar(s), XVar(m)], 0), False)),
+  ]
+  run = XCall(
+    Indirect(XVar(b)),
+    [Ir.XProvide(Some(XVar(ev)), [(key, XVar(hv))])],
+    body_ty.map(|t| {
+      t match {
+        TyFn(f) -> !f.fails.elems.is_empty()
+        _       -> False
+      }
+    }).or(False),
+    body_suspends,
+  )
+  inner = XLambda([s], CUnit, XLet(hv, Ir.XHandler("Scope", ops, []), run), True)
+  XLet(b, args.head().or(XLit(VUnit)), Ir.XFiber("$scope", [inner], 1, fails, True))
+}
+
+## The `@intrinsic` fns of chapter 11.
+fn fiber_call(module: String, name: String, callee: Int, args: List[Expr]) -> Expr
+  uses { State[Lowering] } {
+  callee_ty = st().checked.types.exprs.get(callee)
+  param = |i: Int| callee_ty.and_then(|t| {
+    t match {
+      TyFn(f) -> f.params.get(i)
+      _       -> None
+    }
+  })
+  fn_fails = |t: Option[Ty]| t.map(|x| {
+    x match {
+      TyFn(f) -> !f.fails.elems.is_empty()
+      _       -> False
+    }
+  }).or(False)
+  fn_susp = |t: Option[Ty]| t.map(|x| fn_suspends(lower_type(x))).or(False)
+  arg = |i: Int| args.get(i).or(XLit(VUnit))
+  ev = st().ev
+  ("#{module}.#{name}") match {
+    "Std.Fiber.scope"         -> scope_call(callee, args)
+    "Std.Fiber.join"          -> fiber("$join", args, 2)
+    "Std.Fiber.await"         -> fiber("$fiberAwait", args, 2)
+    "Std.Fiber.interrupt"     -> fiber("$interrupt", args, 2)
+    "Std.Exit.attempt" -> {
+      f_ty = param(0)
+      f = fresh_local("f", CUnit, None)
+      suspends = fn_susp(f_ty)
+      wrapped = XLambda(
+        [],
+        CUnit,
+        XCall(Indirect(XVar(f)), [XVar(ev)], fn_fails(f_ty), suspends),
+        suspends,
+      )
+      XLet(f, arg(0), Ir.XFiber("$attempt", [wrapped], 3, False, suspends))
+    }
+    "Std.Deferred.complete"   -> fiber("$complete", args, 0)
+    "Std.Deferred.await"      -> fiber("$deferredAwait", args, 2)
+    "Std.Deferred.poll"       -> fiber("$poll", args, 0)
+    "Std.Semaphore.available" -> fiber("$available", args, 0)
+    "Std.Semaphore.with_permits" -> permits_call(args, param(2), False)
+    "Std.Semaphore.try_with_permits" -> permits_call(args, param(2), True)
+    "Std.Queue.offer"         -> XIf(fiber("$offer", args, 2), XLit(VUnit), XFail(queue_closed()))
+    "Std.Queue.take" -> {
+      x = fresh_local("x", CUnit, None)
+      some = ctor_ref(prelude_ctor("Some"))
+      XMatch(
+        fiber("$take", args, 2),
+        [Arm(QCtor(some, [QBind(x)]), None, XVar(x)), Arm(QWild, None, XFail(queue_closed()))],
+      )
+    }
+    "Std.Queue.try_offer"     -> fiber("$tryOffer", args, 0)
+    "Std.Queue.poll"          -> fiber("$queuePoll", args, 0)
+    "Std.Queue.size"          -> fiber("$size", args, 0)
+    "Std.Queue.close"         -> fiber("$close", args, 0)
+    "Std.Cause.kind" -> {
+      expr_type(callee)
+      fiber("$causeKind", args, 0)
+    }
+    "Std.Cause.to_string"     -> fiber("$causeToString", args, 0)
+    "Std.Cause.raise"         -> Ir.XFiber("$causeRaise", args, 0, may_fail(callee), False)
+    other                     -> unsupported("the intrinsic #{other}")
+  }
+}
+
+fn prelude_ctor(name: String) -> Int uses { State[Lowering] } {
+  Tylower.prelude_def(st().program, name).or(-1)
+}
+
+## The failure `QueueClosed` of `Std.Queue`.
+fn queue_closed() -> Expr uses { State[Lowering] } {
+  program = st().program
+  closed = program.modules.fold(None, |found, _, items| {
+    found match {
+      Some(_) -> found
+      None if items.name == ["Std", "Queue"] -> items.items.find(
+        |d| def_of(program, d).name == "QueueClosed",
+      )
+      None    -> None
+    }
+  })
+  closed.map(|d| XCtor(ctor_ref(d), [], [])).or(XLit(VUnit))
+}
+
+## `Semaphore.with_permits(s, n, f)`: `f` runs once the permits are taken, and they come back
+## however it ends. `try_with_permits` takes them only if available at once, and gives `None`
+## otherwise.
+fn permits_call(args: List[Expr], f_ty: Option[Ty], try_: Bool) -> Expr uses { State[Lowering] } {
+  s = fresh_local("s", CUnit, None)
+  n = fresh_local("n", CInt, None)
+  f = fresh_local("f", CUnit, None)
+  held = fresh_local("permits", CUnit, None)
+  fails = f_ty.map(|x| {
+    x match {
+      TyFn(g) -> !g.fails.elems.is_empty()
+      _       -> False
+    }
+  }).or(False)
+  suspends = f_ty.map(|x| fn_suspends(lower_type(x))).or(False)
+  call = XCall(Indirect(XVar(f)), [ev_var()], fails, suspends)
+  permits = [XVar(s), XVar(n)]
+  release = fiber("$release", permits, 0)
+  body = if try_ {
+    some = ctor_ref(prelude_ctor("Some"))
+    none = ctor_ref(prelude_ctor("None"))
+    XIf(
+      fiber("$tryAcquire", permits, 0),
+      Ir.XFinally(XCtor(some, [], [call]), release, XLit(VUnit), "Semaphore"),
+      XCtor(none, [], []),
+    )
+  } else {
+    XLet(held, fiber("$acquire", permits, 2), Ir.XFinally(call, release, XLit(VUnit), "Semaphore"))
+  }
+  values = [s, n, f].zip(args)
+  values.reverse().fold(body, |acc, (l, v)| XLet(l, v, acc))
 }

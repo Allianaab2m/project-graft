@@ -206,6 +206,10 @@ pub enum Expr {
   ## `perform` for a suspend fn operation (a request to the scheduler); `suspends` when the call
   ## may suspend.
   XOp(target: Expr, name: String, args: List[Expr], fails: Bool, suspends: Bool, perform: Bool)
+  ## A fiber operation (spec chapter 11): a call of the runtime function `op`. `wait` is 0 when it
+  ## does not suspend, 1 for a runtime generator (`yield*`), 2 for a request to the scheduler
+  ## (`yield`), and 3 when it suspends as calling a function value does (`suspends`).
+  XFiber(op: String, args: List[Expr], wait: Int, fails: Bool, suspends: Bool)
   ## `body`, then `cleanup` however `body` ends: the release of the handler value `retired` (named
   ## `name`) of a `with`, which is retired afterwards. A defect of the release notes a defect of
   ## the body.

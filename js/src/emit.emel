@@ -200,6 +200,31 @@ const RUNTIME: List[String] = [
   "$syncPerform",
   "$start",
   "$suspendOp",
+  "$scope",
+  "$fork",
+  "$deferred",
+  "$join",
+  "$fiberAwait",
+  "$interrupt",
+  "$attempt",
+  "$complete",
+  "$deferredAwait",
+  "$poll",
+  "$semaphore",
+  "$queue",
+  "$acquire",
+  "$tryAcquire",
+  "$release",
+  "$available",
+  "$offer",
+  "$take",
+  "$tryOffer",
+  "$queuePoll",
+  "$size",
+  "$close",
+  "$causeKind",
+  "$causeToString",
+  "$causeRaise",
 ]
 
 ## The comparison of derived and built-in Ord impls: by `<` on primitive values, element by
@@ -586,7 +611,10 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
         line("} catch ($e) {")
         indented(|| line("throw $releaseDefect(#{thrown}, $e, #{quote(name)});"))
         line("} finally {")
-        indented(|| line("$retire(#{h}, #{quote(name)});"))
+        # A release that is not a handler's (the permits of a semaphore) retires nothing.
+        if h != "undefined" {
+          indented(|| line("$retire(#{h}, #{quote(name)});"))
+        }
         line("}")
       })
       line("}")
@@ -932,6 +960,16 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       "#{b}.#{field_key(variant_fields(module, ctor), index)}"
     }
     XTuple(elems)              -> "[#{String.join(values_in_order(elems), ", ")}]"
+    Ir.XFiber(op, args, wait, fails, suspends) -> {
+      call = "#{op}(#{String.join(values_in_order(args), ", ")})"
+      waited = wait match {
+        1 -> "(yield* #{call})"
+        2 -> "(yield #{call})"
+        3 -> suspending_call(call, suspends, False)
+        _ -> call
+      }
+      if fails { checked(waited) } else { waited }
+    }
     Ir.XUse(ev, key)           -> "#{value_of(ev)}[#{quote(key)}]"
     Ir.XProvide(base, bindings) -> {
       vs = values_in_order(base.map(|b| [b]).or([]).append(bindings.map(|(_, h)| h)))
