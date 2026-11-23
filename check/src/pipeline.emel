@@ -180,7 +180,6 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
       Checked(if d.warning { "warning" } else { "error" }, d.code, file, Some((d.start, d.end)))
     })
     # Type checking runs on the program even when name resolution reported errors.
-    main_module = if inp.library_only { None } else { entry }
     # The reference sorts them by file, numbered in the order the files were read.
     ranks = file_ranks(map, reads, start, inp.single_file)
     rank = |d: TyDiag| {
@@ -189,7 +188,7 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
         None    -> (0, 0, 0)
       }
     }
-    sorted = Typeck.check(resolved.program, main_module).sort_by(
+    sorted = Typeck.check(resolved.program, entry, inp.library_only).sort_by(
       |a, b| Ord.compare(rank(a), rank(b)),
     )
     type_diagnostics = sorted.map(|d| {

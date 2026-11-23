@@ -24,8 +24,10 @@ core="$emela_repo/crates/emela-core/lib"
 # Immediate sets and fn operation bodies that may suspend (E0416, E0417), values leaving a fiber
 # scope (E0425), and of `with` items and layers, dependency cycles (E0411), duplicate effects
 # (E0421), layer cycles (E0422), type arguments right of `by` (E0423), labels (E0430 to E0432)
-# and unused label providers (W0401).
-implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452|E031[89]|E0321|E0420|E040[23]|W0302|E041[167]|E042[1235]|E043[0-2]|W0401)\]'
+# and unused label providers (W0401). Of exports, where `@export` and `@entry` are written (E0437,
+# E0439), boundary types (E0436), duplicate names (E0438) and entries that do not fit their
+# adapter (E0440).
+implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|E0231|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[1-9]|E031[0-7]|E0320|E032[3469]|E033[0-35-69]|W030[134]|E0401|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452|E031[89]|E0321|E0420|E040[23]|W0302|E041[167]|E042[1235]|E043[0-2]|W0401|E043[6-9]|E0440)\]'
 # `IMPLEMENTED` replaces the list, to try codes before adding them.
 implemented=${IMPLEMENTED:-$implemented}
 # Paths are printed as given (Graft) or relative to the current directory (the oracle), so the

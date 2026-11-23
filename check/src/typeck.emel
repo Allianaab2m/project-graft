@@ -9,6 +9,7 @@ import Bodystate.{HandlerFacts, Closed, ClosedMain, ClosedExport, Fibers}
 import Cycles
 import Groups
 import Layer
+import Export
 import Signature.{Signatures, insert_sig}
 import Traits
 import Tylower.{TyDiag, TyLower, TyTable, con_def, def_of, new_lower, new_table}
@@ -17,13 +18,15 @@ import Ty.{TyFn, TyPrim, TyNever, TyError, TyBound, TyVar, TyNamed}
 
 ## The diagnostics of type checking, sorted by module and start position (stable), as the
 ## reference reports them. Those without a location come first.
-## `entry` is the module whose `main` is the program's entry, if there is one.
-pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
+## `entry` is the entry module, if there is one; with `library_only`, it has no `main`.
+pub fn check(given: Program, entry_module: Option[Int], library_only: Bool) -> List[TyDiag] {
+  (program, made, entry_diags) = Export.add_entry_exports(given, entry_module)
+  entry = if library_only { None } else { entry_module }
   table = new_table(program)
   (declared, sig_diags) = Signature.collect(program, table)
   (traits, sigs, trait_diags, collect_used) = Traits.collect(program, table, declared)
   groups = Groups.groups(program, sigs)
-  closed = closed_defs(program, entry)
+  closed = closed_defs(program, entry, made)
   fibers = fibers_of(program)
   (inferred, lowered) = State.run(new_lower(program, table, []), || {
     groups.fold(
@@ -53,8 +56,10 @@ pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
     lowered.diags.reverse(),
   ).append(Traits.unused_derives(program, traits, used)).append(
     main_value(program, table, final_sigs, entry),
-  ).append(export_fails(program, final_sigs)).append(Layer.check_layers(program, sigs, facts.uses))
-  diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
+  ).append(Layer.check_layers(program, sigs, facts.uses))
+  main = entry_main(program, entry).and_then(|d| if is_test(program, d) { None } else { Some(d) })
+  checked = Export.check(program, table, final_sigs, entry, main, made, diags).append(entry_diags)
+  checked.sort_by(|a, b| Ord.compare(position(a), position(b)))
 }
 
 fn position(d: TyDiag) -> (Int, Int, Int) {
@@ -127,71 +132,50 @@ fn is_exit_code(program: Program, table: TyTable, ty: Ty.Ty) -> Bool {
 }
 
 ## The definitions whose R must be empty apart from the host effects the entry provides: the
-## entry's `main` and the tests (spec 8.3, 13.3), and `@export` fns (`[ext.export]`).
-fn closed_defs(program: Program, entry: Option[Int]) -> Map[Int, Closed] {
-  in_project = |def: Int| {
-    def_of(program, def).module match {
-      SourceModule(m) -> program.modules.get(m).map(|items| !items.is_core).or(False)
-      _               -> False
-    }
-  }
+## entry's `main` and the tests (spec 8.3, 13.3), and `@export` fns and the fns `@entry` makes
+## (`[ext.export]`).
+fn closed_defs(
+  program: Program,
+  entry: Option[Int],
+  made: List[Export.EntryExport],
+) -> Map[Int, Closed] {
   fns = program.items.fold([], |acc, def, item| {
     item match {
       IFn(f) -> acc.append([(def, f)])
       _      -> acc
     }
   })
-  tests = fns.filter(|(def, f)| f.is_test && in_project(def)).map(|(def, _)| def)
+  tests = fns.filter(|(def, _)| is_test(program, def)).map(|(def, _)| def)
   exports = fns.filter(|(_, f)| !f.exports.is_empty() && f.body.is_some()).fold(
     Map.empty(),
-    |m, (def, f)| m.insert(def, ClosedExport(adapter_hosts(program, f))),
+    |m, (def, _)| m.insert(def, ClosedExport(Export.adapter_hosts(program, def))),
   )
-  with_tests = tests.fold(exports, |m, def| m.insert(def, ClosedMain))
+  entries = made.fold(
+    exports,
+    |m, e| m.insert(e.def, ClosedExport(Export.adapter_hosts(program, e.adapter))),
+  )
+  with_tests = tests.fold(entries, |m, def| m.insert(def, ClosedMain))
   entry_main(program, entry).and_then(|d| if tests.any(|t| t == d) { None } else { Some(d) }).map(
     |d| with_tests.insert(d, ClosedMain),
   ).or(with_tests)
 }
 
+## Whether `def` is a test of the project (not of the bundled modules).
+fn is_test(program: Program, def: Int) -> Bool {
+  in_project = def_of(program, def).module match {
+    SourceModule(m) -> program.modules.get(m).map(|items| !items.is_core).or(False)
+    _               -> False
+  }
+  test = program.items.get(def) match {
+    Some(IFn(f)) -> f.is_test
+    _            -> False
+  }
+  test && in_project
+}
+
 fn entry_main(program: Program, entry: Option[Int]) -> Option[Int] {
   entry.and_then(|m| program.modules.get(m)).and_then(|items| {
     items.items.find(|d| def_of(program, d).name == "main" && def_of(program, d).kind == FnKind)
-  })
-}
-
-## The host effects (other than Async) that the function type of an `@export` fn's first
-## parameter uses: an entry adapter gives them (`[ext.entry]`).
-fn adapter_hosts(program: Program, f: Hir.FnItem) -> List[Int] {
-  f.sig.params.head().and_then(|p| p.ty).and_then(|t| program.types.get(t)).map(|r| r.kind) match {
-    Some(TFn(_, _, _, Some(uses))) -> uses.items.filter_map(|e| {
-      e.res match {
-        ResDef(d) if Signature.is_host_effect(program, d)
-          && def_of(program, d).name != "Async" -> Some(d)
-        _ -> None
-      }
-    })
-    _ -> []
-  }
-}
-
-## E0402: an `@export` fn whose E is not empty. A hidden set of a parameter's function type
-## counts, so a callback parameter is written with `fails {}` (`export.rs`).
-fn export_fails(program: Program, sigs: Signatures) -> List[TyDiag] {
-  program.items.fold([], |acc, def, item| {
-    item match {
-      IFn(f) if !f.exports.is_empty() && f.body.is_some() -> {
-        fails = Signature.get(sigs, def).map(|s| s.scheme.ty) match {
-          Some(TyFn(t)) -> !t.fails.elems.is_empty()
-          _             -> False
-        }
-        span = f.exports.head().map(|e| e.span)
-        if fails {
-          acc.append([TyDiag(span, "E0402", "an exported function cannot fail", False)])
-        } else {
-          acc
-        }
-      }
-      _ -> acc
-    }
   })
 }
 

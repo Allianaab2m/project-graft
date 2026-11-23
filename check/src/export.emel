@@ -1,0 +1,411 @@
+## Exported functions and entry adapters (`[ext.export]`, `[ext.entry]`). Follows `export.rs` of
+## the reference type checker.
+##
+## `add_entry_exports` runs before type checking, because it adds definitions: for each
+## `@entry(T)` on `f`, a fn whose body is `T(f, ...)`. Type checking then infers it like any other
+## fn; an error in that body is reported as E0440 instead. `check` runs after inference: the
+## boundary types of an exported fn (E0436) and its empty E (E0402).
+import Std.Map.{Map}
+import Hir.{
+  Program,
+  Span,
+  DefData,
+  FnKind,
+  SourceModule,
+  LocalData,
+  ParamLocal,
+  Expr,
+  EPath,
+  ECall,
+  EBlock,
+  Block,
+  Arg,
+  Param,
+  FnItem,
+  FnSig,
+  ExternalAttr,
+  IFn,
+  IType,
+  ResDef,
+  ResLocal,
+  ResErr,
+  TPath,
+  TTuple,
+  TFn,
+}
+import Ty.{
+  Ty,
+  TyPrim,
+  TyNamed,
+  TyFn,
+  PInt,
+  PInt64,
+  PFloat,
+  PBool,
+  PString,
+  RTag,
+  RCap,
+  RBound,
+  RVar,
+}
+import Tylower.{TyDiag, TyTable, con_def, def_of, prelude_def}
+import Signature.{Signatures}
+
+## A fn made by `@entry(adapter)` on `entry`, at the attribute `span`.
+pub type EntryExport(def: Int, entry: Int, adapter: Int, span: Span)
+
+fn err_at(span: Span, code: String, message: String) -> TyDiag {
+  TyDiag(Some(span), code, message, False)
+}
+
+## Whether `def` is an entry adapter: an `@export` fn whose first parameter has a function type.
+pub fn is_entry_adapter(program: Program, def: Int) -> Bool {
+  program.items.get(def) match {
+    Some(IFn(f)) if !f.exports.is_empty() -> {
+      first = f.sig.params.head().and_then(|p| p.ty).and_then(|t| program.types.get(t))
+      first.map(|r| r.kind) match {
+        Some(TFn(_, _, _, _)) -> True
+        _                     -> False
+      }
+    }
+    _ -> False
+  }
+}
+
+## The host effects other than Async in the uses of the function type of the first parameter of
+## the entry adapter `def`: the host provides them for each launch through it.
+pub fn adapter_hosts(program: Program, def: Int) -> List[Int] {
+  program.items.get(def) match {
+    Some(IFn(f)) if !f.exports.is_empty() -> {
+      first = f.sig.params.head().and_then(|p| p.ty).and_then(|t| program.types.get(t))
+      first.map(|r| r.kind) match {
+        Some(TFn(_, _, _, Some(set))) -> set.items.filter_map(|e| {
+          e.res match {
+            ResDef(d) if Signature.is_host_effect(program, d)
+              && def_of(program, d).name != "Async" -> Some(d)
+            _ -> None
+          }
+        })
+        _ -> []
+      }
+    }
+    _ -> []
+  }
+}
+
+fn in_module(program: Program, def: Int, entry: Option[Int]) -> Bool {
+  entry.map(|m| def_of(program, def).module == SourceModule(m)).or(False)
+}
+
+## Checks where `@export` and `@entry` are written (E0437, E0439) and that no two exports share a
+## name (E0438), and adds the fns that `@entry` exposes. Without an entry module, every `@export`
+## that is not an entry adapter and every `@entry` is outside it.
+pub fn add_entry_exports(
+  program: Program,
+  entry: Option[Int],
+) -> (Program, List[EntryExport], List[TyDiag]) {
+  fns = program.items.fold([], |acc, def, item| {
+    item match {
+      IFn(f) -> acc.append([(def, f)])
+      _      -> acc
+    }
+  })
+  (diags, found) = fns.fold(([], []), |(ds, es), (def, f)| {
+    in_entry = in_module(program, def, entry)
+    outside = if !in_entry && !f.exports.is_empty() && !is_entry_adapter(program, def) {
+      f.exports.head().map(|x| [err_at(x.span, "E0437", "`@export` outside the entry module")]).or(
+        [],
+      )
+    } else {
+      []
+    }
+    f.entries.fold((ds.append(outside), es), |(d2, e2), attr| {
+      if !in_entry {
+        (d2.append([err_at(attr.span, "E0437", "`@entry` outside the entry module")]), e2)
+      } else {
+        attr.adapter match {
+          Some(ResErr) -> (d2, e2)
+          Some(ResDef(adapter)) if is_entry_adapter(program, adapter) -> (
+            d2,
+            e2.append([(def, adapter, attr.span)]),
+          )
+          _            -> (d2.append([err_at(attr.span, "E0439", "not an entry adapter")]), e2)
+        }
+      }
+    })
+  })
+  (with_fns, exports) = found.fold((program, []), |(p, xs), (f, adapter, span)| {
+    count = xs.filter(|x: EntryExport| x.entry == f).length()
+    entry_fn(p, f, adapter, span, count) match {
+      Some((next, def)) -> (next, xs.append([EntryExport(def, f, adapter, span)]))
+      None              -> (p, xs)
+    }
+  })
+  (with_fns, exports, diags.append(duplicates(with_fns, entry, exports)))
+}
+
+## The span of the expressions and parameters of a fn made by `@entry` at `attr`: an empty range at
+## the end of the attribute, unique to it.
+pub fn body_span(attr: Span) -> Span {
+  Span(attr.module, attr.end, attr.end)
+}
+
+fn next_id[A](m: Map[Int, A]) -> Int {
+  m.fold(0, |acc, k, _| if k + 1 > acc { k + 1 } else { acc })
+}
+
+## Adds `fn f$entryN(p1: T1, ...) -> R { adapter(f, p1, ...) }` with the parameters and return
+## type of `adapter` after its first parameter. None if one of them names a type parameter of
+## `adapter`.
+fn entry_fn(
+  program: Program,
+  f: Int,
+  adapter: Int,
+  attr: Span,
+  count: Int,
+) -> Option[(Program, Int)] {
+  span = body_span(attr)
+  program.items.get(adapter) match {
+    Some(IFn(item)) -> {
+      rest = item.sig.params.drop(1)
+      own = item.sig.type_params.map(|tp| tp.def)
+      names_own = |ty: Int| mentions(program, ty, |d| own.any(|o| o == d))
+      tys = rest.filter_map(|p| p.ty).append(item.sig.ret.map(|r| [r]).or([]))
+      if tys.any(names_own) {
+        None
+      } else {
+        def = next_id(program.defs)
+        data = def_of(program, f)
+        defs = program.defs.insert(
+          def,
+          DefData("#{data.name}$entry#{count}", FnKind, data.module, None, None, False, False),
+        )
+        first_expr = next_id(program.exprs)
+        first_local = next_id(program.locals)
+        locals = rest.enumerate().fold(program.locals, |m, (i, p)| {
+          name = program.locals.get(p.local).map(|l| l.name).or("")
+          m.insert(first_local + i, LocalData(name, ParamLocal, span))
+        })
+        params = rest.enumerate().map(|(i, p)| Param(first_local + i, p.ty))
+        # Expressions: the reference to f, one per parameter, the callee, the call, the block.
+        n = rest.length()
+        arg_exprs = [first_expr, ..List.range(0, n).map(|i| first_expr + 1 + i)]
+        callee = first_expr + n + 1
+        call = callee + 1
+        body = call + 1
+        exprs1 = program.exprs.insert(first_expr, Expr(EPath(ResDef(f)), span))
+        exprs2 = List.range(0, n).fold(exprs1, |m, i| {
+          m.insert(first_expr + 1 + i, Expr(EPath(ResLocal(first_local + i)), span))
+        })
+        args = arg_exprs.map(|e| Arg(None, e, False))
+        exprs = exprs2.insert(callee, Expr(EPath(ResDef(adapter)), span)).insert(
+          call,
+          Expr(ECall(callee, args), span),
+        ).insert(body, Expr(EBlock(Block([], Some(call))), span))
+        sig = FnSig([], params, item.sig.ret, None, None, False)
+        items = program.items.insert(
+          def,
+          IFn(FnItem(sig, Some(body), False, [], False, [], [], False)),
+        )
+        Some((Program(defs:, items:, locals:, exprs:, ..program), def))
+      }
+    }
+    _ -> None
+  }
+}
+
+## Whether the type `ty` names a definition for which `is` holds.
+fn mentions(program: Program, ty: Int, is: fn(Int) -> Bool) -> Bool {
+  program.types.get(ty).map(|r| r.kind) match {
+    Some(TPath(res, args)) -> {
+      here = res match {
+        ResDef(d) -> is(d)
+        _         -> False
+      }
+      here || args.any(|a| mentions(program, a, is))
+    }
+    Some(TTuple(elems)) -> elems.any(|a| mentions(program, a, is))
+    Some(TFn(params, ret, _, _)) -> (
+      params.any(|a| mentions(program, a, is)) || ret.map(|r| mentions(program, r, is)).or(False)
+    )
+    _                   -> False
+  }
+}
+
+## A fn that the program exposes to the host: the fn, its `@export`s (those of the adapter for a
+## fn made by `@entry`), and the `@entry` attribute for one.
+type Exposed(def: Int, exports: List[ExternalAttr], entry: Option[Span])
+
+## The entry module's `@export` fns that are not entry adapters, then the fns made by `@entry`.
+fn host_exports(program: Program, entry: Option[Int], made: List[EntryExport]) -> List[Exposed] {
+  own = program.items.fold([], |acc, def, item| {
+    item match {
+      IFn(f) if in_module(program, def, entry)
+        && !f.exports.is_empty()
+        && !is_entry_adapter(program, def) -> acc.append([Exposed(def, f.exports, None)])
+      _ -> acc
+    }
+  })
+  own.append(
+    made.filter_map(|e| {
+      program.items.get(e.adapter) match {
+        Some(IFn(a)) -> Some(Exposed(e.def, a.exports, Some(e.span)))
+        _            -> None
+      }
+    }),
+  )
+}
+
+## Two exports with the same name for the same target (E0438), reported at the second.
+fn duplicates(program: Program, entry: Option[Int], made: List[EntryExport]) -> List[TyDiag] {
+  (_, found) = host_exports(program, entry, made).fold(([], []), |(seen, found), x| {
+    x.exports.fold((seen, found), |(s, f), export| {
+      key = (export.target, export.args)
+      if s.any(|k| k == key) {
+        (s, f.append([x.entry.or(export.span)]))
+      } else {
+        (s.append([key]), f)
+      }
+    })
+  })
+  found.sort_by(|a, b| Ord.compare((a.module, a.start), (b.module, b.start))).map(
+    |s| err_at(s, "E0438", "duplicate export"),
+  )
+}
+
+## After inference: the parameters and the return value of every `@export` fn are boundary types
+## (E0436, the first parameter of an entry adapter excepted), and its E is empty (E0402). A type
+## error in a fn made by `@entry` becomes one E0440 at the attribute. Also the names `main.mjs`
+## already exports (E0438).
+pub fn check(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  entry: Option[Int],
+  main: Option[Int],
+  made: List[EntryExport],
+  diags: List[TyDiag],
+) -> List[TyDiag] {
+  exported = program.items.fold([], |acc, def, item| {
+    item match {
+      IFn(f) if !f.exports.is_empty() && f.body.is_some() -> Signature.get(sigs, def).map(
+        |s| s.scheme.ty,
+      ) match {
+        Some(TyFn(t)) -> f.exports.head().map(|x| {
+          skip = if is_entry_adapter(program, def) { 1 } else { 0 }
+          params = t.params.drop(skip).filter(|p| !is_boundary(program, table, p)).map(
+            |_| err_at(x.span, "E0436", "not a boundary type"),
+          )
+          ret = if is_boundary(program, table, t.ret) {
+            []
+          } else {
+            [err_at(x.span, "E0436", "not a boundary type")]
+          }
+          acc.append(params).append(ret).append(export_fails(sigs, def, x.span))
+        }).or(acc)
+        _ -> acc
+      }
+      _ -> acc
+    }
+  })
+  all = diags.append(exported)
+  with_entries = made.fold(all, |ds, e| {
+    body = body_span(e.span)
+    with_fails = ds.append(export_fails(sigs, e.def, body))
+    kept = with_fails.filter(|d| d.warning || d.span != Some(body))
+    if kept.length() != with_fails.length() {
+      kept.append([err_at(e.span, "E0440", "the entry does not fit its adapter")])
+    } else {
+      kept
+    }
+  })
+  with_entries.append(reserved_js_names(program, sigs, entry, main, made))
+}
+
+## E0402 when the E of `def` is not empty.
+fn export_fails(sigs: Signatures, def: Int, span: Span) -> List[TyDiag] {
+  fails = Signature.get(sigs, def).map(|s| s.scheme.ty) match {
+    Some(TyFn(t)) -> !t.fails.elems.is_empty()
+    _             -> False
+  }
+  if fails { [err_at(span, "E0402", "an exported function cannot fail")] } else { [] }
+}
+
+## The names `main.mjs` already exports, `main` when the entry has a `main` and `$start` when the
+## entry's `main` or a fn with an `@export(js, ...)` may suspend: an export with one of these names
+## is E0438, reported once per name at the first such export.
+fn reserved_js_names(
+  program: Program,
+  sigs: Signatures,
+  entry: Option[Int],
+  main: Option[Int],
+  made: List[EntryExport],
+) -> List[TyDiag] {
+  entry.map(|m| {
+    suspended = |def: Int| Signature.get(sigs, def).map(|s| may_suspend(program, s.scheme.ty)).or(
+      False,
+    )
+    exposed = host_exports(program, Some(m), made)
+    js_suspends = exposed.any(|x| x.exports.any(|e| e.target == "js") && suspended(x.def))
+    start = main.map(suspended).or(False) || js_suspends
+    names = (if main.is_some() { ["main"] } else { [] }).append(if start { ["$start"] } else { [] })
+    names.flat_map(|name| {
+      spans = exposed.flat_map(|x| {
+        x.exports.filter(|e| e.target == "js" && e.args == [name]).map(|e| x.entry.or(e.span))
+      })
+      first = spans.sort_by(|a, b| Ord.compare((a.module, a.start), (b.module, b.start))).head()
+      first match {
+        Some(s) if spans.filter(|t| t == s).length() <= 1 -> [
+          err_at(s, "E0438", "this name is already exported"),
+        ]
+        _ -> []
+      }
+    })
+  }).or([])
+}
+
+## Whether the R of a fn type contains Async, or a set of unknown contents.
+fn may_suspend(program: Program, ty: Ty) -> Bool {
+  prelude_def(program, "Async") match {
+    None -> True
+    Some(a) -> ty match {
+      TyFn(f) -> f.uses.elems.any(|e| {
+        e match {
+          RTag(t)   -> t.def == a
+          RCap(c)   -> c.tag.def == a
+          RBound(_) -> True
+          RVar(_)   -> True
+          _         -> False
+        }
+      })
+      _ -> False
+    }
+  }
+}
+
+## `[ext.boundary]`: Int, Int64, Float, Bool, String, Bytes, `()`, an `@external type`, `Array[A]`
+## of a boundary type other than a function type, and function types made of these.
+fn is_boundary(program: Program, table: TyTable, ty: Ty) -> Bool {
+  ty match {
+    TyPrim(PInt) -> True
+    TyPrim(PInt64) -> True
+    TyPrim(PFloat) -> True
+    TyPrim(PBool) -> True
+    TyPrim(PString) -> True
+    TyPrim(Ty.PUnit) -> True
+    TyNamed(con, args) -> program.items.get(con_def(table, con)) match {
+      Some(IType(t)) if t.is_intrinsic && !args.is_empty() -> args.all(|a| {
+        not_fn = a match {
+          TyFn(_) -> False
+          _       -> True
+        }
+        not_fn && is_boundary(program, table, a)
+      })
+      Some(IType(t)) -> args.is_empty() && t.ctor.is_none()
+      _              -> False
+    }
+    TyFn(f) -> f.params.all(|p| is_boundary(program, table, p))
+      && is_boundary(program, table, f.ret)
+    _ -> False
+  }
+}

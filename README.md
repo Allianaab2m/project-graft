@@ -98,8 +98,8 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
      (`test_data/types`): the declared signatures, and the types of bodies (expressions,
      patterns, calls, method calls through the module of a type or a trait, handlers and `with`
      items), traits and impls, match coverage, and error and effect sets report the same
-     diagnostics as `emela check`, as do suspension, fiber scopes, `with` items and layers. Not
-     yet: exports (E0436 to E0443) and captures (W0402).
+     diagnostics as `emela check`, as do suspension, fiber scopes, `with` items, layers and
+     exports. Not yet: captures (W0402).
 
   The corpus for M3 is what is written to be checked: the 87 programs of
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of
