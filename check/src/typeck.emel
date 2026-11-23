@@ -1,28 +1,36 @@
 ## Type checking of a resolved program. Follows `check.rs` of the reference type checker: builds
-## the table of named types, collects the declared signatures, then infers the bodies group by
-## group, callees first.
+## the table of named types, collects the declared signatures and the impls, then infers the
+## bodies group by group, callees first.
+import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program}
 import Body
 import Groups
 import Signature.{Signatures, insert_sig}
+import Traits
 import Tylower.{TyDiag, TyLower, new_lower, new_table}
 
 ## The diagnostics of type checking, sorted by module and start position (stable), as the
 ## reference reports them. Those without a location come first.
 pub fn check(program: Program) -> List[TyDiag] {
   table = new_table(program)
-  (sigs, diags) = Signature.collect(program, table)
+  (declared, sig_diags) = Signature.collect(program, table)
+  (traits, sigs, trait_diags, collect_used) = Traits.collect(program, table, declared)
   groups = Groups.groups(program, sigs)
-  (_, lowered) = State.run(new_lower(program, table, []), || {
-    groups.fold(sigs, |known, group| {
-      Body.infer_group(program, table, known, group).fold(
-        known,
-        |acc, (def, sig)| insert_sig(acc, def, sig),
-      )
-    })
+  ((_, used), lowered) = State.run(new_lower(program, table, []), || {
+    groups.fold(
+      (sigs, collect_used.fold(Map.empty(), |m, k| m.insert(k, True))),
+      |(known, used), group| {
+        (inferred, group_used) = Body.infer_group(program, table, traits, known, group)
+        next = inferred.fold(known, |acc, (def, sig)| insert_sig(acc, def, sig))
+        (next, group_used.fold(used, |m, k, v| m.insert(k, v)))
+      },
+    )
   })
-  diags.append(lowered.diags.reverse()).sort_by(|a, b| Ord.compare(position(a), position(b)))
+  diags = sig_diags.append(trait_diags).append(lowered.diags.reverse()).append(
+    Traits.unused_derives(program, traits, used),
+  )
+  diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
 }
 
 fn position(d: TyDiag) -> (Int, Int, Int) {

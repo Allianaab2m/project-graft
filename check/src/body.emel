@@ -227,6 +227,7 @@ import Signature.{
   param_labels,
 }
 import Groups.{defining_module, impl_fn}
+import Traits.{Traits}
 
 ## A definition without a declared type: its monomorphic type within the group and its type
 ## parameters (written and invisible set ones).
@@ -266,7 +267,22 @@ pub type BodyState(
   ops: Map[Int, Int],
   ## Callees of calls, where a handler member may be opened inside an init.
   member_callees: Map[Int, Bool],
+  traits: Traits,
+  ## Derived impls that something required (W0303).
+  used: Map[(Int, Int), Bool],
+  ## Newest first.
+  trait_obligations: List[TraitObligation],
+  ## Newest first.
+  self_obligations: List[SelfObligation],
 )
+
+## A type that must satisfy a trait: the instantiation of a constrained type parameter at a
+## reference, or an operand of `==`, `<` or interpolation. `owner` is the definition whose type
+## parameters `TyBound(i)` in `ty` are. A Float passes `float_ok` (the built-in comparison).
+type TraitObligation(ty: Ty, trait_def: Int, span: Span, owner: Option[Int], float_ok: Bool)
+
+## The `Self` of a trait function determined only by its result type (E0333).
+type SelfObligation(ty: Ty, trait_def: Int, span: Span)
 
 fn bs() -> BodyState uses { State[BodyState] } {
   (use State[BodyState]).get()
@@ -293,9 +309,10 @@ fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] }
 pub fn infer_group(
   program: Program,
   table: TyTable,
+  traits: Traits,
   sigs: Signatures,
   group: List[Int],
-) -> List[(Int, Signature)] uses { State[TyLower] } {
+) -> (List[(Int, Signature)], Map[(Int, Int), Bool]) uses { State[TyLower] } {
   start = BodyState(
     program,
     table,
@@ -313,8 +330,12 @@ pub fn infer_group(
     None,
     Map.empty(),
     Map.empty(),
+    traits,
+    Map.empty(),
+    [],
+    [],
   )
-  ((inferred, _), _) = State.run(new_infer(), || {
+  ((inferred, state), _) = State.run(new_infer(), || {
     set_error_tags(Tylower.error_tags(table))
     State.run(start, || {
       group.each(|def| if Signature.get(sigs, def).is_none() { declare(def) })
@@ -322,7 +343,7 @@ pub fn infer_group(
       finish()
     })
   })
-  inferred
+  (inferred, state.used)
 }
 
 ## Switches to the definition about to be inferred, taking its module and type parameters.
@@ -345,7 +366,8 @@ fn enter(def: Int) -> () {
           Some(IImpl(i)) -> i.type_params.map(|tp| tp.def)
           _              -> []
         }
-        (defs, defs.map(|_| Ty.TypeParamKind), None)
+        slf = Traits.head_of(bs().traits, owner).map(|h| h.self_ty)
+        (defs, defs.map(|_| Ty.TypeParamKind), slf)
       }
       None -> ([], [], None)
     }
@@ -498,6 +520,8 @@ fn finish() -> List[(Int, Signature)] {
     }
   })
   check_numbers()
+  check_known_selves()
+  check_traits()
   program = prog()
   bs().pending.map(|p| {
     labels = program.items.get(p.def) match {
@@ -659,8 +683,8 @@ fn infer_expr_kind(expr: Int, expected: Option[Ty]) -> Ty {
         parts.each(|p| {
           p match {
             SInterp(x) -> {
-              infer_expr(x)
-              ()
+              ty = infer_expr(x)
+              require_prelude_trait(ty, "Show", expr_span(x))
             }
             _ -> ()
           }
@@ -823,6 +847,8 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
   Signature.get(b.sigs, def) match {
     Some(sig) -> {
       (tys, rows) = fresh_args(sig.scheme.params)
+      require_traits(sig.scheme.params, tys, span)
+      require_known_self(def, sig.scheme, tys, span)
       (substitute(sig.scheme.ty, tys, rows), tys, rows)
     }
     None -> pending_of(def) match {
@@ -830,6 +856,7 @@ fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
       Some(p) -> {
         ty = resolve(p.ty)
         (args, rows) = fresh_args(p.params)
+        require_traits(p.params, args, span)
         instance = freshen(substitute(ty, args, rows))
         bupd(
           |s| BodyState(
@@ -1183,6 +1210,7 @@ fn infer_binary(expr: Int, op: BinaryOp, lhs: Int, rhs: Int, span: Span) -> Ty {
     } else {
       ty = infer_expr(lhs)
       check_expr(rhs, ty)
+      require_prelude_trait(ty, if op == OpEq || op == OpNe { "Eq" } else { "Ord" }, span)
       BOOL
     }
   }
@@ -1309,9 +1337,14 @@ fn infer_dot(expr: Int, base: Int, base_ty0: Ty, name: Label, call: Bool) -> Dot
       DotValue(field_error(name, "E0314", "the type of this value must be known to #{what}"))
     }
     _ -> lookup_field(base_ty, name.name) match {
-      FieldFound(_, ty) -> DotValue(ty)
+      # E0334 keeps the fns of the module apart from the fields, so only traits can also be found.
+      FieldFound(_, ty) -> if call && !trait_methods(base_ty, name.name).is_empty() {
+        DotValue(field_error(name, "E0335", "ambiguous method `#{name.name}`"))
+      } else {
+        DotValue(ty)
+      }
       field -> {
-        found = module_methods(base_ty, name.name)
+        found = module_methods(base_ty, name.name).append(trait_methods(base_ty, name.name))
         (found, field) match {
           ([def], _) if call -> DotMethod(def)
           ([_], _) -> DotValue(field_error(name, "E0312", "no field `#{name.name}`"))
@@ -2251,4 +2284,114 @@ fn infer_supply_args(target: Res, args: Option[SupplyArgs], span: Span) -> () {
       a.span,
     )
   }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Traits
+
+## The type parameters of a definition, with their constraints.
+fn def_params(def: Int) -> List[TyParam] {
+  Signature.get(bs().sigs, def).map(|s| s.scheme.params) match {
+    Some(ps) -> ps
+    None     -> pending_of(def).map(|p| p.params).or([])
+  }
+}
+
+## The functions `name` that take `self` of the traits that `ty` implements, among those visible
+## by name in the calling module and the bounds of a type parameter.
+fn trait_methods(ty: Ty, name: String) -> List[Int] {
+  b = bs()
+  b.module match {
+    SourceModule(m) -> {
+      env = b.current.map(def_params).or([])
+      head = Traits.erase_args(ty)
+      Traits.candidate_traits(b.program, b.traits, m, ty, env).filter_map(|t| {
+        Traits.trait_fns(b.program, t).find(|f| def_of(b.program, f).name == name).and_then(|f| {
+          if Traits.takes_self(b.sigs, f) { Some((t, f)) } else { None }
+        })
+      }).filter(|(t, _)| {
+        r = Traits.satisfies(b.program, b.table, b.traits, head, t, env, None)
+        note_used(r.used)
+        r.err.is_none()
+      }).map(|(_, f)| f)
+    }
+    _ -> []
+  }
+}
+
+fn note_used(used: List[(Int, Int)]) -> () {
+  if !used.is_empty() {
+    bupd(|s| BodyState(used: used.fold(s.used, |m, k| m.insert(k, True)), ..s))
+  }
+}
+
+## Remembers the trait constraints of the type parameters `params` instantiated with `tys`.
+fn require_traits(params: List[TyParam], tys: List[Ty], span: Span) -> () {
+  current = bs().current
+  obligations = params.zip(tys).flat_map(|(p, ty)| {
+    p.traits.map(|t| TraitObligation(ty, t, span, current, False))
+  })
+  if !obligations.is_empty() {
+    bupd(|s| BodyState(trait_obligations: obligations.reverse().append(s.trait_obligations), ..s))
+  }
+}
+
+## Remembers that `ty` must satisfy the Prelude's trait `name` (spec 10.3).
+fn require_prelude_trait(ty: Ty, name: String, span: Span) -> () {
+  when_some(prelude_def(prog(), name), |t| {
+    o = TraitObligation(ty, t, span, bs().current, name == "Ord")
+    bupd(|s| BodyState(trait_obligations: [o, ..s.trait_obligations], ..s))
+  })
+}
+
+## Remembers the `Self` of a trait function whose parameters do not mention `Self`: only the
+## result type picks the impl, so it must be known once the group is inferred (E0333).
+fn require_known_self(def: Int, scheme: Scheme, tys: List[Ty], span: Span) -> () {
+  if def_of(prog(), def).kind == TraitFnKind {
+    (tys.head(), scheme.params.head(), scheme.ty) match {
+      (Some(self_ty), Some(param), TyFn(f)) -> when_some(param.traits.head(), |t| {
+        if !f.params.any(|q| mentions_bound(q, 0)) {
+          o = SelfObligation(self_ty, t, span)
+          bupd(|s| BodyState(self_obligations: [o, ..s.self_obligations], ..s))
+        }
+      })
+      _ -> ()
+    }
+  }
+}
+
+fn mentions_bound(ty: Ty, index: Int) -> Bool {
+  ty match {
+    TyBound(i) -> i == index
+    _          -> Ty.child_types(ty).any(|c| mentions_bound(c, index))
+  }
+}
+
+## Reports the `Self` of trait functions left undetermined (E0333).
+fn check_known_selves() -> () {
+  program = prog()
+  bs().self_obligations.reverse().each(|o| {
+    resolve(o.ty) match {
+      TyVar(_) -> diag(
+        o.span,
+        "E0333",
+        "the type implementing `#{def_of(program, o.trait_def).name}` cannot be determined",
+      )
+      _ -> ()
+    }
+  })
+}
+
+## Checks the trait constraints remembered at references (E0326, spec 10.3).
+fn check_traits() -> () {
+  b = bs()
+  b.trait_obligations.reverse().each(|o| {
+    ty = resolve(o.ty)
+    if !(o.float_ok && ty == FLOAT) {
+      env = o.owner.map(def_params).or([])
+      r = Traits.satisfies(b.program, b.table, b.traits, ty, o.trait_def, env, None)
+      note_used(r.used)
+      when_some(r.err, |e| diag(o.span, "E0326", Traits.not_implemented(b.program, e)))
+    }
+  })
 }
