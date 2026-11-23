@@ -64,6 +64,7 @@ $ scripts/compare.sh fmt <emela-lang/emela checkout>     # formatted output agai
 $ scripts/fuzz.py tree <emela-lang/emela checkout> <out dir> # trees of broken corpus files
 $ scripts/fuzz.py fmt <emela-lang/emela checkout> <out dir>  # fmt of reflowed files, any width
 $ scripts/check.sh <emela-lang/emela checkout>      # check diagnostics against the reference
+$ scripts/run.sh <emela-lang/emela checkout> [name...]  # run the JS of `graft build` on Node
 $ emela run . -- parse <file>...                     # parses the files, to time the parser
 ```
 
@@ -105,3 +106,17 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of
   `examples/` and `tests/laws` (all check without errors), Graft itself, and the inputs embedded in
   the tests of emela-resolve and emela-types, which do have errors.
+- M4: started. `scripts/run.sh` builds the 73 test programs of
+  `crates/emela-codegen-c/tests/programs` with `graft build` and runs the JS with Node through the
+  launcher of `emela run`; each must give the exit code, stdout and stderr in its `.expected` (the
+  output of `emela run`). The JS runtime (`emela-codegen-js/src/runtime.mjs`) and the launcher are
+  read from the checkout, so Graft's JS runs on the reference's runtime. The plan follows
+  emela-core and emela-codegen-js:
+  1. Keeping what type checking learns about bodies: the types of expressions, patterns and
+     locals, call arguments by parameter, type arguments at references, methods and operations.
+  2. The Core IR and the lowering of pure code: fns, literals, operators, strings, records and
+     enums, match, lists, closures and local fns, self tail calls as loops; monomorphization; the
+     JS output.
+  3. Traits and derived impls, `dbg` and `inspect`.
+  4. Errors (`fail`, `escape`) and effects (evidence passing, handlers, `with`, layers).
+  5. Suspension (generators) and fibers.
