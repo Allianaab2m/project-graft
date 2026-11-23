@@ -6,9 +6,9 @@
 ## Definitions without a declared type (fns without a return type or `uses` clause, consts without
 ## a type) are monomorphic within the group and generalized once it is inferred.
 ##
-## Once the group is inferred, the error sets of its bodies are computed and solved (`Sets`).
-## Not ported yet: effect sets. Where something unported would decide a type, the type is
-## `TyError`, which unifies with anything, so no diagnostic is made up.
+## Once the group is inferred, the error and effect sets of its bodies are computed and solved
+## (`Sets`). Where something unported would decide a type, the type is `TyError`, which unifies
+## with anything, so no diagnostic is made up.
 import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{
@@ -255,6 +255,9 @@ import Bodystate.{
   prog,
   new_state,
   fn_parts,
+  Closed,
+  named_capability,
+  is_fn_param,
 }
 
 fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] } {
@@ -272,9 +275,10 @@ pub fn infer_group(
   traits: Traits,
   sigs: Signatures,
   facts: HandlerFacts,
+  closed: Map[Int, Closed],
   group: List[Int],
 ) -> (List[(Int, Signature)], Map[(Int, Int), Bool], HandlerFacts) uses { State[TyLower] } {
-  start = new_state(program, table, traits, sigs, facts)
+  start = new_state(program, table, traits, sigs, facts, closed)
   (((inferred, solved), state), _) = State.run(new_infer(), || {
     set_error_tags(Tylower.error_tags(table))
     State.run(start, || {
@@ -436,8 +440,21 @@ fn local_span(local: Int) -> Span {
   prog().locals.get(local).map(|l| l.span).or(Span(0, 0, 0))
 }
 
+## Also records the binder and the definition the local belongs to.
 fn set_local(local: Int, ty: Ty) -> () {
-  bupd(|b| BodyState(locals: b.locals.insert(local, ty), ..b))
+  bupd(|b| {
+    owner = b.current.map(|d| b.local_owner.insert(local, d)).or(b.local_owner)
+    BodyState(
+      locals: b.locals.insert(local, ty),
+      local_binder: b.local_binder.insert(local, b.binder),
+      local_owner: owner,
+      ..b,
+    )
+  })
+}
+
+fn set_binder(binder: Option[Int]) -> () {
+  bupd(|b| BodyState(binder:, ..b))
 }
 
 ## Finishes the group: checks deferred references and numeric types, then generalizes the
@@ -456,8 +473,9 @@ fn finish() -> (List[(Int, Signature)], HandlerFacts) {
   check_numbers()
   check_known_selves()
   check_traits()
-  # Compute and solve the error sets.
+  # Compute and solve the error and effect sets.
   Sets.infer_errors()
+  Sets.infer_effects()
   Sets.solve()
   check_coverage()
   program = prog()
@@ -913,6 +931,8 @@ fn infer_local_fn(f: LocalFn) -> () {
   program = prog()
   b = bs()
   Tylower.reset_local_sets()
+  outer = b.binder
+  set_binder(Some(f.body))
   params = f.sig.params.map(|p| {
     ty = p.ty match {
       Some(t) -> scoped(
@@ -948,7 +968,10 @@ fn infer_local_fn(f: LocalFn) -> () {
     Some(set) -> union(in_scope(|| lower_effect_set(set)), hidden_uses)
     None      -> var_row(new_row_var())
   }
+  # The name belongs to the enclosing body; the parameters and the body to the local fn.
+  set_binder(outer)
   set_local(f.local, func(params, ret, fails, uses))
+  set_binder(Some(f.body))
   info = LocalFnInfo(
     owner: b.current,
     body: f.body,
@@ -965,6 +988,7 @@ fn infer_local_fn(f: LocalFn) -> () {
     ),
   )
   check_expr(f.body, ret)
+  set_binder(outer)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1017,7 +1041,7 @@ fn infer_call(expr: Int, callee: Int, args: List[Arg], span: Span) -> Ty {
       }
       shallow_resolve(callee_ty) match {
         TyFn(f) -> {
-          check_args(callee_name, labels, f.params, args, span)
+          record_call(expr, check_args(callee_name, labels, f.params, args, span))
           f.ret
         }
         TyError -> {
@@ -1032,7 +1056,7 @@ fn infer_call(expr: Int, callee: Int, args: List[Arg], span: Span) -> Ty {
           ret = new_var()
           want = func(params, ret, var_row(new_row_var()), var_row(new_row_var()))
           coerce_at(expr_span(callee), want, callee_ty)
-          check_args(callee_name, labels, params, args, span)
+          record_call(expr, check_args(callee_name, labels, params, args, span))
           ret
         }
       }
@@ -1054,7 +1078,7 @@ fn check_args(
   params: List[Ty],
   args: List[Arg],
   span: Span,
-) -> () {
+) -> List[Option[Int]] {
   assigned = assign_args(callee_name, labels, params.length(), args.map(|a| (a.label, a.value)))
   if !assigned.reported && (assigned.too_many || has_missing(assigned)) {
     who = callee_name.map(|n| "`#{n}`").or("this function")
@@ -1077,6 +1101,11 @@ fn check_args(
     infer_expr(x)
     ()
   })
+  assigned.slots
+}
+
+fn record_call(expr: Int, slots: List[Option[Int]]) -> () {
+  bupd(|b| BodyState(calls: b.calls.insert(expr, slots), ..b))
 }
 
 ## An argument passed to a parameter of type `use F1 + ... + Fm` (`[effect.use]`). A capability
@@ -1243,6 +1272,8 @@ fn infer_lambda(expr: Int, params: List[Param], body: Int, span: Span, expected:
     Some(TyFn(f)) if f.params.length() == params.length() -> Some(f)
     _                                                     -> None
   }
+  outer = bs().binder
+  set_binder(Some(expr))
   param_tys = params.enumerate().map(|(i, p)| {
     from_context = expected_fn.and_then(|f| f.params.get(i))
     ty = (p.ty, from_context) match {
@@ -1267,6 +1298,7 @@ fn infer_lambda(expr: Int, params: List[Param], body: Int, span: Span, expected:
     }
     None -> infer_expr(body)
   }
+  set_binder(outer)
   row = new_row_var()
   uses = new_row_var()
   bupd(|b| BodyState(lambda_rows: b.lambda_rows.insert(expr, (row, uses)), ..b))
@@ -1383,6 +1415,7 @@ fn infer_method_call(
   (ty0, _, _) = instantiate_def(def, name.span)
   ty = open_fails(ty0)
   record(callee, ty)
+  bupd(|b| BodyState(methods: b.methods.insert(callee, def), ..b))
   shallow_resolve(ty) match {
     TyFn(f) if !f.params.is_empty() -> {
       coerce_at(expr_span(base), f.params.get(0).or(TyError), base_ty)
@@ -1390,7 +1423,8 @@ fn infer_method_call(
         Some(sig) -> Some(sig.labels.drop(1))
         None      -> fn_parts(program, def).map(|(ps, _)| param_labels(program, ps.drop(1)))
       }
-      check_args(Some(name.name), labels, f.params.drop(1), args, span)
+      slots = check_args(Some(name.name), labels, f.params.drop(1), args, span)
+      record_call(expr, [Some(base), ..slots])
       f.ret
     }
     _ -> {
@@ -1525,7 +1559,7 @@ fn infer_op(expr: Int, base: Int, tags: List[Tag], name: Label) -> Ty {
   program = prog()
   sigs = bs().sigs
   if is_upper(name.name) {
-    infer_cap_member(expr, tags, name)
+    infer_cap_member(expr, base, tags, name)
   } else {
     found = tags.filter_map(|t| {
       effect_ops(program, t.def).find(|op| def_of(program, op).name == name.name).map(|op| (t, op))
@@ -1551,11 +1585,64 @@ fn infer_op(expr: Int, base: Int, tags: List[Tag], name: Label) -> Ty {
           })
           substitute(sig.scheme.ty, own.append(fresh), rows.append(fresh_rows))
         }) match {
-          Some(TyFn(f)) -> func(f.params, f.ret, f.fails, Ty.row_of([RTag(tag)]))
+          Some(TyFn(f)) -> func(f.params, f.ret, f.fails, op_uses(base, tag, op))
           _             -> TyError
         }
       }
     }
+  }
+}
+
+fn tag_row_of(tag: Tag) -> Row {
+  Ty.row_of([RTag(tag)])
+}
+
+fn cap_elem(local: Int, tag: Tag) -> CapElem {
+  CapElem(local, prog().locals.get(local).map(|l| l.name).or(""), tag)
+}
+
+## The R of calling the operation `op` of `tag` through the capability `base`: the capability of
+## a captured variable or a parameter of the function (`[effect.use]`), the handler's `self` for a
+## capability in one of its fields, or else the effect.
+fn op_uses(base: Int, tag: Tag, op: Int) -> Row {
+  program = prog()
+  named_capability(base) match {
+    Some(local) -> Ty.row_of([RCap(cap_elem(local, tag))])
+    None -> self_field(base) match {
+      Some((self_local, field)) -> {
+        b = bs()
+        in_release = b.current.and_then(|def| {
+          program.items.get(def) match {
+            Some(IHandler(h)) -> h.release.map(|(l, _)| l)
+            _                 -> None
+          }
+        })
+          == Some(self_local)
+        bupd(|s| BodyState(use_bound: s.use_bound.insert(self_local, True), ..s))
+        row = Ty.row_of([RCap(CapElem(self_local, "self.#{field}", tag))])
+        is_suspend = program.items.get(op) match {
+          Some(IOp(o)) -> o.sig.is_suspend
+          _            -> False
+        }
+        async_def = if in_release && is_suspend { prelude_def(program, "Async") } else { None }
+        async_def.map(|a| insert(row, RTag(Tag(a, [])))).or(row)
+      }
+      None -> tag_row_of(tag)
+    }
+  }
+}
+
+## For a field of the implicit `self` of a handler (`self.inner`), `self` and the field.
+fn self_field(expr: Int) -> Option[(Int, String)] {
+  program = prog()
+  program.exprs.get(expr).map(|e| e.kind) match {
+    Some(EField(base, name)) -> program.exprs.get(base).map(|e| e.kind) match {
+      Some(EPath(ResLocal(l))) if program.locals.get(l).map(|d| d.kind == Hir.SelfLocal).or(
+        False,
+      ) -> Some((l, name.name))
+      _ -> None
+    }
+    _ -> None
   }
 }
 
@@ -1564,7 +1651,7 @@ fn is_upper(s: String) -> Bool {
 }
 
 ## Opening the handler member `name` through a capability (`fs.Open`).
-fn infer_cap_member(expr: Int, tags: List[Tag], name: Label) -> Ty {
+fn infer_cap_member(expr: Int, base: Int, tags: List[Tag], name: Label) -> Ty {
   program = prog()
   sigs = bs().sigs
   found = tags.filter_map(|t| {
@@ -1576,8 +1663,13 @@ fn infer_cap_member(expr: Int, tags: List[Tag], name: Label) -> Ty {
       check_member_open(expr, member, name.span)
       args = base_of(sigs, tag).args
       Signature.get(sigs, member).map(|sig| substitute_bound(sig.scheme.ty, args)) match {
-        Some(TyFn(f)) -> func(f.params, f.ret, f.fails, Ty.row_of([RTag(tag)]))
-        _             -> TyError
+        Some(TyFn(f)) -> {
+          uses = named_capability(base).map(|l| Ty.row_of([RCap(cap_elem(l, tag))])).or(
+            tag_row_of(tag),
+          )
+          func(f.params, f.ret, f.fails, uses)
+        }
+        _ -> TyError
       }
     }
   }
@@ -2137,7 +2229,7 @@ fn infer_handler_op(def: Int, item: HandlerItem, index: Int, hop: HandlerOp, han
         resume_later = hop.is_suspend
           && hop.params.length() == params.length()
           && hop.params.last().map(
-            |resume| Suspend.resume_escapes(prog(), bs().sigs, body, resume.local),
+            |resume| Suspend.resume_escapes(prog(), bs().table, bs().sigs, body, resume.local),
           ).or(False)
         hb = HandlerBody(def, index, body, g.fails, resume_later, hop.is_suspend)
         bupd(|b| BodyState(handler_bodies: b.handler_bodies.append([hb]), ..b))
@@ -2164,13 +2256,10 @@ fn infer_with_args(expr: Int, items: List[WithItem]) -> () {
         })
         labels = Signature.get(sigs, member).map(|s| s.labels)
         item.args match {
-          Some(args) -> check_args(
-            Some(def_of(program, member).name),
-            labels,
-            f.params,
-            args.args,
-            args.span,
-          )
+          Some(args) -> {
+            check_args(Some(def_of(program, member).name), labels, f.params, args.args, args.span)
+            ()
+          }
           None -> if !f.params.is_empty() {
             diag(
               item.span,
@@ -2179,7 +2268,10 @@ fn infer_with_args(expr: Int, items: List[WithItem]) -> () {
             )
           }
         }
-        when_some(item.bind, |local| set_local(local, f.ret))
+        when_some(item.bind, |local| {
+          set_local(local, f.ret)
+          bupd(|b| BodyState(member_bound: b.member_bound.insert(local, True), ..b))
+        })
       }
       None -> {
         item.res match {
@@ -2316,13 +2408,10 @@ fn infer_supply_args(target: Res, args: Option[SupplyArgs], span: Span) -> () {
         ()
       })
     }
-    (Some((h, p)), Some(a)) -> check_args(
-      Some(def_of(program, h).name),
-      Some(p.labels),
-      p.tys,
-      a.args,
-      a.span,
-    )
+    (Some((h, p)), Some(a)) -> {
+      check_args(Some(def_of(program, h).name), Some(p.labels), p.tys, a.args, a.span)
+      ()
+    }
   }
 }
 

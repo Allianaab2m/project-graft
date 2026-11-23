@@ -1,5 +1,5 @@
-## Computing and solving the error sets E of the bodies of a group (spec 7, 9.4). Follows
-## `body/errors.rs` of the reference type checker.
+## Computing and solving the error sets E and effect sets R of the bodies of a group (spec 7, 8,
+## 9.4). Follows `body/errors.rs` and `body/effects.rs` of the reference type checker.
 ##
 ## After the types of a group are inferred, each expression's E is computed bottom-up: a call adds
 ## the callee function type's E, `fail e` the tag of e's type, `escape` removes the errors its arms
@@ -50,7 +50,11 @@ import Hir.{
   SLocalFn,
   SExpr,
   IConst,
+  IFn,
+  ITraitFn,
   IHandler,
+  PBind,
+  WithItem,
   ILayer,
   IOp,
   IMember,
@@ -95,16 +99,31 @@ import Ty.{
   Errors,
   Effects,
   EMPTY_ROW,
+  TyCap,
+  CapElem,
   effect_tag,
+  widened_row,
   insert,
   row_of,
   row_vars,
   union,
   var_row,
 }
-import Tylower.{TyLower, def_of, report, self_ty}
+import Tylower.{TyLower, def_of, prelude_def, report, self_ty}
 import Signature
-import Bodystate.{BodyState, EscapeInfo, bs, bupd, prog, fn_parts}
+import Bodystate.{
+  BodyState,
+  EscapeInfo,
+  Closed,
+  ClosedMain,
+  ClosedExport,
+  bs,
+  bupd,
+  prog,
+  fn_parts,
+  named_capability,
+  is_fn_param,
+}
 import Layer
 import Groups.{item_args}
 import Coverage
@@ -272,7 +291,7 @@ fn expr_row(expr: Int) -> Row {
       # inits (spec 9.4). The arguments of a handler a later item overrides are not evaluated.
       EWith(items, body) -> {
         b = bs()
-        entries = Layer.with_entries(program, b.sigs, items)
+        entries = Layer.with_entries(program, b.table, b.sigs, items)
         args_row = items.enumerate().fold(EMPTY_ROW, |acc, (i, item)| {
           initialized = Layer.item_evaluated(program, entries, items, i)
           item_args(item).fold(acc, |a, arg| {
@@ -588,7 +607,24 @@ fn check_subsets(all: List[Subset]) -> () {
   all.each(|c| {
     sub = resolve_row(c.sub)
     sup = resolve_row(c.sup)
-    missing = sub.elems.filter(|e| !contains_elem(sup, e))
+    missing0 = sub.elems.filter(|e| !contains_elem(sup, e))
+    # A capability cannot be written in `uses`, so a missing one is reported as its effect.
+    missing = if c.kind == Effects { widened_row(row_of(missing0)).elems } else { missing0 }
+    if !missing.is_empty() && c.kind == Effects {
+      c.origin match {
+        Infer.Body(def)         -> report_unhandled_effects(def, missing)
+        Infer.Closed(def)       -> report_unhandled_effects(def, missing)
+        Infer.LayerArg(_, _, a) -> push_unhandled_effects(a, missing)
+        Infer.MemberInit(h)     -> report_unhandled_member_init(h, missing)
+        Infer.Coerce(span, _)   -> when_some(span, |s| diag(s, "E0403", "effect set mismatch"))
+        Infer.LocalFnBody(local) -> when_some(bs().local_fns.get(local), |info| {
+          if info.uses_written {
+            push_unhandled_effects(info.body, missing)
+          }
+        })
+        _                       -> ()
+      }
+    }
     if !missing.is_empty() && c.kind == Errors {
       c.origin match {
         Infer.Body(def)           -> report_unhandled(def, missing)
@@ -649,7 +685,25 @@ fn report_local_fn_errors(local: Int, missing: List[RowElem]) -> () {
 
 ## Reports `missing` of `body`, one diagnostic per expression that raised some of them.
 fn push_unhandled(body: Int, missing: List[RowElem], code: String) -> () {
-  rows = resolved_rows()
+  report_origins(resolved_rows(bs().expr_rows), body, missing, code)
+}
+
+## E0402 for the effects `missing` of a definition's body.
+fn report_unhandled_effects(def: Int, missing: List[RowElem]) -> () {
+  program = prog()
+  body = program.items.get(def) match {
+    Some(IConst(c)) -> Some(c.value)
+    _               -> fn_parts(program, def).and_then(|(_, b)| b)
+  }
+  when_some(body, |b| push_unhandled_effects(b, missing))
+}
+
+fn push_unhandled_effects(body: Int, missing: List[RowElem]) -> () {
+  report_origins(resolved_rows(bs().expr_effects), body, missing, "E0402")
+}
+
+## One diagnostic per expression that raised some of `missing`.
+fn report_origins(rows: Map[Int, Row], body: Int, missing: List[RowElem], code: String) -> () {
   origins = missing.fold([], |acc, e| {
     o = origin_of(rows, body, e)
     if acc.any(|x| x == o) { acc } else { acc.append([o]) }
@@ -657,8 +711,8 @@ fn push_unhandled(body: Int, missing: List[RowElem], code: String) -> () {
   origins.each(|o| diag(expr_span(o), code, "unhandled errors"))
 }
 
-fn resolved_rows() -> Map[Int, Row] {
-  bs().expr_rows.fold(Map.empty(), |acc, expr, row| acc.insert(expr, resolve_row(row)))
+fn resolved_rows(table: Map[Int, Row]) -> Map[Int, Row] {
+  table.fold(Map.empty(), |acc, expr, row| acc.insert(expr, resolve_row(row)))
 }
 
 ## The expression that raised `elem`: follows the first sub-expression in source order whose E
@@ -684,12 +738,12 @@ fn sub_exprs(expr: Int) -> List[Int] {
           _          -> None
         }
       })
-      EField(base, _)             -> [base]
-      ECall(callee, args)         -> [callee, ..args.map(|a| a.value)]
-      EUnary(_, operand)          -> [operand]
-      EBinary(_, lhs, rhs)        -> [lhs, rhs]
-      ETuple(elems)               -> elems
-      EList(elems, rest)          -> elems.append(rest.map(|r| [r]).or([]))
+      EField(base, _)    -> [base]
+      ECall(callee, args) -> [callee, ..args.map(|a| a.value)]
+      EUnary(_, operand) -> [operand]
+      EBinary(_, lhs, rhs) -> [lhs, rhs]
+      ETuple(elems)      -> elems
+      EList(elems, rest) -> elems.append(rest.map(|r| [r]).or([]))
       EBlock(block) -> block.stmts.filter_map(|stmt| {
         stmt match {
           SLet(_, _, value) -> Some(value)
@@ -697,14 +751,16 @@ fn sub_exprs(expr: Int) -> List[Int] {
           SExpr(x)          -> Some(x)
         }
       }).append(block.tail.map(|t| [t]).or([]))
-      EIf(c, t, el)               -> [c, t].append(el.map(|x| [x]).or([]))
-      EMatch(inner, arms)         -> [inner].append(arm_exprs(arms))
-      EEscape(inner, arms)        -> [inner].append(arm_exprs(arms))
-      EFail(x)                    -> [x]
-      EAssert(x)                  -> [x]
+      EIf(c, t, el)      -> [c, t].append(el.map(|x| [x]).or([]))
+      EMatch(inner, arms) -> [inner].append(arm_exprs(arms))
+      EEscape(inner, arms) -> [inner].append(arm_exprs(arms))
+      EFail(x)           -> [x]
+      EAssert(x)         -> [x]
       EUpdate(ctor, fields, base) -> [ctor].append(fields.map(|f| f.value)).append([base])
-      EWith(items, body)          -> Layer.evaluated_args(program, bs().sigs, items).append([body])
-      _                           -> []
+      EWith(items, body) -> Layer.evaluated_args(program, bs().table, bs().sigs, items).append(
+        [body],
+      )
+      _                  -> []
     }
   }
 }
@@ -738,5 +794,436 @@ fn check_unraised() -> () {
         })
       }
     })
+  })
+}
+
+# ---------------------------------------------------------------------------------------------
+# Computing R (`body/effects.rs`)
+#
+# - The R of `use X` is `{X}`; a call adds the callee's R; a capability operation's R is its
+#   effect, or the capability itself for a captured variable or a parameter.
+# - `with` removes the effects it provides and adds its handlers' dependencies.
+# - A capability is removed where its root `with` ends; at the end of the body that binds the
+#   variable it is removed if bound to `use E`, and replaced with its effect otherwise.
+# - A body's R is contained in the declared R; the R of `main`, tests and `@export` fns is empty
+#   apart from the host effects the entry provides.
+
+## Computes the R of the group's bodies and adds that they are contained in the declared R.
+pub fn infer_effects() -> () uses { State[BodyState], State[Infer], State[TyLower] } {
+  program = prog()
+  bs().defs.each(|def| {
+    bupd(|b| BodyState(current: Some(def), binder: None, ..b))
+    program.items.get(def) match {
+      # The arguments of a layer's items cannot have effects (`[effect.layer]`).
+      Some(ILayer(item)) -> item.members.enumerate().each(|(member, m)| {
+        m.args.map(|a| a.args).or([]).each(|arg| {
+          add_subset_of(
+            Effects,
+            expr_effects(arg.value),
+            EMPTY_ROW,
+            Infer.LayerArg(def, member, arg.value),
+          )
+        })
+      })
+      # A const's value cannot have effects (spec 5.6).
+      Some(IConst(c)) -> add_subset_of(Effects, expr_effects(c.value), EMPTY_ROW, Infer.Body(def))
+      Some(IHandler(item)) -> handler_effects(def, item)
+      _ -> fn_parts(program, def).and_then(|(_, body)| body) match {
+        Some(body) -> def_ty(def).map(shallow_resolve) match {
+          Some(TyFn(f)) -> {
+            row = end_binder(expr_effects(body), def, None)
+            closed = bs().closed.get(def)
+            when_some(closed, |c| {
+              add_subset_of(Effects, row, provided_hosts(program, c), Infer.Closed(def))
+            })
+            # When `main` or a test has a `uses` clause, only report that it is not empty.
+            written_uses = program.items.get(def) match {
+              Some(IFn(fi))      -> fi.sig.uses.is_some()
+              Some(ITraitFn(fi)) -> fi.sig.uses.is_some()
+              _                  -> False
+            }
+            if closed.is_none() || !written_uses {
+              add_subset_of(Effects, row, f.uses, Infer.Body(def))
+            }
+          }
+          _ -> ()
+        }
+        None -> ()
+      }
+    }
+  })
+}
+
+## The host effects the entry provides to a closed definition.
+fn provided_hosts(program: Program, c: Closed) -> Row {
+  prelude = |name: String| prelude_def(program, name).map(|d| [RTag(Tag(d, []))]).or([])
+  c match {
+    ClosedMain       -> row_of(prelude("Async").append(prelude("ProcessHost")))
+    ClosedExport(hs) -> row_of(prelude("Async").append(hs.map(|d| RTag(Tag(d, [])))))
+  }
+}
+
+## A handler's dependencies are the union of the R of init, release and the operation bodies. A
+## suspend fn implementation that may call resume later requires Async (spec 8.7). The
+## requirements of inner handlers are the outer handler's.
+fn handler_effects(def: Int, item: Hir.HandlerItem) -> () {
+  program = prog()
+  deps = handler_deps(def)
+  bs().handler_bodies.filter(|hb| hb.owner == def).each(|hb| {
+    row = end_binder(expr_effects(hb.body), def, None)
+    async_def = if hb.resume_later { prelude_def(program, "Async") } else { None }
+    with_async = async_def.map(|a| insert(row, RTag(Tag(a, [])))).or(row)
+    add_subset_of(Effects, with_async, deps, Infer.HandlerOp(def, hb.index))
+  })
+  bs().handler_parts.filter(|p| p.owner == def).each(|p| {
+    row = end_binder(expr_effects(p.body), def, None)
+    add_subset_of(Effects, row, deps, Infer.HandlerPart)
+  })
+  item.inner.each(|inner| add_subset_of(Effects, handler_deps(inner), deps, Infer.HandlerPart))
+}
+
+## A handler's dependencies: computed in an earlier group, or a set variable within this group.
+fn handler_deps(hdl: Int) -> Row {
+  b = bs()
+  b.facts.uses.get(hdl) match {
+    Some(row) -> row
+    None -> b.pending_handlers.find(|(h, _, _)| h == hdl).map(|(_, v, _)| var_row(v)).or(EMPTY_ROW)
+  }
+}
+
+## Sub-expressions' R flows into the parent (spec 9.4). Records each expression's R.
+fn expr_effects(expr: Int) -> Row {
+  program = prog()
+  kind = program.exprs.get(expr).map(|e| e.kind)
+  row = kind match {
+    None                     -> EMPTY_ROW
+    # `use` of a host effect is E0414 and adds nothing.
+    Some(EUse(ResDef(eff), _)) if Signature.is_host_effect(program, eff) -> EMPTY_ROW
+    Some(EUse(_, _)) -> bs().expr_tys.get(expr) match {
+      Some(TyCap(tags)) -> row_of(tags.map(RTag))
+      _                 -> EMPTY_ROW
+    }
+    # The body's R is enclosed in the lambda type's R.
+    Some(ELambda(_, body)) -> {
+      outer = bs().binder
+      set_binder(Some(expr))
+      inner = expr_effects(body)
+      set_binder(outer)
+      body_row = end_binder_here(inner, Some(expr))
+      when_some(bs().lambda_rows.get(expr), |(_, v)| {
+        add_subset_of(Effects, body_row, var_row(v), Infer.Lambda)
+      })
+      EMPTY_ROW
+    }
+    Some(EBlock(block)) -> {
+      block.stmts.each(|stmt| {
+        stmt match {
+          # The R of a local fn's body is enclosed in its type's R, as for a lambda.
+          SLocalFn(f) -> when_some(bs().local_fns.get(f.local), |info| {
+            outer = bs().binder
+            set_binder(Some(info.body))
+            inner = expr_effects(info.body)
+            set_binder(outer)
+            body_row = end_binder_here(inner, Some(info.body))
+            add_subset_of(Effects, body_row, info.uses, Infer.LocalFnBody(f.local))
+          })
+          SLet(pat, _, value) -> note_use_binding(pat, value)
+          _                   -> ()
+        }
+      })
+      sub_effects(expr)
+    }
+    Some(EWith(items, body)) -> with_effects(expr, items, body)
+    Some(ECall(callee, _)) -> {
+      row = sub_effects(expr)
+      # The arguments of `x |> f(a)` are recorded on the pipe expression.
+      call = bs().piped_calls.get(expr).or(expr)
+      union(row, replace_params(call, callee, callee_uses(callee)))
+    }
+    # `x |> f(a)` is `f(x, a)`. If the right side is a call, that call adds the callee's R.
+    Some(EBinary(OpPipe, _, rhs)) -> {
+      rhs_call = program.exprs.get(rhs).map(|r| r.kind) match {
+        Some(ECall(_, _)) -> True
+        _                 -> False
+      }
+      if rhs_call {
+        bupd(|b| BodyState(piped_calls: b.piped_calls.insert(rhs, expr), ..b))
+      }
+      row = sub_effects(expr)
+      if rhs_call { row } else { union(row, replace_params(expr, rhs, callee_uses(rhs))) }
+    }
+    _                        -> sub_effects(expr)
+  }
+  bupd(|b| BodyState(expr_effects: b.expr_effects.insert(expr, row), ..b))
+  row
+}
+
+fn set_binder(binder: Option[Int]) -> () {
+  bupd(|b| BodyState(binder:, ..b))
+}
+
+## A variable bound to `use E`: its capability is removed where the `with` providing E ends.
+fn note_use_binding(pat: Int, value: Int) -> () {
+  program = prog()
+  local = program.pats.get(pat).map(|p| p.kind) match {
+    Some(PBind(l)) -> Some(l)
+    _              -> None
+  }
+  is_use = program.exprs.get(value).map(|e| e.kind) match {
+    Some(EUse(_, _)) -> True
+    _                -> False
+  }
+  tag = if is_use {
+    bs().expr_tys.get(value) match {
+      Some(TyCap(tags)) -> tags.head()
+      _                 -> None
+    }
+  } else {
+    None
+  }
+  (local, tag) match {
+    (Some(l), Some(t)) -> {
+      bupd(|b| BodyState(use_bound: b.use_bound.insert(l, True), ..b))
+      when_some(innermost_with(t), |w| {
+        bupd(|b| BodyState(cap_roots: b.cap_roots.insert(l, w), ..b))
+      })
+    }
+    _ -> ()
+  }
+}
+
+fn sub_effects(expr: Int) -> Row {
+  sub_exprs(expr).fold(EMPTY_ROW, |row, e| union(row, expr_effects(e)))
+}
+
+fn callee_uses(callee: Int) -> Row {
+  shallow_resolve(bs().expr_tys.get(callee).or(TyError)) match {
+    TyFn(f) -> f.uses
+    _       -> EMPTY_ROW
+  }
+}
+
+## `uses`, the R of the callee of `call`, with each capability element that is a parameter of the
+## callee replaced by what the argument is: the capability of the argument variable when it is
+## itself an element, the effect otherwise. A capability of another definition's variable that is
+## not a parameter of the callee is replaced with its effect.
+fn replace_params(call: Int, callee: Int, uses0: Row) -> Row {
+  program = prog()
+  uses = resolve_row(uses0)
+  has_cap = uses.elems.any(|e| {
+    e match {
+      RCap(_) -> True
+      _       -> False
+    }
+  })
+  if !has_cap {
+    uses
+  } else {
+    b = bs()
+    callee_def = program.exprs.get(callee).map(|e| e.kind) match {
+      Some(EPath(ResDef(d))) -> Some(d)
+      Some(EField(_, _))     -> b.methods.get(callee)
+      _                      -> None
+    }
+    params = callee_def.and_then(|d| fn_parts(program, d)).map(|(ps, _)| ps.map(|p| p.local)).or([])
+    args = b.calls.get(call).or([])
+    uses.elems.fold(EMPTY_ROW, |out, e| {
+      e match {
+        RCap(c) -> {
+          position = params.enumerate().find(|(_, p)| p == c.local).map(|(i, _)| i)
+          position match {
+            Some(i) -> {
+              arg = args.get(i).and_then(|a| a)
+              arg.and_then(named_capability) match {
+                Some(local) -> insert(out, RCap(CapElem(local, local_name(local), c.tag)))
+                None        -> insert(out, RTag(c.tag))
+              }
+            }
+            None -> if b.local_owner.get(c.local) == b.current {
+              insert(out, e)
+            } else {
+              insert(out, RTag(c.tag))
+            }
+          }
+        }
+        _ -> insert(out, e)
+      }
+    })
+  }
+}
+
+fn local_name(local: Int) -> String {
+  prog().locals.get(local).map(|l| l.name).or("")
+}
+
+## The R of `with H1, ..., Hn { body }` (spec 8.3, 8.5, 9.4).
+fn with_effects(expr: Int, items: List[WithItem], body: Int) -> Row {
+  program = prog()
+  arg_rows = items.map(|item| item_args(item).map(expr_effects))
+  entries = Layer.with_entries(program, bs().table, bs().sigs, items)
+  provided = entries.filter(|e| e.named).map(|e| e.provided)
+  # A variable bound to an item is the capability of that item; it cannot leave the `with`.
+  items.each(|item| {
+    when_some(item.bind, |local| {
+      member = Layer.is_member_item(program, item)
+      bupd(|b| {
+        use_bound = if member { b.use_bound } else { b.use_bound.insert(local, True) }
+        BodyState(cap_roots: b.cap_roots.insert(local, expr), use_bound:, ..b)
+      })
+    })
+  })
+  bupd(|b| BodyState(with_stack: [(expr, provided), ..b.with_stack], ..b))
+  body_row = expr_effects(body)
+  bupd(|b| BodyState(with_stack: b.with_stack.drop(1), ..b))
+  deps = entries.map(|e| {
+    e.supplier match {
+      Layer.SHandler(h) -> handler_deps(h)
+      Layer.SEffect(t)  -> row_of([RTag(t)])
+    }
+  })
+  # A provider of an effect also provides its labels declared `default`, unless the same `with`
+  # gives them a provider. They are removed from the body's R only.
+  defaults = entries.filter(|e| e.named).fold([], |acc, e| {
+    sigs = bs().sigs
+    labels = sigs.default_labels.get(e.provided.def).or([]).filter(
+      |l| Signature.label_base(sigs, l) == Some(e.provided),
+    )
+    labels.fold(acc, |a, label| {
+      tag = Tag(label, [])
+      if provided.any(|p| p == tag) || a.any(|t| t == tag) { a } else { a.append([tag]) }
+    })
+  })
+  subtracted = subtract(body_row, provided.append(defaults))
+  # The capabilities whose root is this `with`.
+  roots = bs().cap_roots.fold([], |acc, local, w| {
+    if w == expr { acc.append(cap_elems(local)) } else { acc }
+  })
+  row = if roots.is_empty() { subtracted } else { subtract_elems(subtracted, roots) }
+  # Handler dependencies may be met by handlers in the same `with` providing other effects (spec
+  # 14.2); a handler's own effects are met from outside.
+  with_deps = entries.zip(deps).fold(row, |acc, (entry, dep)| {
+    others = provided.filter(|p| !entry.own.any(|o| o == p))
+    union(acc, subtract(dep, others))
+  })
+  # An item that opens a handler member requires the effect that declares it, or the capability
+  # it is opened through; a provider of that effect in the same `with` meets it.
+  with_members = bs().with_members.get(expr).or([]).fold(with_deps, |acc, (_, f)| {
+    union(acc, subtract(f.uses, provided))
+  })
+  items.enumerate().zip(arg_rows).fold(with_members, |acc, ((i, _), rows)| {
+    if Layer.item_evaluated(program, entries, items, i) {
+      rows.fold(acc, union)
+    } else {
+      acc
+    }
+  })
+}
+
+## The innermost enclosing `with` that provides `tag`.
+fn innermost_with(tag: Tag) -> Option[Int] {
+  bs().with_stack.find(|(_, provides)| provides.any(|p| same_tag(p, tag))).map(|(w, _)| w)
+}
+
+## The capability elements of a local holding a capability value, one per effect.
+fn cap_elems(local: Int) -> List[RowElem] {
+  bs().locals.get(local).map(resolve) match {
+    Some(TyCap(tags)) -> tags.map(|t| RCap(CapElem(local, local_name(local), t)))
+    _                 -> []
+  }
+}
+
+## `row` without the capabilities of the variables bound in `binder` of `def`: their binding ends
+## with that body. A variable bound to `use E` has already added E, so its capability is removed;
+## another is replaced with its effect.
+fn end_binder(row: Row, def: Int, binder: Option[Int]) -> Row {
+  b = bs()
+  locals = b.local_binder.fold([], |acc, local, bound| {
+    mine = bound == binder && b.local_owner.get(local) == Some(def)
+    if mine && !is_fn_param(local) { acc.append([local]) } else { acc }
+  })
+  used = locals.filter(|l| b.use_bound.contains(l)).flat_map(|l| cap_or_self_elems(l, def))
+  others = locals.filter(|l| !b.use_bound.contains(l)).flat_map(|l| cap_or_self_elems(l, def))
+  removed_row = if used.is_empty() { row } else { subtract_elems(row, used) }
+  if others.is_empty() { removed_row } else { widen_elems(removed_row, others) }
+}
+
+## The capability elements of a local, or else the element of a handler's `self`, which stands
+## for the capabilities in its fields.
+fn cap_or_self_elems(local: Int, def: Int) -> List[RowElem] {
+  elems = cap_elems(local)
+  if !elems.is_empty() {
+    elems
+  } else {
+    is_self = prog().locals.get(local).map(|l| l.kind == Hir.SelfLocal).or(False)
+    if is_self { [RCap(CapElem(local, local_name(local), Tag(def, [])))] } else { [] }
+  }
+}
+
+## Replaces the capabilities `caps` in `row` with their effects. Set variables are replaced with
+## fresh ones whose solutions do the same.
+fn widen_elems(row: Row, caps: List[RowElem]) -> Row {
+  resolve_row(row).elems.fold(EMPTY_ROW, |out, e| {
+    e match {
+      RCap(c) if caps.any(|m| same_local(m, c.local)) -> insert(out, RTag(c.tag))
+      RVar(v) -> {
+        d = new_row_var()
+        bupd(|b| BodyState(row_widens: b.row_widens.append([(d, v, caps)]), ..b))
+        insert(out, RVar(d))
+      }
+      _                                               -> insert(out, e)
+    }
+  })
+}
+
+fn same_local(m: RowElem, local: Int) -> Bool {
+  m match {
+    RCap(x) -> x.local == local
+    _       -> False
+  }
+}
+
+fn end_binder_here(row: Row, binder: Option[Int]) -> Row {
+  bs().current.map(|def| end_binder(row, def, binder)).or(row)
+}
+
+## Removes tags and capabilities from `row`: a tag only the same tag, a capability only the same
+## variable.
+fn subtract_elems(row: Row, minus: List[RowElem]) -> Row {
+  resolve_row(row).elems.fold(EMPTY_ROW, |out, e| {
+    e match {
+      RTag(t) -> {
+        gone = minus.any(|m| {
+          m match {
+            RTag(x) -> same_tag(x, t)
+            _       -> False
+          }
+        })
+        if gone { out } else { insert(out, e) }
+      }
+      RCap(c) -> if minus.any(|m| same_local(m, c.local)) { out } else { insert(out, e) }
+      RVar(v) -> {
+        d = new_row_var()
+        bupd(|b| BodyState(row_diffs: b.row_diffs.append([(d, v, minus)]), ..b))
+        insert(out, RVar(d))
+      }
+      _       -> insert(out, e)
+    }
+  })
+}
+
+## Removes the tags `tags` from `row`. Set variables are replaced with fresh ones whose solutions
+## exclude them; nothing is removed from set type parameters.
+fn subtract(row: Row, tags: List[Tag]) -> Row {
+  resolve_row(row).elems.fold(EMPTY_ROW, |out, e| {
+    e match {
+      RTag(t) if tags.any(|p| same_tag(p, t)) -> out
+      RVar(v) if !tags.is_empty() -> {
+        d = new_row_var()
+        minus = tags.map(RTag)
+        bupd(|b| BodyState(row_diffs: b.row_diffs.append([(d, v, minus)]), ..b))
+        insert(out, RVar(d))
+      }
+      _                                       -> insert(out, e)
+    }
   })
 }

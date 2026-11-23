@@ -284,6 +284,8 @@ pub type FnItem(
   is_intrinsic: Bool,
   exports: List[ExternalAttr],
   entries: List[EntryAttr],
+  ## Whether it is a test function (`@test`, spec 13.1).
+  is_test: Bool,
 )
 
 ## One `@entry(T)` on a fn: what `T` names, if it is one name or path.

@@ -4,7 +4,7 @@ import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program, DefModule, Span, Arm, Param, IFn, ITraitFn}
 import Groups.{impl_fn}
-import Ty.{Ty, Row, RowElem, TyParam, ParamKind, FnTy, SetKind}
+import Ty.{Ty, Row, RowElem, Tag, TyParam, ParamKind, FnTy, SetKind}
 import Tylower.{TyTable}
 import Signature.{Signatures}
 import Traits.{Traits}
@@ -85,7 +85,43 @@ pub type BodyState(
   row_widens: List[(Int, Int, List[RowElem])],
   ## Newest first.
   escapes: List[EscapeInfo],
+  ## The lambda expression or local fn body whose body is being inferred; `None` in the body of
+  ## the definition itself.
+  binder: Option[Int],
+  ## The binder each local is bound in. A local used inside another binder is captured.
+  local_binder: Map[Int, Option[Int]],
+  ## The definition whose body each local belongs to.
+  local_owner: Map[Int, Int],
+  ## Calls (and method calls) → the arguments by parameter position.
+  calls: Map[Int, List[Option[Int]]],
+  ## Method call callees → the fn called.
+  methods: Map[Int, Int],
+  ## Locals bound to the capability a handler member item of `with` opens.
+  member_bound: Map[Int, Bool],
+  ## Locals bound to `use E`, or to a `with` item, or the `self` of a handler whose fields hold
+  ## capabilities: at the end of their binding their capability is removed, not widened.
+  use_bound: Map[Int, Bool],
+  ## Each expression's R, computed after the body is inferred.
+  expr_effects: Map[Int, Row],
+  ## The call on the right of a pipe `x |> f(a)` → the pipe expression.
+  piped_calls: Map[Int, Int],
+  ## While computing R: the enclosing `with` expressions, innermost first, with the effects they
+  ## provide.
+  with_stack: List[(Int, List[Tag])],
+  ## Locals bound to `use E` → the `with` that provides E there. Their capability is removed
+  ## where it ends.
+  cap_roots: Map[Int, Int],
+  ## Definitions whose R must be empty apart from the host effects the entry provides.
+  closed: Map[Int, Closed],
 )
+
+## Why a definition's R is closed.
+pub enum Closed {
+  ## The entry's `main` or a test: Async and ProcessHost are provided.
+  ClosedMain
+  ## An `@export` fn: Async and the given host effects are provided.
+  ClosedExport(hosts: List[Int])
+}
 
 ## A fresh state for a group.
 pub fn new_state(
@@ -94,6 +130,7 @@ pub fn new_state(
   traits: Traits,
   sigs: Signatures,
   facts: HandlerFacts,
+  closed: Map[Int, Closed],
 ) -> BodyState {
   BodyState(
     program:,
@@ -131,6 +168,18 @@ pub fn new_state(
     row_diffs: [],
     row_widens: [],
     escapes: [],
+    binder: None,
+    local_binder: Map.empty(),
+    local_owner: Map.empty(),
+    calls: Map.empty(),
+    methods: Map.empty(),
+    member_bound: Map.empty(),
+    use_bound: Map.empty(),
+    expr_effects: Map.empty(),
+    piped_calls: Map.empty(),
+    with_stack: [],
+    cap_roots: Map.empty(),
+    closed:,
   )
 }
 
@@ -213,4 +262,29 @@ pub fn fn_parts(program: Program, def: Int) -> Option[(List[Param], Option[Int])
     Some(_)           -> None
     None              -> impl_fn(program, def).map(|(_, f)| (f.params, f.body))
   }
+}
+
+## The local `expr` refers to, if its capability is an element of R by itself: a variable bound
+## outside the closure or local fn being inferred, or a parameter of the function being inferred.
+pub fn named_capability(expr: Int) -> Option[Int] uses { State[BodyState] } {
+  b = bs()
+  b.program.exprs.get(expr).map(|e| e.kind) match {
+    Some(Hir.EPath(Hir.ResLocal(local))) -> if b.member_bound.contains(local) {
+      Some(local)
+    } else {
+      b.local_binder.get(local).and_then(|bound| {
+        if bound != b.binder || is_fn_param(local) { Some(local) } else { None }
+      })
+    }
+    _ -> None
+  }
+}
+
+## Whether `local` is a parameter of the function definition being inferred.
+pub fn is_fn_param(local: Int) -> Bool uses { State[BodyState] } {
+  b = bs()
+  b.current.map(|def| {
+    owned = b.local_owner.get(local) == Some(def) && b.local_binder.get(local) == Some(None)
+    owned && fn_parts(b.program, def).map(|(ps, _)| ps.any(|p| p.local == local)).or(False)
+  }).or(False)
 }

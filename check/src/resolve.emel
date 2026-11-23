@@ -1479,6 +1479,10 @@ fn fn_item(def: Int, f: Node) -> FnItem uses { State[Resolver] } {
   entries = annotations(f).filter(|a| annotation_name(a) == Some("entry")).map(|a| {
     EntryAttr(entry_adapter(a), node_span(a))
   })
+  # A test (spec 13.1): `@test` without arguments on a fn without parameters with a body.
+  test_attr = annotations(f).find(|a| annotation_name(a) == Some("test"))
+  well_formed = test_attr.map(|a| child_kind(a, AnnotArgList).is_none()).or(False)
+  is_test = well_formed && params.is_empty() && body.is_some()
   FnItem(
     sig,
     body,
@@ -1487,6 +1491,7 @@ fn fn_item(def: Int, f: Node) -> FnItem uses { State[Resolver] } {
     has_annotation(f, "intrinsic"),
     attrs(f, "export"),
     entries,
+    is_test,
   )
 }
 

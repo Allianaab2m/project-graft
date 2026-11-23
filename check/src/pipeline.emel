@@ -22,6 +22,7 @@ import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, looku
 import Syntax.Parse
 import Resolve
 import Typeck
+import Tylower.{TyDiag}
 import Syntax.Sink
 import Syntax.Source.{slice}
 import Syntax.Tree.{Diagnostic, Import, ImportList, Error}
@@ -180,7 +181,18 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
     })
     # Type checking runs on the program even when name resolution reported errors.
     main_module = if inp.library_only { None } else { entry }
-    type_diagnostics = Typeck.check(resolved.program, main_module).map(|d| {
+    # The reference sorts them by file, numbered in the order the files were read.
+    ranks = file_ranks(map, reads, start, inp.single_file)
+    rank = |d: TyDiag| {
+      d.span match {
+        Some(s) -> (1, ranks.get(s.module).or(count), s.start)
+        None    -> (0, 0, 0)
+      }
+    }
+    sorted = Typeck.check(resolved.program, main_module).sort_by(
+      |a, b| Ord.compare(rank(a), rank(b)),
+    )
+    type_diagnostics = sorted.map(|d| {
       severity = if d.warning { "warning" } else { "error" }
       d.span match {
         Some(s) -> Checked(
@@ -206,6 +218,48 @@ fn normalize(path: String) -> String {
     )
   } else {
     path
+  }
+}
+
+## The number of each module's file in the reference's file table: the work list is a stack
+## (the last module first), and for a single file the imports of each module read are pushed in
+## import order.
+fn file_ranks(
+  map: ModuleMap,
+  reads: Map[Int, Read],
+  start: List[Int],
+  single_file: Bool,
+) -> Map[Int, Int] {
+  queued = start.fold(Map.empty(), |m, i| m.insert(i, True))
+  next_rank(map, reads, start.reverse(), queued, single_file, Map.empty())
+}
+
+## `stack` is newest first.
+fn next_rank(
+  map: ModuleMap,
+  reads: Map[Int, Read],
+  stack: List[Int],
+  queued: Map[Int, Bool],
+  single_file: Bool,
+  ranks: Map[Int, Int],
+) -> Map[Int, Int] {
+  stack match {
+    [] -> ranks
+    [module, ..rest] -> reads.get(module) match {
+      None -> next_rank(map, reads, rest, queued, single_file, ranks)
+      Some(r) -> {
+        ranked = ranks.insert(module, ranks.size())
+        targets = if single_file {
+          imports_of(r.src, r.parsed).filter_map(|imp| lookup(map, imp.path))
+        } else {
+          []
+        }
+        (pushed, marked) = targets.fold((rest, queued), |(st, q), t| {
+          if q.contains(t) { (st, q) } else { ([t, ..st], q.insert(t, True)) }
+        })
+        next_rank(map, reads, pushed, marked, single_file, ranked)
+      }
+    }
   }
 }
 

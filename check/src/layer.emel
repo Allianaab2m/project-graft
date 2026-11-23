@@ -8,7 +8,9 @@
 import Hir.{Program, Span, WithItem, ResDef, MemberKind, EffectKind, IHandler, ILayer, IEffect}
 import Ty.{Tag}
 import Signature.{Signatures, base_of, effects_of_handler, label_base}
-import Tylower.{def_of}
+import Std.State.{State}
+import Tylower.{TyTable, def_of, effect_tag, new_lower}
+import Infer.{new_infer}
 import Groups.{flatten_layer, item_args}
 
 ## What provides an effect listed in `with`: a handler, or the provider of an effect already in
@@ -44,10 +46,15 @@ pub fn entry_handler(e: Entry) -> Option[Int] {
 
 ## Expands the items listed in `with` into providers. Items that do not fit are skipped (they are
 ## reported elsewhere).
-pub fn with_entries(program: Program, sigs: Signatures, items: List[WithItem]) -> List[Entry] {
+pub fn with_entries(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  items: List[WithItem],
+) -> List[Entry] {
   all = items.enumerate().flat_map(|(origin, item)| {
     item.res match {
-      ResDef(def) -> item_entries(program, sigs, item, def, origin)
+      ResDef(def) -> item_entries(program, table, sigs, item, def, origin)
       _           -> []
     }
   })
@@ -56,6 +63,7 @@ pub fn with_entries(program: Program, sigs: Signatures, items: List[WithItem]) -
 
 fn item_entries(
   program: Program,
+  table: TyTable,
   sigs: Signatures,
   item: WithItem,
   def: Int,
@@ -64,8 +72,8 @@ fn item_entries(
   span = item.span
   item.by match {
     Some((by, _)) -> label_base(sigs, def) match {
-      Some(base) -> by_supplier(program, sigs, by) match {
-        Some((supplier, provided)) if provided.any(|t| t.def == base.def) -> [
+      Some(base) -> by_supplier(program, table, sigs, by, item.by_args) match {
+        Some((supplier, provided)) if provided.any(|t| t == base) -> [
           Entry(supplier, Tag(def, []), span, origin, False, True, [Tag(def, [])]),
         ]
         _ -> []
@@ -99,21 +107,35 @@ fn handler_entries(
 
 ## The right of `by` as a supplier, with the effects it provides: a handler provides every effect
 ## it implements; an effect provides itself, or its base if it is a label.
-fn by_supplier(program: Program, sigs: Signatures, by: Hir.Res) -> Option[(Supplier, List[Tag])] {
+fn by_supplier(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  by: Hir.Res,
+  args: List[Int],
+) -> Option[(Supplier, List[Tag])] {
   by match {
     ResDef(d) -> {
       effects = effects_of_handler(sigs, d)
       if !effects.is_empty() {
         Some((SHandler(d), effects))
       } else if def_of(program, d).kind == EffectKind {
-        tag = Tag(d, [])
-        Some((SEffect(tag), [base_of(sigs, tag)]))
+        effect_tag_of(program, table, d, args).map(|tag| (SEffect(tag), [base_of(sigs, tag)]))
       } else {
         None
       }
     }
     _ -> None
   }
+}
+
+## The effect `eff` with the type arguments `args` written after it, read outside any scope.
+## Their diagnostics are reported where `with` items are checked, not here.
+fn effect_tag_of(program: Program, table: TyTable, eff: Int, args: List[Int]) -> Option[Tag] {
+  ((tag, _), _) = State.run(new_lower(program, table, []), || {
+    State.run(new_infer(), || effect_tag(eff, args, None, None))
+  })
+  tag
 }
 
 ## For providers of the same effect, only the later one is kept. An item bound to a name is kept
@@ -160,8 +182,13 @@ pub fn item_evaluated(
 }
 
 ## The arguments written on the items of a `with` that are evaluated, in source order.
-pub fn evaluated_args(program: Program, sigs: Signatures, items: List[WithItem]) -> List[Int] {
-  entries = with_entries(program, sigs, items)
+pub fn evaluated_args(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  items: List[WithItem],
+) -> List[Int] {
+  entries = with_entries(program, table, sigs, items)
   items.enumerate().flat_map(|(i, item)| {
     if item_evaluated(program, entries, items, i) { item_args(item) } else { [] }
   })

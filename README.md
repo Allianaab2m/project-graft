@@ -97,8 +97,10 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
      E04xx). In progress, on the corpus and the 214 inputs of the tests of emela-types
      (`test_data/types`): the declared signatures, and the types of bodies (expressions,
      patterns, calls, method calls through the module of a type or a trait, handlers and `with`
-     items), traits and impls, match coverage, and error sets report the same diagnostics as
-     `emela check`. Not yet: effect sets, and captures.
+     items), traits and impls, match coverage, and error and effect sets report the same
+     diagnostics as `emela check`. Not yet: suspension (E0416, E0417), capability values
+     (E0425), handler dependency cycles (E0411), the checks of `with` items and layers, exports
+     and captures.
 
   The corpus for M3 is what is written to be checked: the 87 programs of
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of
