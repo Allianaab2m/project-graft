@@ -1,0 +1,99 @@
+import Std.State.{State}
+import Infer.{
+  Infer,
+  Mismatch,
+  InfiniteType,
+  new_infer,
+  new_var,
+  new_int_var,
+  unify,
+  resolve,
+  join,
+  generalize,
+  instantiate,
+}
+import Ty.{
+  Ty,
+  TyVar,
+  TyList,
+  TyFn,
+  TyNever,
+  TyBound,
+  Scheme,
+  INT,
+  INT64,
+  STRING,
+  BOOL,
+  EMPTY_ROW,
+  func,
+}
+
+fn run[A](f: fn() -> A uses { State[Infer] }) -> A {
+  (out, _) = State.run(new_infer(), f)
+  out
+}
+
+@test
+fn a_variable_takes_the_type_it_is_unified_with() {
+  assert run(|| {
+    v = new_var()
+    unify(TyList(v), TyList(INT))
+    resolve(v)
+  })
+    == INT
+}
+
+@test
+fn a_mismatch_reports_the_part_that_differs_and_rolls_back() {
+  (kind, after) = run(|| {
+    v = new_var()
+    err = unify(
+      func([v, INT], v, EMPTY_ROW, EMPTY_ROW),
+      func([STRING, STRING], STRING, EMPTY_ROW, EMPTY_ROW),
+    )
+    (err.map(|e| e.kind), resolve(v))
+  })
+  assert kind == Some(Mismatch(INT, STRING))
+  assert after match {
+    TyVar(_) -> True
+    _        -> False
+  }
+}
+
+@test
+fn a_variable_does_not_unify_with_a_type_containing_it() {
+  assert run(|| {
+    v = new_var()
+    unify(v, TyList(v)).map(|e| e.kind) match {
+      Some(InfiniteType(_, _)) -> True
+      _                        -> False
+    }
+  })
+}
+
+@test
+fn an_integer_literal_variable_takes_only_int_or_int64() {
+  assert run(|| {
+    a = new_int_var()
+    b = new_int_var()
+    unify(a, INT64).is_none() && unify(b, BOOL).is_some()
+  })
+}
+
+@test
+fn never_joins_with_any_type() {
+  (ty, err) = run(|| join(TyNever, STRING))
+  assert ty == STRING
+  assert err.is_none()
+}
+
+@test
+fn generalizing_names_the_free_variables_in_order() {
+  scheme = run(|| {
+    a = new_var()
+    b = new_var()
+    generalize(func([a, b], a, EMPTY_ROW, EMPTY_ROW), [])
+  })
+  assert scheme.params.map(|p| p.name) == ["A", "B"]
+  assert scheme.ty == func([TyBound(0), TyBound(1)], TyBound(0), EMPTY_ROW, EMPTY_ROW)
+}

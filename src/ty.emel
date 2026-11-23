@@ -1,0 +1,334 @@
+## Types, sets and type schemes. Follows `ty.rs`, `row.rs` and `scheme.rs` of the reference type
+## checker (emela-types).
+##
+## Types are nominal: types declared with `type` and `enum` (and errors and handlers) are named by
+## the index of their entry in the table of named types (`TyCon`). Primitive types, `List`, tuples
+## and functions are structural. The Prelude's `Bool` is the primitive Bool.
+##
+## Error sets E (spec chapter 7) and effect sets R (spec chapter 8) share one representation, a
+## `Row` of elements: tags (an error definition, or an effect definition with its type
+## arguments), set type parameters of a scheme, the tag of an error type not known yet, set
+## variables, and capabilities.
+
+pub enum Prim {
+  PInt
+  PInt64
+  PFloat
+  PBool
+  PString
+  ## `()`.
+  PUnit
+} derive Eq
+
+pub fn prim_name(p: Prim) -> String {
+  p match {
+    PInt    -> "Int"
+    PInt64  -> "Int64"
+    PFloat  -> "Float"
+    PBool   -> "Bool"
+    PString -> "String"
+    PUnit   -> "()"
+  }
+}
+
+pub enum SetKind {
+  Errors
+  Effects
+} derive Eq
+
+## An error definition, or an effect definition with its type arguments (`State[Int]`).
+pub type Tag(def: Int, args: List[Ty]) derive Eq
+
+## A capability as an element of an effect set: the local holding the capability value, its name
+## for display, and its effect.
+pub type CapElem(local: Int, name: String, tag: Tag) derive Eq
+
+pub enum RowElem {
+  RTag(tag: Tag)
+  ## A set type parameter of a scheme: an index into its parameters.
+  RBound(index: Int)
+  ## The tag of the error type `ty`, once it resolves to a named error type.
+  ROf(ty: Ty)
+  RVar(id: Int)
+  RCap(cap: CapElem)
+} derive Eq
+
+## Elements without duplicates, sorted as tags, capabilities, type parameters, types, then set
+## variables (by number within a group; types keep insertion order).
+pub type Row(elems: List[RowElem]) derive Eq
+
+## `fn(A, B) -> C fails E uses { R }`.
+pub type FnTy(params: List[Ty], ret: Ty, fails: Row, uses: Row) derive Eq
+
+pub enum Ty {
+  TyPrim(prim: Prim)
+  ## The type with no values. Joins with any type.
+  TyNever
+  TyVar(id: Int)
+  ## A type parameter quantified by a scheme: an index into its parameters.
+  TyBound(index: Int)
+  TyFn(f: FnTy)
+  ## At least two elements.
+  TyTuple(elems: List[Ty])
+  TyList(elem: Ty)
+  ## An application of a named type (`Pair[A, B]`).
+  TyNamed(con: Int, args: List[Ty])
+  ## A set passed as a set type argument of a named type.
+  TySet(kind: SetKind, row: Row)
+  ## The type of a capability value, its effects in the order of their definitions.
+  TyCap(tags: List[Tag])
+  ## A broken type. Unification accepts it against any type, so errors do not cascade.
+  TyError
+} derive Eq
+
+pub const INT = TyPrim(PInt)
+pub const INT64 = TyPrim(PInt64)
+pub const FLOAT = TyPrim(PFloat)
+pub const BOOL = TyPrim(PBool)
+pub const STRING = TyPrim(PString)
+pub const UNIT = TyPrim(PUnit)
+
+pub fn func(params: List[Ty], ret: Ty, fails: Row, uses: Row) -> Ty {
+  TyFn(FnTy(params, ret, fails, uses))
+}
+
+## The type of a capability of `tags`, sorted by definition; a tag that appears twice is kept once.
+pub fn cap(tags: List[Tag]) -> Ty {
+  unique = tags.fold([], |acc, t| if acc.any(|x| x == t) { acc } else { acc.append([t]) })
+  TyCap(unique.sort_by(|a, b| Ord.compare(a.def, b.def)))
+}
+
+pub fn map_args(t: Tag, f: fn(Ty) -> Ty) -> Tag {
+  Tag(t.def, t.args.map(f))
+}
+
+## Replaces the immediate child types with `f`, including the types inside a function type's sets
+## and the type arguments of tags.
+pub fn map_children(ty: Ty, f: fn(Ty) -> Ty) -> Ty {
+  ty match {
+    TyCap(tags)    -> TyCap(tags.map(|t| map_args(t, f)))
+    TyFn(g)        -> TyFn(FnTy(g.params.map(f), f(g.ret), map_tys(g.fails, f), map_tys(g.uses, f)))
+    TySet(kind, row) -> TySet(kind, map_tys(row, f))
+    TyTuple(elems) -> TyTuple(elems.map(f))
+    TyNamed(con, args) -> TyNamed(con, args.map(f))
+    TyList(elem)   -> TyList(f(elem))
+    _              -> ty
+  }
+}
+
+## The immediate child types (`map_children` without replacing).
+pub fn child_types(ty: Ty) -> List[Ty] {
+  ty match {
+    TyCap(tags)    -> tags.flat_map(|t| t.args)
+    TyFn(g)        -> g.params.append([g.ret]).append(row_types(g.fails)).append(row_types(g.uses))
+    TySet(_, row)  -> row_types(row)
+    TyTuple(elems) -> elems
+    TyNamed(_, args) -> args
+    TyList(elem)   -> [elem]
+    _              -> []
+  }
+}
+
+## The type with every capability element of its sets replaced by its effect.
+pub fn widened(ty: Ty) -> Ty {
+  ty match {
+    TyFn(g) -> TyFn(
+      FnTy(
+        g.params.map(widened),
+        widened(g.ret),
+        map_tys(widened_row(g.fails), widened),
+        map_tys(widened_row(g.uses), widened),
+      ),
+    )
+    TySet(kind, row) -> TySet(kind, map_tys(widened_row(row), widened))
+    _ -> map_children(ty, widened)
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Rows (`row.rs`)
+
+pub const EMPTY_ROW = Row([])
+
+pub fn row_of(elems: List[RowElem]) -> Row {
+  elems.fold(EMPTY_ROW, insert)
+}
+
+pub fn tag_row(def: Int) -> Row {
+  Row([RTag(Tag(def, []))])
+}
+
+pub fn var_row(v: Int) -> Row {
+  Row([RVar(v)])
+}
+
+pub fn is_empty_row(row: Row) -> Bool {
+  row.elems.is_empty()
+}
+
+## The sort key of an element.
+fn order(e: RowElem) -> (Int, Int) {
+  e match {
+    RTag(t)   -> (0, t.def)
+    RCap(c)   -> (0, 1073741823 + c.local)
+    RBound(i) -> (1, i)
+    ROf(_)    -> (2, 0)
+    RVar(v)   -> (3, v)
+  }
+}
+
+## Does nothing if the element is already present.
+pub fn insert(row: Row, e: RowElem) -> Row {
+  if row.elems.any(|x| x == e) {
+    row
+  } else {
+    key = order(e)
+    (before, after) = split_before(row.elems, key, [])
+    Row(before.append([e, ..after]))
+  }
+}
+
+fn split_before(
+  elems: List[RowElem],
+  key: (Int, Int),
+  acc: List[RowElem],
+) -> (List[RowElem], List[RowElem]) {
+  elems match {
+    [] -> (acc.reverse(), [])
+    [x, ..rest] -> if Ord.compare(order(x), key) == Greater {
+      (acc.reverse(), elems)
+    } else {
+      split_before(rest, key, [x, ..acc])
+    }
+  }
+}
+
+pub fn union(a: Row, b: Row) -> Row {
+  b.elems.fold(a, insert)
+}
+
+pub fn tags(row: Row) -> List[Tag] {
+  row.elems.filter_map(|e| {
+    e match {
+      RTag(t) -> Some(t)
+      _       -> None
+    }
+  })
+}
+
+## The effect of a tag or of a capability.
+pub fn effect_tag(e: RowElem) -> Option[Tag] {
+  e match {
+    RTag(t) -> Some(t)
+    RCap(c) -> Some(c.tag)
+    _       -> None
+  }
+}
+
+## The tags, and the effects of capability elements.
+pub fn effect_tags(row: Row) -> List[Tag] {
+  row.elems.filter_map(effect_tag)
+}
+
+## The set with each capability element replaced by its effect.
+pub fn widened_row(row: Row) -> Row {
+  row_of(
+    row.elems.map(|e| {
+      e match {
+        RCap(c) -> RTag(c.tag)
+        _       -> e
+      }
+    }),
+  )
+}
+
+pub fn row_vars(row: Row) -> List[Int] {
+  row.elems.filter_map(|e| {
+    e match {
+      RVar(v) -> Some(v)
+      _       -> None
+    }
+  })
+}
+
+## The types inside the elements (`ROf` and tag type arguments).
+pub fn row_types(row: Row) -> List[Ty] {
+  row.elems.flat_map(|e| {
+    e match {
+      ROf(t)  -> [t]
+      RTag(t) -> t.args
+      RCap(c) -> c.tag.args
+      _       -> []
+    }
+  })
+}
+
+## Replaces the types inside the elements with `f`.
+pub fn map_tys(row: Row, f: fn(Ty) -> Ty) -> Row {
+  row_of(
+    row.elems.map(|e| {
+      e match {
+        ROf(t)  -> ROf(f(t))
+        RTag(t) -> RTag(map_args(t, f))
+        RCap(c) -> RCap(CapElem(tag: map_args(c.tag, f), ..c))
+        _       -> e
+      }
+    }),
+  )
+}
+
+## `f` may expand one element into a set.
+pub fn flat_map_row(row: Row, f: fn(RowElem) -> Row) -> Row {
+  row.elems.fold(EMPTY_ROW, |acc, e| union(acc, f(e)))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Named types, type parameters and schemes
+
+pub enum TyConKind {
+  ConType
+  ConEnum
+  ## `error`; error sets hold errors by definition, and the table maps between the two.
+  ConError
+  ## A handler value, which takes no type arguments.
+  ConHandler
+} derive Eq
+
+## There is no syntax for kinds; a parameter's kind is decided by where it is used (spec 9.2).
+pub enum ParamKind {
+  ## An ordinary type, `TyBound(i)`.
+  TypeParamKind
+  ## A set (error or effect), `RBound(i)`.
+  SetParamKind
+} derive Eq
+
+## A type parameter, the names of its constraints for display, and the trait constraints checked
+## where it is instantiated.
+pub type TyParam(name: String, bounds: List[String], traits: List[Int], kind: ParamKind) derive Eq
+
+pub fn ty_param(name: String) -> TyParam {
+  TyParam(name, [], [], TypeParamKind)
+}
+
+pub fn set_param(name: String) -> TyParam {
+  TyParam(name, [], [], SetParamKind)
+}
+
+pub type TyCon(name: String, kind: TyConKind, params: List[TyParam])
+
+## `TyBound(i)` inside `ty` refers to `params[i]`.
+pub type Scheme(params: List[TyParam], ty: Ty) derive Eq
+
+pub fn mono(ty: Ty) -> Scheme {
+  Scheme([], ty)
+}
+
+## Names for generalized type parameters: `A` to `Z`, then `T26`, `T27`, ...
+pub fn param_name(i: Int) -> String {
+  if i < 26 { String.from_code_point(0x41 + i).or("?") } else { "T#{i}" }
+}
+
+## Names for generalized set type parameters: `E`, `E1`, `E2`, ... with the prefix.
+pub fn set_param_name(prefix: String, i: Int) -> String {
+  if i == 0 { prefix } else { "#{prefix}#{i}" }
+}

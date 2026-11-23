@@ -1,0 +1,762 @@
+## Unification, joining with `Never`, generalization and instantiation. Follows `infer.rs` and
+## `error.rs` of the reference type checker.
+##
+## Error sets and effect sets of function types are not equated by unification; they are collected
+## as inclusion constraints (`Subset`), solved after the body is inferred. A function placed where a
+## type is expected only needs its E and R to be contained in the expected E and R (spec 7.4, 9.2).
+##
+## The type variable table is a union-find kept in maps. The reference snapshots the table before
+## trying a unification and rolls back on failure; here the maps are values, so a snapshot is the
+## maps themselves.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{Span}
+import Ty.{
+  Ty,
+  TyPrim,
+  TyNever,
+  TyVar,
+  TyBound,
+  TyFn,
+  TyTuple,
+  TyList,
+  TyNamed,
+  TySet,
+  TyCap,
+  TyError,
+  Prim,
+  PInt,
+  PInt64,
+  FnTy,
+  Row,
+  RowElem,
+  RTag,
+  RBound,
+  ROf,
+  RVar,
+  RCap,
+  Tag,
+  CapElem,
+  SetKind,
+  Errors,
+  Effects,
+  TyParam,
+  ParamKind,
+  TypeParamKind,
+  SetParamKind,
+  Scheme,
+  EMPTY_ROW,
+  INT,
+  child_types,
+  flat_map_row,
+  func,
+  is_empty_row,
+  map_args,
+  map_children,
+  map_tys,
+  param_name,
+  row_of,
+  row_vars,
+  set_param,
+  set_param_name,
+  tag_row,
+  tags,
+  ty_param,
+  var_row,
+}
+
+## A unification failure: the types passed to unification, with bindings followed, and the part
+## that differs.
+pub type TypeError(expected: Ty, actual: Ty, kind: TypeErrorKind)
+
+pub enum TypeErrorKind {
+  Mismatch(expected: Ty, actual: Ty)
+  ## Binding `id` to `ty` would make an infinite type (occurs check).
+  InfiniteType(id: Int, ty: Ty)
+} derive Eq
+
+## Where an inclusion constraint came from; decides the diagnostic when it cannot be solved.
+pub enum Origin {
+  ## A function value placed where a function type is expected.
+  Coerce(span: Option[Span], def: Option[Int])
+  ## The E (R) of a definition's body is contained in the declared E (R).
+  Body(def: Int)
+  ## The E of the body of a handler's `index`-th operation is contained in the operation's E.
+  HandlerOp(owner: Int, index: Int)
+  HandlerPart
+  ## The E of a handler's release body is empty.
+  Release(def: Int)
+  MemberInit(def: Int)
+  ## The R of the body of `main` or a test function is empty.
+  Closed(def: Int)
+  Lambda
+  Instance
+  LocalFnBody(local: Int)
+  LayerArg(owner: Int, member: Int, arg: Int)
+}
+
+## An inclusion constraint `sub ⊆ sup`.
+pub type Subset(sub: Row, sup: Row, origin: Origin, kind: SetKind)
+
+enum Variance {
+  ## The actual side is contained in the expected side.
+  Co
+  ## The expected side is contained in the actual side (inside function parameters).
+  Contra
+  ## Both directions (inside type arguments of named types).
+  Inv
+}
+
+fn flip(v: Variance) -> Variance {
+  v match {
+    Co     -> Contra
+    Contra -> Co
+    Inv    -> Inv
+  }
+}
+
+pub type Infer(
+  ## The union-find: the parent of each variable that is not a root, and the type a root is bound
+  ## to.
+  parent: Map[Int, Int],
+  values: Map[Int, Ty],
+  next_var: Int,
+  ## Newest first.
+  errors: List[TypeError],
+  ## Type variables of integer literals, bindable only to Int or Int64.
+  int_vars: List[Int],
+  next_row_var: Int,
+  ## Oldest first.
+  subsets: List[Subset],
+  ## Constraints made during a unification, kept once it succeeds.
+  row_buffer: List[(Row, Row, SetKind)],
+  origin: (Option[Span], Option[Int]),
+  ## Named error type → its error definition.
+  error_tags: Map[Int, Int],
+  ## Solutions of set variables, once solved.
+  row_solution: Option[Map[Int, Row]],
+  solving: Bool,
+)
+
+pub fn new_infer() -> Infer {
+  Infer(Map.empty(), Map.empty(), 0, [], [], 0, [], [], (None, None), Map.empty(), None, False)
+}
+
+fn ctx() -> Infer uses { State[Infer] } {
+  (use State[Infer]).get()
+}
+
+fn upd(f: fn(Infer) -> Infer) -> () uses { State[Infer] } {
+  s = use State[Infer]
+  s.set(f(s.get()))
+}
+
+pub fn new_var() -> Ty uses { State[Infer] } {
+  v = ctx().next_var
+  upd(|c| Infer(next_var: v + 1, ..c))
+  TyVar(v)
+}
+
+pub fn new_row_var() -> Int uses { State[Infer] } {
+  v = ctx().next_row_var
+  upd(|c| Infer(next_row_var: v + 1, ..c))
+  v
+}
+
+## A type variable for an integer literal, bindable only to Int or Int64.
+pub fn new_int_var() -> Ty uses { State[Infer] } {
+  t = new_var()
+  t match {
+    TyVar(v) -> upd(|c| Infer(int_vars: [v, ..c.int_vars], ..c))
+    _        -> ()
+  }
+  t
+}
+
+pub fn set_error_tags(tags: Map[Int, Int]) -> () uses { State[Infer] } {
+  upd(|c| Infer(error_tags: tags, ..c))
+}
+
+pub fn error_tag(con: Int) -> Option[Int] uses { State[Infer] } {
+  ctx().error_tags.get(con)
+}
+
+## The span for inclusion constraints that unification collects from now on.
+pub fn set_origin(span: Option[Span], def: Option[Int]) -> () uses { State[Infer] } {
+  upd(|c| Infer(origin: (span, def), ..c))
+}
+
+pub fn add_subset(sub: Row, sup: Row, origin: Origin) -> () uses { State[Infer] } {
+  add_subset_of(Errors, sub, sup, origin)
+}
+
+pub fn add_subset_of(kind: SetKind, sub: Row, sup: Row, origin: Origin) -> ()
+  uses { State[Infer] } {
+  c = ctx()
+  skip = (
+    is_empty_row(sub)
+      || sub == sup
+      || (c.solving && c.subsets.any(|s| s.kind == kind && s.sub == sub && s.sup == sup))
+  )
+  if !skip {
+    upd(|x| Infer(subsets: x.subsets.append([Subset(sub, sup, origin, kind)]), ..x))
+  }
+}
+
+pub fn clear_row_solution() -> () uses { State[Infer] } {
+  upd(|c| Infer(row_solution: None, ..c))
+}
+
+pub fn set_solving(solving: Bool) -> () uses { State[Infer] } {
+  upd(|c| Infer(solving:, ..c))
+}
+
+pub fn subsets() -> List[Subset] uses { State[Infer] } {
+  ctx().subsets
+}
+
+pub fn set_row_solution(solution: Map[Int, Row]) -> () uses { State[Infer] } {
+  upd(|c| Infer(row_solution: Some(solution), ..c))
+}
+
+# ---------------------------------------------------------------------------------------------
+# The union-find
+
+fn find(v: Int) -> Int uses { State[Infer] } {
+  ctx().parent.get(v) match {
+    Some(p) -> find(p)
+    None    -> v
+  }
+}
+
+fn unioned(a: Int, b: Int) -> Bool uses { State[Infer] } {
+  find(a) == find(b)
+}
+
+## Unions two unbound variables; the root of `b` stays the root.
+fn union_vars(a: Int, b: Int) -> () uses { State[Infer] } {
+  ra = find(a)
+  rb = find(b)
+  if ra != rb {
+    upd(|c| {
+      # Keep a bound value of either side.
+      value = c.values.get(rb) match {
+        Some(v) -> Some(v)
+        None    -> c.values.get(ra)
+      }
+      values = value.map(|v| c.values.insert(rb, v)).or(c.values)
+      Infer(parent: c.parent.insert(ra, rb), values:, ..c)
+    })
+  }
+}
+
+fn probe(v: Int) -> Option[Ty] uses { State[Infer] } {
+  ctx().values.get(find(v))
+}
+
+## Whether `v` is an integer-literal type variable (or unified with one).
+pub fn is_int_var(v: Int) -> Bool uses { State[Infer] } {
+  ctx().int_vars.any(|w| unioned(v, w))
+}
+
+## Follows bound type variables until the head is not one. Unbound type variables are normalized to
+## their representative.
+pub fn shallow_resolve(ty: Ty) -> Ty uses { State[Infer] } {
+  ty match {
+    TyVar(v) -> probe(v) match {
+      Some(bound) -> shallow_resolve(bound)
+      None        -> TyVar(find(v))
+    }
+    _ -> ty
+  }
+}
+
+## Follows every bound type variable. Error types inside error sets become tags if they are named
+## error types. After set variables are solved, they are replaced by their solutions.
+pub fn resolve(ty: Ty) -> Ty uses { State[Infer] } {
+  shallow_resolve(ty) match {
+    TyFn(f) -> func(
+      f.params.map(resolve),
+      resolve(f.ret),
+      resolve_row(f.fails),
+      resolve_row(f.uses),
+    )
+    TySet(kind, row) -> TySet(kind, resolve_row(row))
+    t -> map_children(t, resolve)
+  }
+}
+
+pub fn resolve_row(row: Row) -> Row uses { State[Infer] } {
+  flat_map_row(row, |e| {
+    e match {
+      ROf(t) -> resolve(t) match {
+        TyNamed(con, _) -> error_tag(con).map(tag_row).or(EMPTY_ROW)
+        TyBound(i)      -> row_of([ROf(TyBound(i))])
+        TyVar(v)        -> row_of([ROf(TyVar(v))])
+        _               -> EMPTY_ROW
+      }
+      # Type arguments of tags in a solution may have been fixed after solving, so follow them.
+      RVar(v) -> ctx().row_solution match {
+        Some(solution) -> map_tys(solution.get(v).or(EMPTY_ROW), resolve)
+        None           -> var_row(v)
+      }
+      RTag(t) -> row_of([RTag(map_args(t, resolve))])
+      RCap(c) -> row_of([RCap(CapElem(tag: map_args(c.tag, resolve), ..c))])
+      _       -> row_of([e])
+    }
+  })
+}
+
+# ---------------------------------------------------------------------------------------------
+# Unification
+
+## Runs `f` on a snapshot of the table: keeps the table and the buffered constraints when it
+## succeeds, restores the table otherwise.
+fn trying(f: fn() -> Option[TypeErrorKind] uses { State[Infer] }) -> Option[TypeErrorKind]
+  uses { State[Infer] } {
+  saved = ctx()
+  upd(|c| Infer(row_buffer: [], ..c))
+  result = f()
+  result match {
+    None -> {
+      c = ctx()
+      (span, def) = c.origin
+      origin = Coerce(span, def)
+      buffered = c.row_buffer
+      upd(|x| Infer(row_buffer: [], ..x))
+      buffered.reverse().each(|(sub, sup, kind)| add_subset_of(kind, sub, sup, origin))
+    }
+    Some(_) -> {
+      int_vars = ctx().int_vars
+      upd(|_| Infer(parent: saved.parent, values: saved.values, row_buffer: [], int_vars:, ..saved))
+    }
+  }
+  result
+}
+
+## Whether two tags are the same effect (or error). If their type arguments are not determined yet,
+## tries unifying them and treats them as the same if it succeeds, binding the variables. `a` is on
+## the containing side.
+pub fn same_tag(a: Tag, b: Tag) -> Bool uses { State[Infer] } {
+  if a.def != b.def || a.args.length() != b.args.length() {
+    False
+  } else if a.args.is_empty() {
+    True
+  } else {
+    result = trying(|| {
+      a.args.zip(b.args).fold(None, |err, (x, y)| {
+        err match {
+          Some(_) -> err
+          None -> {
+            variance = (x, y) match {
+              (TySet(_, _), TySet(_, _)) -> Co
+              _                          -> Inv
+            }
+            unify_inner(x, y, variance)
+          }
+        }
+      })
+    })
+    result.is_none()
+  }
+}
+
+## Whether `row` has a tag that is the same as `tag`.
+pub fn row_has_tag(row: Row, tag: Tag) -> Bool uses { State[Infer] } {
+  ts = tags(row)
+  ts.any(|t| t == tag) || ts.any(|t| same_tag(t, tag))
+}
+
+## On failure, the table is restored to its state before the call.
+pub fn unify(expected: Ty, actual: Ty) -> Option[TypeError] uses { State[Infer] } {
+  trying(|| unify_inner(expected, actual, Co)).map(|kind| {
+    k = kind match {
+      Mismatch(e, a)     -> Mismatch(resolve_for_report(e), resolve_for_report(a))
+      InfiniteType(v, t) -> InfiniteType(v, resolve_for_report(t))
+    }
+    TypeError(resolve_for_report(expected), resolve_for_report(actual), k)
+  })
+}
+
+fn known(row: Row) -> Row {
+  row_of(
+    row.elems.filter(|e| {
+      e match {
+        RVar(_) -> False
+        _       -> True
+      }
+    }),
+  )
+}
+
+## The form for reports: undetermined integer-literal variables are shown as Int, and unsolved set
+## variables are left out.
+fn resolve_for_report(ty: Ty) -> Ty uses { State[Infer] } {
+  shallow_resolve(ty) match {
+    TyVar(v) if is_int_var(v) -> INT
+    TyFn(f) -> func(
+      f.params.map(resolve_for_report),
+      resolve_for_report(f.ret),
+      map_tys(known(f.fails), resolve_for_report),
+      map_tys(known(f.uses), resolve_for_report),
+    )
+    TySet(kind, row) -> TySet(kind, known(row))
+    t -> map_children(t, resolve_for_report)
+  }
+}
+
+## Records a unify failure and continues. Whether unification succeeded.
+pub fn expect(expected: Ty, actual: Ty) -> Bool uses { State[Infer] } {
+  unify(expected, actual) match {
+    Some(e) -> {
+      report(e)
+      False
+    }
+    None -> True
+  }
+}
+
+## Places `actual` where `expected` is expected. A Never fits any type.
+pub fn coerce(expected: Ty, actual: Ty) -> Option[TypeError] uses { State[Infer] } {
+  if shallow_resolve(actual) == TyNever { None } else { unify(expected, actual) }
+}
+
+## The common type of two branches. If one side is Never, the other's type. If both are function
+## types, the sets become fresh set variables that contain both. On failure, `a` is reported as
+## the expected type.
+pub fn join(a0: Ty, b0: Ty) -> (Ty, Option[TypeError]) uses { State[Infer] } {
+  a = shallow_resolve(a0)
+  b = shallow_resolve(b0)
+  (a, b) match {
+    (TyNever, _) -> (b, None)
+    (_, TyNever) -> (a, None)
+    (TyFn(f), TyFn(g)) if f.params.length() == g.params.length() -> {
+      e = new_row_var()
+      r = new_row_var()
+      joined = func(f.params, f.ret, var_row(e), var_row(r))
+      unify(joined, a) match {
+        Some(err) -> (joined, Some(err))
+        None -> unify(joined, b) match {
+          Some(err) -> (joined, Some(TypeError(resolve_for_report(a), err.actual, err.kind)))
+          None      -> (joined, None)
+        }
+      }
+    }
+    _            -> (a, unify(a, b))
+  }
+}
+
+## Records a join failure, taking `a` as the overall type.
+pub fn join_or_report(a: Ty, b: Ty) -> Ty uses { State[Infer] } {
+  join(a, b) match {
+    (t, None) -> t
+    (_, Some(e)) -> {
+      report(e)
+      a
+    }
+  }
+}
+
+pub fn report(e: TypeError) -> () uses { State[Infer] } {
+  upd(|c| Infer(errors: [e, ..c.errors], ..c))
+}
+
+## The errors so far, oldest first, and forgets them.
+pub fn take_errors() -> List[TypeError] uses { State[Infer] } {
+  errors = ctx().errors.reverse()
+  upd(|c| Infer(errors: [], ..c))
+  errors
+}
+
+fn unify_inner(expected: Ty, actual: Ty, variance: Variance) -> Option[TypeErrorKind]
+  uses { State[Infer] } {
+  e = shallow_resolve(expected)
+  a = shallow_resolve(actual)
+  mismatch = Some(Mismatch(e, a))
+  (e, a) match {
+    (TyVar(x), TyVar(y)) -> {
+      int = is_int_var(x) || is_int_var(y)
+      union_vars(x, y)
+      if int { upd(|c| Infer(int_vars: [find(x), ..c.int_vars], ..c)) }
+      None
+    }
+    (TyVar(v), t)                                            -> bind_var(v, t, mismatch)
+    (t, TyVar(v))                                            -> bind_var(v, t, mismatch)
+    (TyError, _)                                             -> None
+    (_, TyError)                                             -> None
+    (TyPrim(p), TyPrim(q)) if p == q                         -> None
+    (TyNever, TyNever)                                       -> None
+    (TyBound(i), TyBound(j)) if i == j                       -> None
+    # Capability values match only with the same effects and type arguments.
+    (TyCap(x), TyCap(y)) if x.length() == y.length()
+      && x.zip(y).all(|(p, q)| p.def == q.def && p.args.length() == q.args.length()) -> {
+      x.zip(y).fold(None, |err, (p, q)| or_first(err, || unify_all(p.args, q.args, Inv)))
+    }
+    (TySet(k, x), TySet(l, y)) if k == l -> {
+      buffer_rows(k, x, y, variance)
+      None
+    }
+    (TyFn(f), TyFn(g)) if f.params.length() == g.params.length() -> {
+      params = f.params.zip(g.params).fold(
+        None,
+        |err, (p, q)| or_first(err, || unify_inner(p, q, flip(variance))),
+      )
+      or_first(params, || {
+        or_first(unify_inner(f.ret, g.ret, variance), || {
+          buffer_rows(Errors, f.fails, g.fails, variance)
+          buffer_rows(Effects, f.uses, g.uses, variance)
+          None
+        })
+      })
+    }
+    (TyTuple(xs), TyTuple(ys)) if xs.length() == ys.length() -> unify_all(xs, ys, variance)
+    # Where a type argument is used is not tracked, so both directions.
+    (TyNamed(c, xs), TyNamed(d, ys)) if c == d && xs.length() == ys.length() -> unify_all(
+      xs,
+      ys,
+      Inv,
+    )
+    (TyList(x), TyList(y))                                   -> unify_inner(x, y, variance)
+    _                                                        -> mismatch
+  }
+}
+
+fn or_first(
+  err: Option[TypeErrorKind],
+  next: fn() -> Option[TypeErrorKind] uses { State[Infer] },
+) -> Option[TypeErrorKind] uses { State[Infer] } {
+  err match {
+    Some(_) -> err
+    None    -> next()
+  }
+}
+
+fn bind_var(v: Int, t: Ty, mismatch: Option[TypeErrorKind]) -> Option[TypeErrorKind]
+  uses { State[Infer] } {
+  int_ok = t match {
+    TyPrim(PInt)   -> True
+    TyPrim(PInt64) -> True
+    TyError        -> True
+    _              -> False
+  }
+  if is_int_var(v) && !int_ok {
+    mismatch
+  } else if occurs(v, t) {
+    Some(InfiniteType(v, t))
+  } else {
+    r = find(v)
+    upd(|c| Infer(values: c.values.insert(r, t), ..c))
+    None
+  }
+}
+
+## Collects inclusion constraints on a function type's sets. `expected` is the expected side.
+fn buffer_rows(kind: SetKind, expected: Row, actual: Row, variance: Variance) -> ()
+  uses { State[Infer] } {
+  if expected != actual {
+    pairs = variance match {
+      Co     -> [(actual, expected, kind)]
+      Contra -> [(expected, actual, kind)]
+      Inv    -> [(actual, expected, kind), (expected, actual, kind)]
+    }
+    # The buffer is newest first.
+    upd(|c| Infer(row_buffer: pairs.reverse().append(c.row_buffer), ..c))
+  }
+}
+
+fn unify_all(xs: List[Ty], ys: List[Ty], variance: Variance) -> Option[TypeErrorKind]
+  uses { State[Infer] } {
+  xs.zip(ys).fold(None, |err, (x, y)| or_first(err, || unify_inner(x, y, variance)))
+}
+
+fn occurs(v: Int, ty: Ty) -> Bool uses { State[Infer] } {
+  shallow_resolve(ty) match {
+    TyVar(w) -> unioned(v, w)
+    t        -> child_types(t).any(|c| occurs(v, c))
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Generalization and instantiation
+
+## The unbound type variables (representatives) in the type, in order of first occurrence, without
+## duplicates.
+pub fn free_vars(ty: Ty) -> List[Int] uses { State[Infer] } {
+  collect_free_vars(ty, [])
+}
+
+fn collect_free_vars(ty: Ty, out: List[Int]) -> List[Int] uses { State[Infer] } {
+  shallow_resolve(ty) match {
+    TyVar(v) -> if out.any(|w| w == v) { out } else { out.append([v]) }
+    t        -> child_types(t).fold(out, |acc, c| collect_free_vars(c, acc))
+  }
+}
+
+## Quantifies the type variables of `ty` not in `env_vars`, after the parameters `existing`
+## (`TyBound(i)` inside `ty`). Type parameters are named `A`, `B`, ... and set variables `E`, `E1`,
+## ... (error sets) and `R`, `R1`, ... (effect sets), placed after the type variables. Set
+## variables in `immediate` get an `Immediate` bound. Also returns the quantified set variables and
+## type variables with the indices of the parameters replacing them.
+pub fn generalize_bounded(
+  ty: Ty,
+  existing: List[TyParam],
+  env_vars: List[Int],
+  immediate: List[Int],
+) -> (Scheme, List[(Int, Int)], List[(Int, Int)]) uses { State[Infer] } {
+  # If an environment variable is bound, the variables it reaches belong to the environment too.
+  env = env_vars.fold([], |acc, v| collect_free_vars(TyVar(v), acc))
+  (params1, map, _) = free_vars(ty).fold((existing, [], 0), |(params, map, next), v| {
+    if env.any(|w| w == v) {
+      (params, map, next)
+    } else {
+      (name, after) = fresh_name(params, next, param_name)
+      (params.append([ty_param(name)]), map.append([(v, params.length())]), after)
+    }
+  })
+  resolved = resolve(ty)
+  (params2, row_map, _, _) = free_row_vars(resolved).fold(
+    (params1, [], 0, 0),
+    |(params, rows, ne, nr), (v, kind)| {
+      (prefix, n) = if kind == Errors { ("E", ne) } else { ("R", nr) }
+      (name, after) = fresh_name(params, n, |i| set_param_name(prefix, i))
+      p = set_param(name)
+      param = if immediate.any(|w| w == v) {
+        TyParam(bounds: p.bounds.append(["Immediate"]), ..p)
+      } else {
+        p
+      }
+      next_rows = rows.append([(v, params.length())])
+      if kind == Errors {
+        (params.append([param]), next_rows, after, nr)
+      } else {
+        (params.append([param]), next_rows, ne, after)
+      }
+    },
+  )
+  (Scheme(params2, replace_vars(resolved, map, row_map)), row_map, map)
+}
+
+pub fn generalize_with(ty: Ty, existing: List[TyParam], env_vars: List[Int]) -> Scheme
+  uses { State[Infer] } {
+  (s, _, _) = generalize_bounded(ty, existing, env_vars, [])
+  s
+}
+
+pub fn generalize(ty: Ty, env_vars: List[Int]) -> Scheme uses { State[Infer] } {
+  generalize_with(ty, [], env_vars)
+}
+
+## The first name from `next` that no parameter has, and the next index after it.
+fn fresh_name(params: List[TyParam], next: Int, name_of: fn(Int) -> String) -> (String, Int) {
+  name = name_of(next)
+  if params.any(|p| p.name == name) {
+    fresh_name(params, next + 1, name_of)
+  } else {
+    (name, next + 1)
+  }
+}
+
+## Replaces each type parameter of the scheme with a fresh type variable (a fresh set variable for
+## set type parameters).
+pub fn instantiate(scheme: Scheme) -> Ty uses { State[Infer] } {
+  (ty, _) = instantiate_with_args(scheme)
+  ty
+}
+
+## Also returns the type variables used as type arguments.
+pub fn instantiate_with_args(scheme: Scheme) -> (Ty, List[Ty]) uses { State[Infer] } {
+  (tys, rows) = fresh_args(scheme.params)
+  (substitute(scheme.ty, tys, rows), tys)
+}
+
+## A fresh type variable and set variable per type parameter.
+pub fn fresh_args(params: List[TyParam]) -> (List[Ty], List[Row]) uses { State[Infer] } {
+  params.fold(([], []), |(tys, rows), p| {
+    t = new_var()
+    r = if p.kind == SetParamKind { var_row(new_row_var()) } else { EMPTY_ROW }
+    (tys.append([t]), rows.append([r]))
+  })
+}
+
+## The set variables in the type and their kinds, in order of first occurrence, without duplicates.
+pub fn free_row_vars(ty: Ty) -> List[(Int, SetKind)] {
+  collect_row_vars(ty, [])
+}
+
+fn collect_row_vars(ty: Ty, out: List[(Int, SetKind)]) -> List[(Int, SetKind)] {
+  rows = ty match {
+    TyFn(f)          -> [(f.fails, Errors), (f.uses, Effects)]
+    TySet(kind, row) -> [(row, kind)]
+    _                -> []
+  }
+  here = rows.fold(out, |acc, (row, kind)| {
+    row_vars(row).fold(acc, |a, v| if a.any(|(w, _)| w == v) { a } else { a.append([(v, kind)]) })
+  })
+  child_types(ty).fold(here, |acc, c| collect_row_vars(c, acc))
+}
+
+fn replace_vars(ty: Ty, map: List[(Int, Int)], rows: List[(Int, Int)]) -> Ty {
+  replace_row = |row: Row| {
+    flat_map_row(row, |e| {
+      e match {
+        RVar(v) -> rows.find(|(w, _)| w == v).map(|(_, i)| row_of([RBound(i)])).or(var_row(v))
+        ROf(t)  -> row_of([ROf(replace_vars(t, map, rows))])
+        RTag(t) -> row_of([RTag(map_args(t, |a| replace_vars(a, map, rows)))])
+        RCap(c) -> row_of(
+          [RCap(CapElem(tag: map_args(c.tag, |a| replace_vars(a, map, rows)), ..c))],
+        )
+        _       -> row_of([e])
+      }
+    })
+  }
+  ty match {
+    TyVar(v) -> map.find(|(w, _)| w == v).map(|(_, i)| TyBound(i)).or(ty)
+    TySet(kind, row) -> TySet(kind, replace_row(row))
+    TyFn(f) -> func(
+      f.params.map(|p| replace_vars(p, map, rows)),
+      replace_vars(f.ret, map, rows),
+      replace_row(f.fails),
+      replace_row(f.uses),
+    )
+    _ -> map_children(ty, |c| replace_vars(c, map, rows))
+  }
+}
+
+## Replaces `TyBound(i)` with `args[i]`, for type arguments of named types. Set type parameters are
+## replaced when `args[i]` is a set, and left as they are otherwise.
+pub fn substitute_bound(ty: Ty, args: List[Ty]) -> Ty {
+  rows = args.enumerate().map(|(i, a)| {
+    a match {
+      TySet(_, row) -> row
+      _             -> row_of([RBound(i)])
+    }
+  })
+  substitute(ty, args, rows)
+}
+
+## Replaces `TyBound(i)` with `tys[i]` and `RBound(i)` with `rows[i]`. Out-of-range indices stay.
+pub fn substitute(ty: Ty, tys: List[Ty], rows: List[Row]) -> Ty {
+  ty match {
+    TyBound(i) -> tys.get(i).or(ty)
+    TyFn(f) -> func(
+      f.params.map(|p| substitute(p, tys, rows)),
+      substitute(f.ret, tys, rows),
+      substitute_row(f.fails, tys, rows),
+      substitute_row(f.uses, tys, rows),
+    )
+    TySet(kind, row) -> TySet(kind, substitute_row(row, tys, rows))
+    _ -> map_children(ty, |c| substitute(c, tys, rows))
+  }
+}
+
+pub fn substitute_row(row: Row, tys: List[Ty], rows: List[Row]) -> Row {
+  flat_map_row(row, |e| {
+    e match {
+      RBound(i) -> rows.get(i).or(row_of([e]))
+      ROf(t)    -> row_of([ROf(substitute(t, tys, rows))])
+      RTag(t)   -> row_of([RTag(map_args(t, |a| substitute(a, tys, rows)))])
+      RCap(c)   -> row_of([RCap(CapElem(tag: map_args(c.tag, |a| substitute(a, tys, rows)), ..c))])
+      _         -> row_of([e])
+    }
+  })
+}
