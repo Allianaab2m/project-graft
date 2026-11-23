@@ -14,8 +14,11 @@ core="$emela_repo/crates/emela-core/lib"
 # The codes Graft reports: syntax (E01xx), modules and the import graph (E0201 to E0210), name
 # resolution (E0211 to E0225, W0201, W0202, E0328, E0334), files (E09xx).
 # Of types, the declarations: the codes only signature collection reports (E0322, E0424, E0426,
-# E0429, E0433, E0445, E0446, E0450, E0451).
-implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01])\]'
+# E0429, E0433, E0445, E0446, E0450, E0451). Of bodies, the types of expressions and patterns
+# (E0301, E0302, E0304 to E0311, E0316, E0320, E0323, E0324) and the parts of handlers and `with`
+# items checked with them (E0404 to E0407, E0413 to E0415, E0418, E0419, E0434, E0435, E0447,
+# E0448, E0452). E0423 waits for the check of `with` items (`Hits by Box`).
+implemented='^[a-z]*\[(E01[0-9][0-9]|E02[01][0-9]|E022[0-5]|W020[12]|E0328|E0334|E09[0-9][0-9]|E032[2]|E042[469]|E0433|E044[56]|E045[01]|E030[124-9]|E031[016]|E0320|E032[34]|E040[4-7]|E041[3-589]|E043[45]|E044[78]|E0452)\]'
 # `IMPLEMENTED` replaces the list, to try codes before adding them.
 implemented=${IMPLEMENTED:-$implemented}
 # Paths are printed as given (Graft) or relative to the current directory (the oracle), so the

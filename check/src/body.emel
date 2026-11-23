@@ -1,0 +1,2254 @@
+## Inference of fn and const bodies: assigns types to expressions and patterns. Follows `body.rs`
+## and `body/methods.rs` of the reference type checker.
+##
+## A group of mutually referring definitions (`Groups`) is inferred together, bottom-up per
+## expression. On a type mismatch a diagnostic is reported at the expression and inference goes on.
+## Definitions without a declared type (fns without a return type or `uses` clause, consts without
+## a type) are monomorphic within the group and generalized once it is inferred.
+##
+## Not ported yet: handler bodies and `with` items, the error and effect sets of bodies (their
+## constraints are collected but not solved), match coverage, and trait constraints. Where those
+## would decide a type, the type is `TyError`, which unifies with anything, so no diagnostic is
+## made up.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  DefData,
+  DefKind,
+  DefModule,
+  FnKind,
+  CtorKind,
+  ErrorKind,
+  MemberKind,
+  HandlerKind,
+  TraitFnKind,
+  ImplFnKind,
+  TypeParamKind,
+  SourceModule,
+  LocalKind,
+  Res,
+  ResDef,
+  ResLocal,
+  ResErr,
+  Span,
+  Label,
+  TPath,
+  Literal,
+  LInt,
+  LFloat,
+  LString,
+  BinaryOp,
+  OpAdd,
+  OpSub,
+  OpMul,
+  OpDiv,
+  OpRem,
+  OpEq,
+  OpNe,
+  OpLt,
+  OpLe,
+  OpGt,
+  OpGe,
+  OpAnd,
+  OpOr,
+  OpPipe,
+  UnaryOp,
+  OpNot,
+  OpNeg,
+  StrPart,
+  SInterp,
+  ExprKind,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  PatKind,
+  PWild,
+  PBind,
+  PLit,
+  PConst,
+  PCtor,
+  PUnit,
+  PTuple,
+  PList,
+  PMissing,
+  PatArg,
+  Arg,
+  Arm,
+  Block,
+  SLet,
+  SLocalFn,
+  SExpr,
+  LocalFn,
+  Param,
+  FnItem,
+  Item,
+  IFn,
+  ITraitFn,
+  IConst,
+  IType,
+  IError,
+  IHandler,
+  ILayer,
+  IOp,
+  ICtor,
+  IImpl,
+  IEffect,
+  HandlerItem,
+  HandlerOp,
+  WithItem,
+  SupplyArgs,
+}
+import Infer.{
+  Infer,
+  Origin,
+  Coerce,
+  TypeError,
+  InfiniteType,
+  add_subset,
+  add_subset_of,
+  coerce,
+  fresh_args,
+  free_vars,
+  generalize_bounded,
+  join,
+  new_infer,
+  new_int_var,
+  new_row_var,
+  new_var,
+  resolve,
+  set_error_tags,
+  set_origin,
+  shallow_resolve,
+  substitute,
+  substitute_bound,
+  unify,
+}
+import Ty.{
+  Ty,
+  TyPrim,
+  TyNever,
+  TyVar,
+  TyBound,
+  TyFn,
+  TyTuple,
+  TyList,
+  TyNamed,
+  TySet,
+  TyCap,
+  TyError,
+  Prim,
+  PInt,
+  PInt64,
+  PFloat,
+  FnTy,
+  Row,
+  RowElem,
+  RTag,
+  RBound,
+  RVar,
+  RCap,
+  Tag,
+  CapElem,
+  Effects,
+  ParamKind,
+  TyParam,
+  Scheme,
+  EMPTY_ROW,
+  BOOL,
+  FLOAT,
+  INT,
+  STRING,
+  UNIT,
+  cap,
+  func,
+  insert,
+  map_children,
+  map_tys,
+  row_vars,
+  tag_row,
+  union,
+  var_row,
+  widened,
+  widened_row,
+}
+import Tylower.{
+  TyTable,
+  TyLower,
+  OmitEmpty,
+  OmitFresh,
+  OmitLocal,
+  con_def,
+  def_of,
+  effect_params,
+  effect_tag,
+  has_omitted,
+  is_intrinsic_effect,
+  lower_effect_set,
+  lower_error_set,
+  lower_in,
+  lw,
+  prelude_def,
+  report,
+  scoped,
+  self_ty,
+  set_kind,
+}
+import Signature.{
+  Signature,
+  Signatures,
+  all_params,
+  base_of,
+  declared_fails,
+  declared_uses,
+  effect_members,
+  effect_ops,
+  fn_params,
+  is_host_effect,
+  lower_params,
+  param_labels,
+}
+import Groups.{defining_module, impl_fn}
+
+## A definition without a declared type: its monomorphic type within the group and its type
+## parameters (written and invisible set ones).
+pub type Pending(def: Int, ty: Ty, params: List[TyParam])
+
+## A reference within the group to a pending definition with written type parameters, checked
+## against the definition's final type once the group is inferred.
+type DeferredRef(def: Int, args: List[Ty], rows: List[Row], instance: Ty, span: Span)
+
+## Integer literals need Int or Int64 (`integer`); arithmetic operands a number.
+type NumConstraint(ty: Ty, span: Span, integer: Bool, literal: Option[String])
+
+## The state while inferring one group.
+pub type BodyState(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  current: Option[Int],
+  ## The module of the definition being inferred, for whether opaque fields are accessible.
+  module: DefModule,
+  ## Type parameters of the fn being inferred and their kinds.
+  type_params: List[Int],
+  param_kinds: List[ParamKind],
+  ## What `Self` stands for.
+  self_ty: Option[Ty],
+  pending: List[Pending],
+  ## Newest first.
+  deferred: List[DeferredRef],
+  locals: Map[Int, Ty],
+  ## Local fns → the labels of their named arguments.
+  local_labels: Map[Int, List[Option[String]]],
+  ## Newest first.
+  numbers: List[NumConstraint],
+  ## The handler whose init is being inferred.
+  in_init: Option[Int],
+  ## References to capability operations → the effect operation.
+  ops: Map[Int, Int],
+  ## Callees of calls, where a handler member may be opened inside an init.
+  member_callees: Map[Int, Bool],
+)
+
+fn bs() -> BodyState uses { State[BodyState] } {
+  (use State[BodyState]).get()
+}
+
+fn bupd(f: fn(BodyState) -> BodyState) -> () uses { State[BodyState] } {
+  s = use State[BodyState]
+  s.set(f(s.get()))
+}
+
+fn prog() -> Program uses { State[BodyState] } {
+  bs().program
+}
+
+fn diag(span: Span, code: String, message: String) -> () uses { State[TyLower] } {
+  report(Some(span), code, message)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Groups
+
+## Infers one group with the signatures known so far. Returns the generalized signatures of the
+## group's definitions without a declared type.
+pub fn infer_group(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  group: List[Int],
+) -> List[(Int, Signature)] uses { State[TyLower] } {
+  start = BodyState(
+    program,
+    table,
+    sigs,
+    None,
+    Hir.BuiltinPrelude,
+    [],
+    [],
+    None,
+    [],
+    [],
+    Map.empty(),
+    Map.empty(),
+    [],
+    None,
+    Map.empty(),
+    Map.empty(),
+  )
+  ((inferred, _), _) = State.run(new_infer(), || {
+    set_error_tags(Tylower.error_tags(table))
+    State.run(start, || {
+      group.each(|def| if Signature.get(sigs, def).is_none() { declare(def) })
+      group.each(infer_def)
+      finish()
+    })
+  })
+  inferred
+}
+
+## Switches to the definition about to be inferred, taking its module and type parameters.
+fn enter(def: Int) -> () {
+  program = prog()
+  data = def_of(program, def)
+  (defs, kinds, slf) = program.items.get(def) match {
+    Some(IFn(f)) -> {
+      fp = fn_params(f, None)
+      (fp.defs, fp.kinds, None)
+    }
+    Some(ITraitFn(f)) -> {
+      fp = fn_params(f, data.parent)
+      (fp.defs, fp.kinds, fp.self_ty)
+    }
+    # The impl's type parameters can be named in its functions.
+    _ -> impl_fn(program, def) match {
+      Some((owner, _)) -> {
+        defs = program.items.get(owner) match {
+          Some(IImpl(i)) -> i.type_params.map(|tp| tp.def)
+          _              -> []
+        }
+        (defs, defs.map(|_| Ty.TypeParamKind), None)
+      }
+      None -> ([], [], None)
+    }
+  }
+  bupd(
+    |b| BodyState(
+      current: Some(def),
+      module: data.module,
+      type_params: defs,
+      param_kinds: kinds,
+      self_ty: slf,
+      ..b,
+    ),
+  )
+}
+
+## Gives a definition without a declared type its monomorphic type within the group: for a fn, the
+## written parameter types, the return type (a type variable if not written), and E and R (set
+## variables if not written); for a const, a type variable.
+fn declare(def: Int) -> () {
+  enter(def)
+  program = prog()
+  program.items.get(def) match {
+    Some(ILayer(_))   -> ()
+    Some(IHandler(_)) -> ()
+    Some(IFn(f))      -> declare_fn(def, f)
+    _                 -> push_pending(def, new_var(), [])
+  }
+}
+
+fn push_pending(def: Int, ty: Ty, params: List[TyParam]) -> () {
+  bupd(|b| BodyState(pending: b.pending.append([Pending(def, ty, params)]), ..b))
+}
+
+fn declare_fn(def: Int, f: FnItem) -> () {
+  program = prog()
+  fp = fn_params(f, None)
+  params = lower_params(fp, f.sig.params)
+  (ret, fails) = f.sig.ret match {
+    Some(r) -> {
+      ret = scoped(fp.defs, fp.kinds, OmitFresh, True, fp.self_ty, || lower_in(r, True))
+      declared = declared_fails(fp, f.sig)
+      if has_omitted(program, r, False) {
+        # E is inferred from the body and contained in the declared E.
+        v = var_row(new_row_var())
+        add_subset(v, declared, Infer.Body(def))
+        (ret, v)
+      } else {
+        (ret, declared)
+      }
+    }
+    None -> (new_var(), var_row(new_row_var()))
+  }
+  # Without a `uses` clause, R is inferred from the body (spec 9.3).
+  uses = f.sig.uses match {
+    Some(_) -> declared_uses(fp, f.sig)
+    None    -> var_row(new_row_var())
+  }
+  push_pending(def, func(params, ret, fails, uses), all_params(fp))
+}
+
+fn pending_of(def: Int) -> Option[Pending] {
+  bs().pending.find(|p| p.def == def)
+}
+
+## The parameters and body of a function definition: a top-level fn, a trait's function or an
+## impl's function.
+fn fn_parts(program: Program, def: Int) -> Option[(List[Param], Option[Int])] {
+  program.items.get(def) match {
+    Some(IFn(f))      -> Some((f.sig.params, f.body))
+    Some(ITraitFn(f)) -> Some((f.sig.params, f.body))
+    Some(_)           -> None
+    None              -> impl_fn(program, def).map(|(_, f)| (f.params, f.body))
+  }
+}
+
+## Places the body at the declared type (or the type given by `declare`).
+fn infer_def(def: Int) -> () {
+  enter(def)
+  program = prog()
+  item = program.items.get(def)
+  item match {
+    Some(IHandler(h)) -> infer_handler(def, h)
+    Some(ILayer(l))   -> l.members.each(|m| infer_supply_args(m.res, m.args, m.span))
+    _ -> {
+      declared = Signature.get(bs().sigs, def).map(|s| s.scheme.ty).or(
+        pending_of(def).map(|p| p.ty).or(TyError),
+      )
+      item match {
+        Some(IConst(c)) -> check_expr(c.value, declared)
+        _ -> fn_parts(program, def) match {
+          Some((params, body)) -> infer_fn(
+            params,
+            body,
+            declared,
+            def_of(program, def).kind == ImplFnKind,
+          )
+          None -> ()
+        }
+      }
+    }
+  }
+}
+
+## An impl's function (`in_impl`) may write parameter types; they must be the trait's.
+fn infer_fn(params: List[Param], body: Option[Int], declared: Ty, in_impl: Bool) -> () {
+  shallow_resolve(declared) match {
+    TyFn(f) -> {
+      program = prog()
+      params.enumerate().each(|(i, p)| {
+        ty = f.params.get(i).or(TyError)
+        p.ty match {
+          Some(written) if in_impl -> {
+            written_ty = lower_type(written)
+            span = program.types.get(written).and_then(|r| r.span).or(local_span(p.local))
+            coerce_at(span, ty, written_ty)
+          }
+          _ -> ()
+        }
+        set_local(p.local, ty)
+      })
+      body match {
+        Some(b) -> check_expr(b, f.ret)
+        None    -> ()
+      }
+    }
+    _ -> ()
+  }
+}
+
+fn local_span(local: Int) -> Span {
+  prog().locals.get(local).map(|l| l.span).or(Span(0, 0, 0))
+}
+
+fn set_local(local: Int, ty: Ty) -> () {
+  bupd(|b| BodyState(locals: b.locals.insert(local, ty), ..b))
+}
+
+## Finishes the group: checks deferred references and numeric types, then generalizes the
+## definitions without declared types.
+fn finish() -> List[(Int, Signature)] {
+  bs().deferred.reverse().each(|r| {
+    pending_of(r.def) match {
+      Some(p) -> {
+        ty = resolve(p.ty)
+        actual = keep_instance_sets(substitute(ty, r.args, r.rows), r.instance)
+        coerce_at(r.span, r.instance, actual)
+      }
+      None -> ()
+    }
+  })
+  check_numbers()
+  program = prog()
+  bs().pending.map(|p| {
+    labels = program.items.get(p.def) match {
+      Some(IFn(f)) -> param_labels(program, f.sig.params)
+      _            -> []
+    }
+    (scheme, _, _) = generalize_bounded(p.ty, p.params, [], [])
+    params = fn_parts(program, p.def).map(|(ps, _)| ps.map(|q| q.local)).or([])
+    (p.def, Signature(Scheme(scheme.params, widened_keeping_params(scheme.ty, params)), labels))
+  })
+}
+
+## `ty` with capability elements replaced by their effects, except the parameters in its R.
+fn widened_keeping_params(ty: Ty, params: List[Int]) -> Ty {
+  ty match {
+    TyFn(f) -> {
+      uses = Ty.row_of(
+        f.uses.elems.map(|e| {
+          e match {
+            RCap(c) if params.any(|l| l == c.local) -> e
+            RCap(c)                                 -> RTag(c.tag)
+            _                                       -> e
+          }
+        }),
+      )
+      func(
+        f.params.map(widened),
+        widened(f.ret),
+        map_tys(widened_row(f.fails), widened),
+        map_tys(uses, widened),
+      )
+    }
+    _ -> widened(ty)
+  }
+}
+
+## `actual` with the E and R that have set variables taken from `instance`.
+fn keep_instance_sets(actual: Ty, instance: Ty) -> Ty {
+  (actual, instance) match {
+    (TyFn(a), TyFn(i)) -> {
+      pick = |x: Row, y: Row| if row_vars(x).is_empty() { x } else { y }
+      func(a.params, a.ret, pick(a.fails, i.fails), pick(a.uses, i.uses))
+    }
+    _ -> actual
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Placing types
+
+fn report_mismatch(span: Span, e: TypeError) -> () {
+  e.kind match {
+    InfiniteType(_, _) -> diag(span, "E0302", "infinite type")
+    _                  -> diag(span, "E0301", "type mismatch")
+  }
+}
+
+## Places `actual` where `expected` is expected; reports a mismatch at `span`.
+fn coerce_at(span: Span, expected: Ty, actual: Ty) -> () {
+  set_origin(Some(span), bs().current)
+  result = coerce(expected, actual)
+  set_origin(None, bs().current)
+  result match {
+    Some(e) -> report_mismatch(span, e)
+    None    -> ()
+  }
+}
+
+## The common type of two branches. On mismatch, reports at `span` and takes `a`.
+fn join_at(span: Span, a: Ty, b: Ty) -> Ty {
+  set_origin(Some(span), bs().current)
+  result = join(a, b)
+  set_origin(None, bs().current)
+  result match {
+    (t, None) -> t
+    (_, Some(e)) -> {
+      report_mismatch(span, e)
+      a
+    }
+  }
+}
+
+## With an expected type, `()` is placed at it.
+fn unit_at(span: Span, expected: Option[Ty]) -> Ty {
+  expected match {
+    Some(t) -> coerce_at(span, t, UNIT)
+    None    -> ()
+  }
+  UNIT
+}
+
+## Converts a type annotation inside a body. An omitted `fails` or `uses` is a fresh set variable.
+fn lower_type(ty: Int) -> Ty {
+  b = bs()
+  scoped(b.type_params, b.param_kinds, OmitFresh, True, b.self_ty, || lower_in(ty, True))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Expressions
+
+fn expr_span(expr: Int) -> Span {
+  prog().exprs.get(expr).map(|e| e.span).or(Span(0, 0, 0))
+}
+
+fn infer_expr(expr: Int) -> Ty {
+  infer_expr_kind(expr, None)
+}
+
+## Infers the expression and places it at the expected type. Blocks, if, match, with, lambdas
+## and lists take the expected type inside; other expressions are inferred, then checked.
+fn check_expr(expr: Int, expected: Ty) -> () {
+  prog().exprs.get(expr) match {
+    Some(e) -> e.kind match {
+      EBlock(_)     -> infer_expr_kind(expr, Some(expected))
+      EIf(_, _, _)  -> infer_expr_kind(expr, Some(expected))
+      EMatch(_, _)  -> infer_expr_kind(expr, Some(expected))
+      ELambda(_, _) -> infer_expr_kind(expr, Some(expected))
+      EList(_, _)   -> infer_expr_kind(expr, Some(expected))
+      EWith(_, _)   -> infer_expr_kind(expr, Some(expected))
+      _ -> {
+        actual = infer_expr(expr)
+        coerce_at(e.span, expected, actual)
+        actual
+      }
+    }
+    None -> TyError
+  }
+  ()
+}
+
+fn infer_expr_kind(expr: Int, expected: Option[Ty]) -> Ty {
+  program = prog()
+  program.exprs.get(expr) match {
+    None -> TyError
+    Some(e) -> e.kind match {
+      EMissing                    -> TyError
+      ELit(lit)                   -> lit_ty(lit, e.span)
+      EUnit                       -> UNIT
+      ETuple(elems)               -> TyTuple(elems.map(infer_expr))
+      EPath(ResLocal(local))      -> bs().locals.get(local).map(open_fails).or(TyError)
+      EPath(ResDef(def))          -> infer_path(expr, def, e.span)
+      EPath(ResErr)               -> TyError
+      EBlock(block)               -> infer_block(block, e.span, expected)
+      ECall(callee, args)         -> infer_call(expr, callee, args, e.span)
+      EIf(c, t, el)               -> infer_if(c, t, el, e.span, expected)
+      EMatch(s, arms)             -> infer_match(s, arms, expected)
+      EBinary(op, lhs, rhs)       -> infer_binary(expr, op, lhs, rhs, e.span)
+      EUnary(op, operand)         -> infer_unary(op, operand, e.span)
+      ELambda(params, body)       -> infer_lambda(expr, params, body, e.span, expected)
+      EList(elems, rest)          -> infer_list(elems, rest, e.span, expected)
+      EField(base, name) -> {
+        base_ty = infer_expr(base)
+        infer_dot(expr, base, base_ty, name, False) match {
+          DotValue(t)  -> t
+          DotMethod(_) -> TyError
+        }
+      }
+      EInterpolated(parts) -> {
+        parts.each(|p| {
+          p match {
+            SInterp(x) -> {
+              infer_expr(x)
+              ()
+            }
+            _ -> ()
+          }
+        })
+        STRING
+      }
+      EAssert(c) -> {
+        check_expr(c, BOOL)
+        UNIT
+      }
+      EUpdate(ctor, fields, base) -> infer_update(expr, ctor, fields, base)
+      # `fail e` is Never. The tag of e's type goes into E when E is computed (spec 7.2).
+      EFail(inner) -> {
+        infer_expr(inner)
+        TyNever
+      }
+      EEscape(inner, arms)        -> infer_escape(inner, arms)
+      EUse(target, args)          -> infer_use(target, args, e.span)
+      EWith(items, body) -> {
+        infer_with_args(items)
+        expected match {
+          Some(t) -> {
+            check_expr(body, t)
+            t
+          }
+          None -> infer_expr(body)
+        }
+      }
+    }
+  }
+}
+
+## A reference to a definition: its declared type instantiated.
+fn infer_path(expr: Int, def: Int, span: Span) -> Ty {
+  program = prog()
+  check_external(def, span)
+  check_handler_ctor(def, span)
+  if def_of(program, def).kind == MemberKind {
+    check_member_open(expr, def, span)
+  }
+  (ty, _, _) = instantiate_def(def, span)
+  labelled = program.member_labels.get(expr) match {
+    Some(label) -> through_label(ty, label)
+    None        -> ty
+  }
+  open_fails(labelled)
+}
+
+## `use X` is X's capability value (spec 8.2).
+fn infer_use(target: Res, args: List[Int], span: Span) -> Ty {
+  program = prog()
+  target match {
+    ResDef(eff) if is_host_effect(program, eff) -> {
+      diag(span, "E0414", "`use #{def_of(program, eff).name}`: a host effect has no capability")
+      TyError
+    }
+    # A built-in effect's type arguments may be omitted (`use Scope`); they are inferred.
+    ResDef(eff) if args.is_empty() && is_intrinsic_effect(program, eff) -> {
+      n = effect_params(program, eff).length()
+      table = bs().table
+      tys = List.range(0, n).map(|i| {
+        set_kind(table, eff, i) match {
+          Some(kind) -> TySet(kind, var_row(new_row_var()))
+          None       -> new_var()
+        }
+      })
+      cap([Tag(eff, tys)])
+    }
+    ResDef(eff) -> {
+      b = bs()
+      tag = scoped(
+        b.type_params,
+        b.param_kinds,
+        OmitEmpty,
+        True,
+        b.self_ty,
+        || effect_tag(eff, args, Some(span), None),
+      )
+      tag.map(|t| cap([t])).or(TyError)
+    }
+    _ -> TyError
+  }
+}
+
+## A handler value's constructor can only be used in its own init (E0418).
+fn check_handler_ctor(def: Int, span: Span) -> () {
+  program = prog()
+  program.items.get(def) match {
+    Some(ICtor(c)) if def_of(program, c.owner).kind == HandlerKind
+      && bs().in_init != Some(c.owner) -> diag(
+      span,
+      "E0418",
+      "the handler value `#{def_of(program, c.owner).name}` can only be made in its init",
+    )
+    _ -> ()
+  }
+}
+
+fn in_handler() -> Bool {
+  bs().current.map(|d| def_of(prog(), d).kind == HandlerKind).or(False)
+}
+
+## An `@external` fn with `uses` omitted or with host effects in it, and an `@external suspend
+## fn`, can only be used inside handler operation bodies (E0407).
+fn check_external(def: Int, span: Span) -> () {
+  prog().items.get(def) match {
+    Some(IFn(f)) if f.is_external && !in_handler() -> {
+      host = f.sig.uses.map(|u| !u.items.is_empty()).or(True)
+      if f.sig.is_suspend || host {
+        diag(
+          span,
+          "E0407",
+          "`#{def_of(prog(), def).name}` can only be called inside a handler operation",
+        )
+      }
+    }
+    _ -> ()
+  }
+}
+
+## Opening a handler member is written only as an item of `with` and, as a call, inside an init
+## (E0448).
+fn check_member_open(expr: Int, member: Int, span: Span) -> () {
+  b = bs()
+  if b.in_init.is_none() || !b.member_callees.contains(expr) {
+    diag(
+      span,
+      "E0448",
+      "the handler member `#{def_of(b.program, member).name}` can only be opened in `with` or an init",
+    )
+  }
+}
+
+## The type of opening a handler member through the label `label`: it requires the label.
+fn through_label(ty: Ty, label: Int) -> Ty {
+  ty match {
+    TyFn(f) -> func(f.params, f.ret, f.fails, tag_row(label))
+    _       -> ty
+  }
+}
+
+## The type of a reference to a function value, with fresh set variables added to E and R, so
+## functions with different E can meet in branches and lists.
+fn open_fails(ty: Ty) -> Ty {
+  shallow_resolve(ty) match {
+    TyFn(f) -> {
+      fails = insert(f.fails, RVar(new_row_var()))
+      uses = insert(f.uses, RVar(new_row_var()))
+      func(f.params, f.ret, fails, uses)
+    }
+    _ -> ty
+  }
+}
+
+## The declared type with its type parameters replaced by fresh variables, the type arguments
+## and the sets. Pending definitions of the group are monomorphic; a reference from another
+## definition to one with written type parameters is checked once the group is inferred.
+fn instantiate_def(def: Int, span: Span) -> (Ty, List[Ty], List[Row]) {
+  b = bs()
+  Signature.get(b.sigs, def) match {
+    Some(sig) -> {
+      (tys, rows) = fresh_args(sig.scheme.params)
+      (substitute(sig.scheme.ty, tys, rows), tys, rows)
+    }
+    None -> pending_of(def) match {
+      Some(p) if b.current == Some(def) || p.params.is_empty() -> (p.ty, [], [])
+      Some(p) -> {
+        ty = resolve(p.ty)
+        (args, rows) = fresh_args(p.params)
+        instance = freshen(substitute(ty, args, rows))
+        bupd(
+          |s| BodyState(
+            deferred: [DeferredRef(def, args, rows, instance, span), ..s.deferred],
+            ..s,
+          ),
+        )
+        (instance, args, rows)
+      }
+      None -> {
+        diag(span, "-", "not supported yet: reference to this kind of definition")
+        (TyError, [], [])
+      }
+    }
+  }
+}
+
+## Replaces undetermined type variables with fresh ones, consistently.
+fn freshen(ty: Ty) -> Ty {
+  pairs = free_vars(ty).map(|v| (v, new_var()))
+  replace_tys(resolve(ty), pairs)
+}
+
+fn replace_tys(ty: Ty, pairs: List[(Int, Ty)]) -> Ty {
+  ty match {
+    TyVar(v) -> pairs.find(|(w, _)| w == v).map(|(_, t)| t).or(ty)
+    _        -> map_children(ty, |c| replace_tys(c, pairs))
+  }
+}
+
+## `()` if the block ends with a binding or is empty. An expected type goes to the last
+## expression.
+fn infer_block(block: Block, span: Span, expected: Option[Ty]) -> Ty {
+  block.stmts.each(|stmt| {
+    stmt match {
+      SLet(pat, ty, value) -> {
+        bound = ty match {
+          Some(t) -> {
+            want = lower_type(t)
+            check_expr(value, want)
+            want
+          }
+          None -> infer_expr(value)
+        }
+        bind_pat(pat, bound)
+      }
+      SLocalFn(f) -> infer_local_fn(f)
+      SExpr(x) -> {
+        infer_expr(x)
+        ()
+      }
+    }
+  })
+  (block.tail, expected) match {
+    (Some(x), Some(t)) -> {
+      check_expr(x, t)
+      t
+    }
+    (Some(x), None) -> infer_expr(x)
+    (None, _)       -> unit_at(span, expected)
+  }
+}
+
+## A local fn (`[fn.local]`). Its name is bound to its function type before the body is checked,
+## so a call to itself has the type being inferred.
+fn infer_local_fn(f: LocalFn) -> () {
+  program = prog()
+  b = bs()
+  Tylower.reset_local_sets()
+  params = f.sig.params.map(|p| {
+    ty = p.ty match {
+      Some(t) -> scoped(
+        b.type_params,
+        b.param_kinds,
+        OmitLocal,
+        True,
+        b.self_ty,
+        || lower_in(t, True),
+      )
+      None -> {
+        name = program.locals.get(p.local).map(|l| l.name).or("")
+        diag(local_span(p.local), "E0316", "parameter `#{name}` needs a type")
+        TyError
+      }
+    }
+    set_local(p.local, ty)
+    ty
+  })
+  hidden_fails = lw().local_fails
+  hidden_uses = lw().local_uses
+  ret = f.sig.ret.map(lower_type).or(new_var())
+  in_scope = |g: fn() -> Row uses { State[TyLower], State[Infer] }| {
+    scoped(b.type_params, b.param_kinds, OmitEmpty, True, b.self_ty, g)
+  }
+  fails = if f.sig.ret.is_some() {
+    written = f.sig.fails.map(|set| in_scope(|| lower_error_set(set))).or(EMPTY_ROW)
+    union(written, hidden_fails)
+  } else {
+    var_row(new_row_var())
+  }
+  uses = f.sig.uses match {
+    Some(set) -> union(in_scope(|| lower_effect_set(set)), hidden_uses)
+    None      -> var_row(new_row_var())
+  }
+  set_local(f.local, func(params, ret, fails, uses))
+  bupd(
+    |s| BodyState(
+      local_labels: s.local_labels.insert(f.local, param_labels(program, f.sig.params)),
+      ..s,
+    ),
+  )
+  check_expr(f.body, ret)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Calls
+
+## Reorders the arguments by parameter position, then checks types (spec 6.2).
+fn infer_call(expr: Int, callee: Int, args: List[Arg], span: Span) -> Ty {
+  program = prog()
+  sigs = bs().sigs
+  callee_kind = program.exprs.get(callee).map(|c| c.kind)
+  # A local fn called by its name takes named arguments.
+  named = callee_kind match {
+    Some(EPath(ResDef(def))) -> (
+      Some(def_of(program, def).name),
+      Signature.get(sigs, def).map(|s| s.labels),
+    )
+    Some(EPath(ResLocal(local))) -> bs().local_labels.get(local) match {
+      Some(labels) -> (program.locals.get(local).map(|l| l.name), Some(labels))
+      None         -> (None, None)
+    }
+    _ -> (None, None)
+  }
+  bupd(|s| BodyState(member_callees: s.member_callees.insert(callee, True), ..s))
+  # `x.f(a)` may be a method call (`[type.rules]`).
+  found = callee_kind match {
+    Some(EField(base, name)) -> {
+      base_ty = infer_expr(base)
+      infer_dot(callee, base, base_ty, name, True) match {
+        DotMethod(def) -> Some(
+          Right(infer_method_call(expr, callee, base, base_ty, def, name, args, span)),
+        )
+        DotValue(t) -> Some(Left(t))
+      }
+    }
+    _ -> Some(Left(infer_expr(callee)))
+  }
+  found match {
+    Some(Right(t)) -> t
+    Some(Left(callee_ty)) -> {
+      # Capability operations use the declared operation's parameter names as labels.
+      (callee_name, labels) = (named, bs().ops.get(callee)) match {
+        ((None, _), Some(op)) -> (
+          Some(def_of(program, op).name),
+          Signature.get(sigs, op).map(|s| s.labels),
+        )
+        _ -> named
+      }
+      shallow_resolve(callee_ty) match {
+        TyFn(f) -> {
+          check_args(callee_name, labels, f.params, args, span)
+          f.ret
+        }
+        TyError -> {
+          args.each(|a| {
+            infer_expr(a.value)
+            ()
+          })
+          TyError
+        }
+        _ -> {
+          params = args.map(|_| new_var())
+          ret = new_var()
+          want = func(params, ret, var_row(new_row_var()), var_row(new_row_var()))
+          coerce_at(expr_span(callee), want, callee_ty)
+          check_args(callee_name, labels, params, args, span)
+          ret
+        }
+      }
+    }
+    None           -> TyError
+  }
+}
+
+enum Either2[A, B] {
+  Left(value: A)
+  Right(value: B)
+}
+
+## Assigns `args` to the parameters, reports a wrong number of them at `span` (E0305), checks each
+## argument against its parameter's type and infers the extra ones.
+fn check_args(
+  callee_name: Option[String],
+  labels: Option[List[Option[String]]],
+  params: List[Ty],
+  args: List[Arg],
+  span: Span,
+) -> () {
+  assigned = assign_args(callee_name, labels, params.length(), args.map(|a| (a.label, a.value)))
+  if !assigned.reported && (assigned.too_many || has_missing(assigned)) {
+    who = callee_name.map(|n| "`#{n}`").or("this function")
+    diag(
+      span,
+      "E0305",
+      "wrong number of arguments: #{who} takes #{params.length()}, found #{args.length()}",
+    )
+  }
+  assigned.slots.zip(params).each(|(slot, param_ty)| {
+    slot match {
+      Some(arg) -> shallow_resolve(param_ty) match {
+        TyCap(wanted) -> check_cap_arg(arg, wanted, param_ty)
+        _             -> check_expr(arg, param_ty)
+      }
+      None -> ()
+    }
+  })
+  assigned.extra.each(|x| {
+    infer_expr(x)
+    ()
+  })
+}
+
+## An argument passed to a parameter of type `use F1 + ... + Fm` (`[effect.use]`). A capability
+## without some Fi is E0452.
+fn check_cap_arg(arg: Int, wanted: List[Tag], param_ty: Ty) -> () {
+  actual = infer_expr(arg)
+  span = expr_span(arg)
+  shallow_resolve(actual) match {
+    TyCap(have) -> {
+      matched = wanted.filter_map(|w| {
+        have.find(|h| h.def == w.def && h.args.length() == w.args.length()).map(|h| (w, h))
+      })
+      if matched.length() < wanted.length() {
+        diag(span, "E0452", "the capability lacks effects the parameter needs")
+      } else {
+        matched.each(|(w, h)| coerce_at(span, cap([w]), cap([h])))
+      }
+    }
+    _ -> coerce_at(span, param_ty, actual)
+  }
+}
+
+## The result of reordering arguments by parameter position.
+type Assigned(
+  slots: List[Option[Int]],
+  ## Arguments that could not be placed.
+  extra: List[Int],
+  ## Whether a label error was reported; then count errors are not reported on top.
+  reported: Bool,
+  too_many: Bool,
+)
+
+fn has_missing(a: Assigned) -> Bool {
+  a.slots.any(|s| s.is_none())
+}
+
+## Positional arguments from the front, named arguments by label. Label errors are reported
+## here.
+fn assign_args(
+  callee_name: Option[String],
+  labels: Option[List[Option[String]]],
+  n: Int,
+  args: List[(Option[Label], Int)],
+) -> Assigned {
+  start = (Assigned(List.range(0, n).map(|_| None), [], False, False), 0)
+  (assigned, _) = args.fold(start, |(a, next), (label, value)| {
+    label match {
+      None -> if next < n {
+        (Assigned(slots: set_at(a.slots, next, Some(value)), ..a), next + 1)
+      } else {
+        (Assigned(extra: a.extra.append([value]), too_many: True, ..a), next + 1)
+      }
+      Some(l) -> label_slot(callee_name, labels, a.slots, l.name) match {
+        Slot(i) -> (Assigned(slots: set_at(a.slots, i, Some(value)), ..a), next)
+        SlotErr(code, message) -> {
+          diag(l.span, code, message)
+          (Assigned(extra: a.extra.append([value]), reported: True, ..a), next)
+        }
+      }
+    }
+  })
+  assigned
+}
+
+fn set_at[A](xs: List[A], i: Int, x: A) -> List[A] {
+  xs.enumerate().map(|(j, y)| if j == i { x } else { y })
+}
+
+## The position for a named argument, or the code and message of why it cannot be placed.
+fn label_slot(
+  callee_name: Option[String],
+  labels: Option[List[Option[String]]],
+  slots: List[Option[Int]],
+  label: String,
+) -> SlotResult {
+  labels match {
+    None -> SlotErr(
+      "E0306",
+      "no parameter named `#{label}`: a function value has no parameter names",
+    )
+    Some(ls) -> ls.find_index(|l| l == Some(label)) match {
+      None -> SlotErr("E0306", "no parameter named `#{label}` in `#{callee_name.or("")}`")
+      Some(i) -> if slots.get(i).and_then(|s| s).is_some() {
+        SlotErr("E0307", "argument `#{label}` given more than once")
+      } else {
+        Slot(i)
+      }
+    }
+  }
+}
+
+enum SlotResult {
+  Slot(index: Int)
+  SlotErr(code: String, message: String)
+}
+
+## Without else, the body is `()` and the whole is `()` (spec 6.4). With an expected type and an
+## else, both branches get it.
+fn infer_if(c: Int, t: Int, el: Option[Int], span: Span, expected: Option[Ty]) -> Ty {
+  check_expr(c, BOOL)
+  (el, expected) match {
+    (Some(e), Some(want)) -> {
+      check_expr(t, want)
+      check_expr(e, want)
+      want
+    }
+    (Some(e), None) -> {
+      then_ty = infer_expr(t)
+      else_ty = infer_expr(e)
+      join_at(expr_span(e), then_ty, else_ty)
+    }
+    (None, _) -> {
+      check_expr(t, UNIT)
+      unit_at(span, expected)
+    }
+  }
+}
+
+## Binary operators (spec 6.6). Pipes are read as calls (spec 6.7).
+fn infer_binary(expr: Int, op: BinaryOp, lhs: Int, rhs: Int, span: Span) -> Ty {
+  op match {
+    OpPipe -> infer_pipe(expr, lhs, rhs, span)
+    OpAnd  -> logical(lhs, rhs)
+    OpOr   -> logical(lhs, rhs)
+    _ -> if [OpAdd, OpSub, OpMul, OpDiv, OpRem].any(|o| o == op) {
+      ty = infer_expr(lhs)
+      check_expr(rhs, ty)
+      require_numeric(ty, span)
+      ty
+    } else {
+      ty = infer_expr(lhs)
+      check_expr(rhs, ty)
+      BOOL
+    }
+  }
+}
+
+fn logical(lhs: Int, rhs: Int) -> Ty {
+  check_expr(lhs, BOOL)
+  check_expr(rhs, BOOL)
+  BOOL
+}
+
+## Infers `x |> f(a)` as `f(x, a)` and `x |> f` as `f(x)` (spec 6.7).
+fn infer_pipe(expr: Int, lhs: Int, rhs: Int, span: Span) -> Ty {
+  piped = Arg(None, lhs, False)
+  prog().exprs.get(rhs).map(|e| e.kind) match {
+    Some(ECall(callee, args)) -> infer_call(expr, callee, [piped, ..args], span)
+    _                         -> infer_call(expr, rhs, [piped], span)
+  }
+}
+
+## If the expected type is a function type with the same number of parameters, its parameter
+## types go to the lambda's parameters first. The body's E and R are enclosed in fresh set
+## variables of the function type.
+fn infer_lambda(expr: Int, params: List[Param], body: Int, span: Span, expected: Option[Ty]) -> Ty {
+  expected_fn = expected.map(shallow_resolve) match {
+    Some(TyFn(f)) if f.params.length() == params.length() -> Some(f)
+    _                                                     -> None
+  }
+  param_tys = params.enumerate().map(|(i, p)| {
+    from_context = expected_fn.and_then(|f| f.params.get(i))
+    ty = (p.ty, from_context) match {
+      (Some(annotation), ctx) -> {
+        t = lower_type(annotation)
+        ctx match {
+          Some(c) -> coerce_at(local_span(p.local), c, t)
+          None    -> ()
+        }
+        t
+      }
+      (None, Some(c)) -> c
+      (None, None)    -> new_var()
+    }
+    set_local(p.local, ty)
+    ty
+  })
+  ret_ty = expected_fn match {
+    Some(f) -> {
+      check_expr(body, f.ret)
+      f.ret
+    }
+    None -> infer_expr(body)
+  }
+  row = new_row_var()
+  uses = new_row_var()
+  ty = func(param_tys, ret_ty, var_row(row), var_row(uses))
+  origin = Coerce(Some(span), bs().current)
+  (expected, expected_fn) match {
+    (_, Some(f)) -> {
+      add_subset(var_row(row), f.fails, origin)
+      add_subset_of(Effects, var_row(uses), f.uses, origin)
+    }
+    (Some(want), None) -> coerce_at(span, want, ty)
+    (None, None)       -> ()
+  }
+  ty
+}
+
+## All elements have the same type, and `..rest` is a list of it (spec 2.4).
+fn infer_list(elems: List[Int], rest: Option[Int], span: Span, expected: Option[Ty]) -> Ty {
+  from_context = expected.map(shallow_resolve) match {
+    Some(TyList(elem)) -> Some(elem)
+    _                  -> None
+  }
+  elem_ty = from_context.or(new_var())
+  elems.each(|e| check_expr(e, elem_ty))
+  ty = TyList(elem_ty)
+  when_some(rest, |r| check_expr(r, ty))
+  (expected, from_context) match {
+    (Some(want), None) -> coerce_at(span, want, ty)
+    _                  -> ()
+  }
+  ty
+}
+
+# ---------------------------------------------------------------------------------------------
+# Fields and method calls (`body/methods.rs`)
+
+## What `x.f` stands for: a value (a field, an operation, or `TyError` once reported), or the
+## function a method call calls.
+enum Dot {
+  DotValue(ty: Ty)
+  DotMethod(def: Int)
+}
+
+enum Field {
+  FieldFound(index: Int, ty: Ty)
+  ## An opaque type outside its module (E0315).
+  FieldOpaque
+  FieldMissing
+  NotARecord
+}
+
+enum FieldTy {
+  Found(index: Int, ty: Ty)
+  NoSuchField
+  NoFieldsHere
+}
+
+fn field_error(name: Label, code: String, message: String) -> Ty {
+  diag(name.span, code, message)
+  TyError
+}
+
+## Looks up `x.f`: a field, then the fns of the module that defines the type of x, then the
+## functions of traits. More than one candidate is E0335; a function not called is E0312.
+fn infer_dot(expr: Int, base: Int, base_ty0: Ty, name: Label, call: Bool) -> Dot {
+  base_ty = shallow_resolve(base_ty0)
+  base_ty match {
+    TyCap(tags) -> DotValue(infer_op(expr, base, tags, name))
+    TyError     -> DotValue(TyError)
+    TyNever     -> DotValue(TyError)
+    TyVar(_) -> {
+      what = if call { "call `#{name.name}`" } else { "access field `#{name.name}`" }
+      DotValue(field_error(name, "E0314", "the type of this value must be known to #{what}"))
+    }
+    _ -> lookup_field(base_ty, name.name) match {
+      FieldFound(_, ty) -> DotValue(ty)
+      field -> {
+        found = module_methods(base_ty, name.name)
+        (found, field) match {
+          ([def], _) if call -> DotMethod(def)
+          ([_], _) -> DotValue(field_error(name, "E0312", "no field `#{name.name}`"))
+          ([_, _, ..], _) -> DotValue(field_error(name, "E0335", "ambiguous method `#{name.name}`"))
+          ([], FieldOpaque) -> DotValue(
+            field_error(name, "E0315", "cannot access field `#{name.name}` of an opaque type"),
+          )
+          ([], FieldMissing) -> DotValue(
+            field_error(name, "E0312", "no field or function `#{name.name}`"),
+          )
+          _        -> DotValue(field_error(name, "E0313", "no field or function `#{name.name}`"))
+        }
+      }
+    }
+  }
+}
+
+## Types the call `x.f(args)` of the function `def` found for `x.f` as `M.f(x, args)`.
+fn infer_method_call(
+  expr: Int,
+  callee: Int,
+  base: Int,
+  base_ty: Ty,
+  def: Int,
+  name: Label,
+  args: List[Arg],
+  span: Span,
+) -> Ty {
+  program = prog()
+  check_external(def, name.span)
+  (ty0, _, _) = instantiate_def(def, name.span)
+  ty = open_fails(ty0)
+  shallow_resolve(ty) match {
+    TyFn(f) if !f.params.is_empty() -> {
+      coerce_at(expr_span(base), f.params.get(0).or(TyError), base_ty)
+      labels = Signature.get(bs().sigs, def) match {
+        Some(sig) -> Some(sig.labels.drop(1))
+        None      -> fn_parts(program, def).map(|(ps, _)| param_labels(program, ps.drop(1)))
+      }
+      check_args(Some(name.name), labels, f.params.drop(1), args, span)
+      f.ret
+    }
+    _ -> {
+      args.each(|a| {
+        infer_expr(a.value)
+        ()
+      })
+      TyError
+    }
+  }
+}
+
+## The field `name` of `ty`, if `ty` is a type with fields that can be accessed here.
+fn lookup_field(ty: Ty, name: String) -> Field {
+  ty match {
+    TyNamed(id, args) -> {
+      b = bs()
+      type_def = con_def(b.table, id)
+      data = def_of(b.program, type_def)
+      hidden = data.is_opaque && data.module != b.module
+      field_ty(type_def, args, name) match {
+        NoFieldsHere -> NotARecord
+        _ if hidden  -> FieldOpaque
+        Found(i, t)  -> FieldFound(i, t)
+        NoSuchField  -> FieldMissing
+      }
+    }
+    _ -> NotARecord
+  }
+}
+
+## The type of field `field` of the type definition applied to `args`, from the constructor's
+## declared type.
+fn field_ty(type_def: Int, args: List[Ty], field: String) -> FieldTy {
+  program = prog()
+  ctor = program.items.get(type_def) match {
+    Some(IType(t))    -> t.ctor
+    # An error is its own constructor.
+    Some(IError(_))   -> Some(type_def)
+    Some(IHandler(h)) -> h.ctor
+    _                 -> None
+  }
+  no_ctor = program.items.get(type_def) match {
+    Some(IHandler(_)) -> NoSuchField
+    _                 -> NoFieldsHere
+  }
+  ctor match {
+    None -> no_ctor
+    Some(c) -> Signature.get(bs().sigs, c) match {
+      None -> NoFieldsHere
+      Some(sig) -> sig.scheme.ty match {
+        TyFn(f) -> sig.labels.find_index(|l| l == Some(field)) match {
+          Some(i) -> Found(i, substitute_bound(f.params.get(i).or(TyError), args))
+          None    -> NoSuchField
+        }
+        # A type or error without fields.
+        _ -> NoSuchField
+      }
+    }
+  }
+}
+
+## The head of a type: the definition of a named type, a primitive's or List's Prelude type.
+fn head_def(ty: Ty) -> Option[Int] {
+  b = bs()
+  ty match {
+    TyNamed(id, _)   -> Some(con_def(b.table, id))
+    TyPrim(Ty.PUnit) -> None
+    TyPrim(p)        -> prelude_def(b.program, Ty.prim_name(p))
+    TyList(_)        -> prelude_def(b.program, "List")
+    _                -> None
+  }
+}
+
+## The fns `name` of the module that defines the head of `ty`, whose first parameter has that
+## head. Outside that module, only pub fns.
+fn module_methods(ty: Ty, name: String) -> List[Int] {
+  program = prog()
+  head_def(ty) match {
+    None -> []
+    Some(head) -> defining_module(program, head) match {
+      None -> []
+      Some(m) -> {
+        here = bs().module == SourceModule(m)
+        program.modules.get(m).map(|items| items.items).or([]).filter(|def| {
+          data = def_of(program, def)
+          data.kind == FnKind
+            && data.name == name
+            && (data.is_pub || here)
+            && first_param_head(def) == Some(head)
+        })
+      }
+    }
+  }
+}
+
+## The head of the type of the first parameter of the fn `def`; for a fn whose type is not known
+## yet, the type written in its declaration.
+fn first_param_head(def: Int) -> Option[Int] {
+  program = prog()
+  known = Signature.get(bs().sigs, def).map(|s| s.scheme.ty) match {
+    Some(t) -> Some(t)
+    None    -> pending_of(def).map(|p| p.ty)
+  }
+  known match {
+    Some(ty) -> shallow_resolve(ty) match {
+      TyFn(f) -> f.params.get(0).map(shallow_resolve).and_then(head_def)
+      _       -> None
+    }
+    None -> written_first_param(program, def)
+  }
+}
+
+fn written_first_param(program: Program, def: Int) -> Option[Int] {
+  program.items.get(def) match {
+    Some(IFn(f)) -> f.sig.params.head().and_then(|p| p.ty).and_then(
+      |t| program.types.get(t),
+    ) match {
+      Some(r) -> r.kind match {
+        TPath(ResDef(d), _) if def_of(program, d).kind != TypeParamKind -> Some(d)
+        _                                                               -> None
+      }
+      None -> None
+    }
+    _ -> None
+  }
+}
+
+## The type of a capability operation `log.info` (spec 8.2): the declared operation type with the
+## effect's type parameters replaced by the capability's type arguments, and the effect in R.
+fn infer_op(expr: Int, base: Int, tags: List[Tag], name: Label) -> Ty {
+  program = prog()
+  sigs = bs().sigs
+  if is_upper(name.name) {
+    infer_cap_member(expr, tags, name)
+  } else {
+    found = tags.filter_map(|t| {
+      effect_ops(program, t.def).find(|op| def_of(program, op).name == name.name).map(|op| (t, op))
+    }).head()
+    found match {
+      None -> field_error(name, "E0401", "no operation `#{name.name}`")
+      Some((tag, op)) -> {
+        bupd(|s| BodyState(ops: s.ops.insert(expr, op), ..s))
+        args = base_of(sigs, tag).args
+        Signature.get(sigs, op).map(|sig| {
+          n = if args.length() < sig.scheme.params.length() {
+            args.length()
+          } else {
+            sig.scheme.params.length()
+          }
+          (fresh, fresh_rows) = fresh_args(sig.scheme.params.drop(n))
+          own = args.take(n)
+          rows = own.enumerate().map(|(i, a)| {
+            a match {
+              TySet(_, row) -> row
+              _             -> Ty.row_of([RBound(i)])
+            }
+          })
+          substitute(sig.scheme.ty, own.append(fresh), rows.append(fresh_rows))
+        }) match {
+          Some(TyFn(f)) -> func(f.params, f.ret, f.fails, Ty.row_of([RTag(tag)]))
+          _             -> TyError
+        }
+      }
+    }
+  }
+}
+
+fn is_upper(s: String) -> Bool {
+  s.code_points().head().map(|c| c >= 65 && c <= 90).or(False)
+}
+
+## Opening the handler member `name` through a capability (`fs.Open`).
+fn infer_cap_member(expr: Int, tags: List[Tag], name: Label) -> Ty {
+  program = prog()
+  sigs = bs().sigs
+  found = tags.filter_map(|t| {
+    effect_members(program, t.def).find(|m| def_of(program, m).name == name.name).map(|m| (t, m))
+  }).head()
+  found match {
+    None -> field_error(name, "E0401", "no operation `#{name.name}`")
+    Some((tag, member)) -> {
+      check_member_open(expr, member, name.span)
+      args = base_of(sigs, tag).args
+      Signature.get(sigs, member).map(|sig| substitute_bound(sig.scheme.ty, args)) match {
+        Some(TyFn(f)) -> func(f.params, f.ret, f.fails, Ty.row_of([RTag(tag)]))
+        _             -> TyError
+      }
+    }
+  }
+}
+
+## The type of an update `C(f: e, ..base)` (spec 5.3). The constructor's type is instantiated
+## twice, for the value built and for `base`; unwritten fields are carried over from `base`.
+fn infer_update(expr: Int, ctor: Int, fields: List[Arg], base: Int) -> Ty {
+  program = prog()
+  ctor_ty = infer_expr(ctor)
+  infer_all = || fields.each(|f| {
+    infer_expr(f.value)
+    ()
+  })
+  program.exprs.get(ctor).map(|c| c.kind) match {
+    Some(EPath(ResDef(ctor_def))) -> shallow_resolve(ctor_ty) match {
+      TyFn(made) -> Signature.get(bs().sigs, ctor_def) match {
+        None -> TyError
+        Some(sig) -> Infer.instantiate(sig.scheme) match {
+          TyFn(from) -> {
+            check_expr(base, from.ret)
+            written = fields.fold([], |done, f| {
+              f.label match {
+                None -> {
+                  infer_expr(f.value)
+                  done
+                }
+                Some(l) -> sig.labels.find_index(|x| x == Some(l.name)) match {
+                  Some(i) if done.any(|j| j == i) -> {
+                    diag(l.span, "E0307", "argument `#{l.name}` given more than once")
+                    infer_expr(f.value)
+                    done
+                  }
+                  Some(i) -> {
+                    check_expr(f.value, made.params.get(i).or(TyError))
+                    done.append([i])
+                  }
+                  None -> {
+                    diag(l.span, "E0312", "no field `#{l.name}`")
+                    infer_expr(f.value)
+                    done
+                  }
+                }
+              }
+            })
+            base_span = expr_span(base)
+            made.params.enumerate().each(|(i, p)| {
+              if !written.any(|j| j == i) {
+                coerce_at(base_span, p, from.params.get(i).or(TyError))
+              }
+            })
+            made.ret
+          }
+          _ -> TyError
+        }
+      }
+      # A constructor without fields.
+      _ -> {
+        check_expr(base, ctor_ty)
+        infer_all()
+        ctor_ty
+      }
+    }
+    _ -> {
+      infer_all()
+      infer_expr(base)
+      TyError
+    }
+  }
+}
+
+## `!` takes Bool, `-` a number (spec 6.6).
+fn infer_unary(op: UnaryOp, operand: Int, span: Span) -> Ty {
+  op match {
+    OpNot -> {
+      check_expr(operand, BOOL)
+      BOOL
+    }
+    OpNeg -> {
+      ty = infer_expr(operand)
+      require_numeric(ty, span)
+      ty
+    }
+  }
+}
+
+## Each arm's pattern gets the scrutinee type; the arm bodies' types are joined from Never. An
+## expected type goes to each arm body.
+fn infer_match(scrutinee: Int, arms: List[Arm], expected: Option[Ty]) -> Ty {
+  scrutinee_ty = infer_expr(scrutinee)
+  arms.fold(TyNever, |result, arm| {
+    bind_pat(arm.pat, scrutinee_ty)
+    when_some(arm.guard, |g| check_expr(g, BOOL))
+    expected match {
+      Some(want) -> {
+        check_expr(arm.body, want)
+        want
+      }
+      None -> {
+        body_ty = infer_expr(arm.body)
+        join_at(expr_span(arm.body), result, body_ty)
+      }
+    }
+  })
+}
+
+## The type of `escape` (`[error.escape]`): arm patterns are error constructors or `_`, arm results
+## have the inner expression's type or Never. Arms below an arm `_` without a guard are
+## unreachable (W0301).
+fn infer_escape(inner: Int, arms: List[Arm]) -> Ty {
+  program = prog()
+  inner_ty = infer_expr(inner)
+  (result, _) = arms.fold((inner_ty, False), |(result, below), arm| {
+    p = program.pats.get(arm.pat)
+    span = p.map(|q| q.span).or(Span(0, 0, 0))
+    if below {
+      Tylower.report_warning(Some(span), "W0301", "unreachable match arm")
+    }
+    now_below = p.map(|q| q.kind) match {
+      Some(PCtor(ResDef(def), _, _)) if def_of(program, def).kind == ErrorKind -> {
+        bind_pat(arm.pat, self_ty(bs().table, def).or(TyError))
+        below
+      }
+      Some(PWild) -> {
+        bind_pat(arm.pat, TyError)
+        arm.guard match {
+          Some(g) -> {
+            diag(expr_span(g), "E0320", "an `escape` arm `_` cannot have a guard")
+            below
+          }
+          None -> True
+        }
+      }
+      Some(PCtor(_, _, _)) -> {
+        bind_pat(arm.pat, TyError)
+        below
+      }
+      Some(PMissing) -> {
+        bind_pat(arm.pat, TyError)
+        below
+      }
+      _ -> {
+        diag(span, "E0320", "an `escape` arm must be an error constructor or `_`")
+        bind_pat(arm.pat, TyError)
+        below
+      }
+    }
+    when_some(arm.guard, |g| check_expr(g, BOOL))
+    body_ty = infer_expr(arm.body)
+    (join_at(expr_span(arm.body), result, body_ty), now_below)
+  })
+  result
+}
+
+# ---------------------------------------------------------------------------------------------
+# Patterns
+
+## Also records the types of the variables the pattern binds. `ty` is the incoming value's type,
+## the expected side.
+fn bind_pat(pat: Int, ty: Ty) -> () {
+  program = prog()
+  program.pats.get(pat) match {
+    None -> ()
+    Some(p) -> p.kind match {
+      PBind(local)                   -> set_local(local, ty)
+      PUnit                          -> coerce_at(p.span, ty, UNIT)
+      PLit(lit)                      -> coerce_at(p.span, ty, lit_ty(lit, p.span))
+      PConst(ResDef(def)) -> {
+        (const_ty, _, _) = instantiate_def(def, p.span)
+        coerce_at(p.span, ty, const_ty)
+      }
+      PTuple(elems) -> {
+        tys = elems.map(|_| new_var())
+        coerce_at(p.span, ty, TyTuple(tys))
+        elems.zip(tys).each(|(e, t)| bind_pat(e, t))
+      }
+      PList(elems, rest) -> {
+        elem_ty = new_var()
+        coerce_at(p.span, ty, TyList(elem_ty))
+        elems.each(|e| bind_pat(e, elem_ty))
+        when_some(rest.and_then(|r| r.binding), |local| set_local(local, TyList(elem_ty)))
+      }
+      PCtor(ResDef(def), args, rest) -> bind_ctor_pat(pat, def, args.or([]), rest, ty, p.span)
+      _                              -> ()
+    }
+  }
+}
+
+## Constructor patterns: instantiates the constructor's type, checks the constructed type against
+## `ty`, and passes types to the fields. Omitting fields without `..` is E0308.
+fn bind_ctor_pat(pat: Int, def: Int, args: List[PatArg], rest: Bool, ty: Ty, span: Span) -> () {
+  program = prog()
+  (ctor_ty, _, _) = instantiate_def(def, span)
+  labels = Signature.get(bs().sigs, def).map(|s| s.labels)
+  (field_tys, made_ty) = shallow_resolve(ctor_ty) match {
+    TyFn(f) -> (f.params, f.ret)
+    other   -> ([], other)
+  }
+  name = def_of(program, def).name
+  assigned = assign_args(Some(name), labels, field_tys.length(), args.map(|a| (a.label, a.pat)))
+  count_message = "pattern `#{name}` has #{field_tys.length()} fields, found #{args.length()}"
+  if !assigned.reported {
+    if assigned.too_many {
+      diag(span, "E0309", count_message)
+    } else if has_missing(assigned) && !rest {
+      missing = assigned.slots.zip(labels.or([])).filter_map(|(slot, label)| {
+        if slot.is_none() { label } else { None }
+      })
+      if missing.is_empty() {
+        diag(span, "E0309", count_message)
+      } else {
+        diag(span, "E0308", "pattern `#{name}` does not mention every field")
+      }
+    }
+  }
+  assigned.slots.zip(field_tys).each(|(slot, field_ty)| when_some(slot, |q| bind_pat(q, field_ty)))
+  assigned.extra.each(|q| bind_pat(q, TyError))
+  coerce_at(span, ty, made_ty)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Numbers
+
+## Integers get an Int-or-Int64 type variable, decided by context (spec 2.4).
+fn lit_ty(lit: Literal, span: Span) -> Ty {
+  lit match {
+    LInt(text) -> {
+      ty = new_int_var()
+      bupd(|b| BodyState(numbers: [NumConstraint(ty, span, True, Some(text)), ..b.numbers], ..b))
+      ty
+    }
+    LFloat(_)  -> FLOAT
+    LString(_) -> STRING
+  }
+}
+
+## Requires Int, Int64 or Float (arithmetic operators, unary minus).
+fn require_numeric(ty: Ty, span: Span) -> () {
+  bupd(|b| BodyState(numbers: [NumConstraint(ty, span, False, None), ..b.numbers], ..b))
+}
+
+## Undetermined numeric variables become Int (spec 2.4). Integer literals must fit the decided
+## type.
+fn check_numbers() -> () {
+  bs().numbers.reverse().each(|c| {
+    ty = shallow_resolve(c.ty) match {
+      TyVar(_) -> {
+        unify(INT, c.ty)
+        INT
+      }
+      t -> t
+    }
+    ok = ty match {
+      TyError        -> None
+      TyNever        -> None
+      TyPrim(PInt)   -> Some(True)
+      TyPrim(PInt64) -> Some(True)
+      TyPrim(PFloat) -> Some(!c.integer)
+      _              -> Some(False)
+    }
+    ok match {
+      None -> ()
+      Some(False) -> diag(
+        c.span,
+        "E0310",
+        if c.integer { "expected an integer" } else { "expected a number" },
+      )
+      Some(True) -> c.literal match {
+        Some(text) if !int_literal_fits(text, ty) -> diag(
+          c.span,
+          "E0311",
+          "integer literal `#{text}` is out of range",
+        )
+        _ -> ()
+      }
+    }
+  })
+}
+
+## Whether an integer literal fits Int (32 bits) or Int64. Only a pattern's literal can be
+## negative. Not reinterpreted as two's complement.
+fn int_literal_fits(text: String, ty: Ty) -> Bool {
+  bits = ty match {
+    TyPrim(PInt)   -> 32
+    TyPrim(PInt64) -> 64
+    _              -> 0
+  }
+  if bits == 0 {
+    True
+  } else {
+    cps = text.code_points()
+    (negative, digits0) = cps match {
+      [45, ..rest] -> (True, rest)
+      _            -> (False, cps)
+    }
+    (radix, digits) = digits0 match {
+      [48, 120, ..rest] -> (16, rest)
+      [48, 98, ..rest]  -> (2, rest)
+      _                 -> (10, digits0)
+    }
+    values = digits.map(|d| digit_value(d))
+    if digits.is_empty() || values.any(|v| v < 0 || v >= radix) {
+      False
+    } else {
+      # The magnitude in decimal digits, compared with 2^(bits-1) (- 1 if positive).
+      decimal = to_decimal(values, radix)
+      limit = if bits == 32 { "2147483648" } else { "9223372036854775808" }
+      cmp = compare_decimal(decimal, limit)
+      if negative { cmp != Greater } else { cmp == Less }
+    }
+  }
+}
+
+fn digit_value(c: Int) -> Int {
+  {
+    if c >= 48 && c <= 57 {
+      c - 48
+    } else if c >= 97 && c <= 102 {
+      c - 87
+    } else if c >= 65 && c <= 70 {
+      c - 55
+    } else {
+      -1
+    }
+  }
+}
+
+## The digits in base `radix` as a decimal string without leading zeros ("0" for zero).
+fn to_decimal(values: List[Int], radix: Int) -> String {
+  # Little-endian decimal digits.
+  acc = values.fold([], |dec, v| add_small(mul_small(dec, radix), v))
+  s = String.concat(acc.reverse().map(|d| "#{d}"))
+  if s == "" { "0" } else { s }
+}
+
+fn mul_small(dec: List[Int], m: Int) -> List[Int] {
+  (out, carry) = dec.fold(([], 0), |(acc, c), d| {
+    x = d * m + c
+    ([x % 10, ..acc], x / 10)
+  })
+  flush(out.reverse(), carry)
+}
+
+fn add_small(dec: List[Int], a: Int) -> List[Int] {
+  (out, carry) = dec.fold(([], a), |(acc, c), d| {
+    x = d + c
+    ([x % 10, ..acc], x / 10)
+  })
+  flush(out.reverse(), carry)
+}
+
+fn flush(dec: List[Int], carry: Int) -> List[Int] {
+  if carry == 0 { dec } else { flush(dec.append([carry % 10]), carry / 10) }
+}
+
+fn compare_decimal(a: String, b: String) -> Ordering {
+  la = a.code_points().length()
+  lb = b.code_points().length()
+  if la != lb { Ord.compare(la, lb) } else { Ord.compare(a, b) }
+}
+
+fn when_some[A](o: Option[A], f: fn(A) -> ()) -> () {
+  o match {
+    Some(x) -> f(x)
+    None    -> ()
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Handlers
+
+## The effect tag `handler` implements for the effect that declares `op`.
+fn handler_effect_of(handler_def: Int, op: Int) -> Option[Tag] {
+  b = bs()
+  def_of(b.program, op).parent.and_then(|eff| {
+    Signature.effects_of_handler(b.sigs, handler_def).find(|t| t.def == eff)
+  })
+}
+
+## Infers a handler's init, release and operation bodies (spec 8.4).
+fn infer_handler(def: Int, item: HandlerItem) -> () {
+  program = prog()
+  data = def_of(program, def)
+  span = data.span.or(Span(0, 0, 0))
+  # The effects listed after `:`. One that did not resolve leaves the handler unchecked.
+  listed = item.effects.fold(Some([]), |acc, e| {
+    acc.and_then(|effs| {
+      e.res match {
+        ResDef(eff) -> Some(effs.append([eff]))
+        _           -> None
+      }
+    })
+  })
+  checked = listed.and_then(|effs| {
+    effs.fold(Some([]), |acc, eff| {
+      acc.and_then(|kept| {
+        if is_host_effect(program, eff) {
+          diag(span, "E0413", "a handler cannot be written for a host effect")
+          None
+        } else if is_intrinsic_effect(program, eff) {
+          diag(span, "E0413", "a handler cannot be written for a built-in effect")
+          None
+        } else if Signature.is_label(program, eff) {
+          None
+        } else if kept.any(|k| k == eff) {
+          Some(kept)
+        } else {
+          Some(kept.append([eff]))
+        }
+      })
+    })
+  })
+  checked match {
+    Some(effs) if !effs.is_empty() -> infer_handler_parts(def, item, effs, span)
+    _                              -> ()
+  }
+}
+
+fn infer_handler_parts(def: Int, item: HandlerItem, effs: List[Int], span: Span) -> () {
+  program = prog()
+  sigs = bs().sigs
+  handler_ty = self_ty(bs().table, def).or(TyError)
+  item.init match {
+    Some(init) -> {
+      params = sigs.init_params.get(def).map(|p| p.tys)
+      item.init_params.enumerate().each(|(i, p)| {
+        set_local(p.local, params.and_then(|tys| tys.get(i)).or(TyError))
+      })
+      bupd(|b| BodyState(in_init: Some(def), ..b))
+      check_expr(init, handler_ty)
+      bupd(|b| BodyState(in_init: None, ..b))
+    }
+    None -> if !item.fields.is_empty() {
+      diag(span, "E0419", "handler `#{def_of(program, def).name}` has fields but no init")
+    }
+  }
+  when_some(item.release, |(self_local, body)| {
+    set_local(self_local, handler_ty)
+    infer_expr(body)
+    ()
+  })
+  inner_member = |inner: Int| {
+    program.items.get(inner) match {
+      Some(IHandler(h)) -> h.member
+      _                 -> None
+    }
+  }
+  declared = |members: Bool| {
+    effs.flat_map(|eff| {
+      program.items.get(eff) match {
+        Some(IEffect(e)) -> if members { e.members } else { e.ops }
+        _                -> []
+      }
+    })
+  }
+  ops = declared(False)
+  members = declared(True)
+  name_of = |d: Int| def_of(program, d).name
+  # An operation whose name another listed effect has too is E0450, not missing.
+  missing = ops.filter(|op| !item.ops.any(|h| h.op == ResDef(op))).map(name_of).filter(
+    |n| ops.filter(|o| name_of(o) == n).length() == 1,
+  )
+  missing_members = members.filter(|m| !item.inner.any(|i| inner_member(i) == Some(ResDef(m))))
+  item.inner.enumerate().each(|(k, inner)| {
+    inner_member(inner) match {
+      Some(ResDef(m)) if item.inner.take(k).any(|i| inner_member(i) == Some(ResDef(m))) -> diag(
+        def_of(program, inner).span.or(span),
+        "E0405",
+        "`#{name_of(m)}` is implemented more than once",
+      )
+      _ -> ()
+    }
+  })
+  if !missing.is_empty() || !missing_members.is_empty() {
+    diag(span, "E0404", "handler `#{name_of(def)}` does not implement every operation")
+  }
+  item.ops.enumerate().each(|(index, hop)| infer_handler_op(def, item, index, hop, handler_ty))
+}
+
+fn infer_handler_op(def: Int, item: HandlerItem, index: Int, hop: HandlerOp, handler_ty: Ty) -> () {
+  program = prog()
+  sigs = bs().sigs
+  set_local(hop.self_local, handler_ty)
+  op = hop.op match {
+    ResDef(o) if item.ops.take(index).any(|h| h.op == hop.op) -> {
+      diag(hop.name.span, "E0405", "`#{def_of(program, o).name}` is implemented more than once")
+      None
+    }
+    ResDef(o) -> Some(o)
+    _         -> None
+  }
+  # A `suspend` differing from the effect's declaration is E0415.
+  when_some(op, |o| {
+    program.items.get(o) match {
+      Some(IOp(decl)) if decl.sig.is_suspend != hop.is_suspend
+        && def_of(program, o).parent.is_some() -> diag(
+        hop.name.span,
+        "E0415",
+        "`#{hop.name.name}` differs from its declaration in `suspend`",
+      )
+      _ -> ()
+    }
+  })
+  effect_args = op.and_then(|o| handler_effect_of(def, o)).map(|t| t.args).or([])
+  f = op.and_then(|o| Signature.get(sigs, o)).map(
+    |s| substitute_bound(s.scheme.ty, effect_args),
+  ) match {
+    Some(TyFn(g)) -> Some(g)
+    _             -> None
+  }
+  f match {
+    None -> {
+      hop.params.each(|p| set_local(p.local, TyError))
+      when_some(hop.body, |body| {
+        infer_expr(body)
+        ()
+      })
+    }
+    Some(g) -> {
+      # A suspend fn implementation's parameters are the operation's plus `resume`.
+      params = if hop.is_suspend {
+        g.params.append([func([g.ret], UNIT, EMPTY_ROW, EMPTY_ROW)])
+      } else {
+        g.params
+      }
+      if hop.params.length() != params.length() {
+        diag(
+          hop.name.span,
+          "E0406",
+          "`#{hop.name.name}` takes #{params.length()} parameters, found #{hop.params.length()}",
+        )
+      }
+      hop.params.enumerate().each(|(i, p)| set_local(p.local, params.get(i).or(TyError)))
+      when_some(hop.body, |body| check_expr(body, if hop.is_suspend { UNIT } else { g.ret }))
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# `with` items and the arguments of init
+
+## The arguments of init written on the items of a `with` (`[effect.with]`). An item that opens
+## a handler member binds its name to the capability of the member's effect; another bound item
+## to the capability of the effects it provides.
+fn infer_with_args(items: List[WithItem]) -> () {
+  program = prog()
+  sigs = bs().sigs
+  items.each(|item| {
+    infer_member_item(item) match {
+      Some((f, member)) -> {
+        labels = Signature.get(sigs, member).map(|s| s.labels)
+        item.args match {
+          Some(args) -> check_args(
+            Some(def_of(program, member).name),
+            labels,
+            f.params,
+            args.args,
+            args.span,
+          )
+          None -> if !f.params.is_empty() {
+            diag(
+              item.span,
+              "E0434",
+              "`#{def_of(program, member).name}` needs the arguments of its init",
+            )
+          }
+        }
+        when_some(item.bind, |local| set_local(local, f.ret))
+      }
+      None -> {
+        item.res match {
+          ResDef(d) if item.bind.is_some() && is_layer(d) -> diag(
+            item.span,
+            "E0447",
+            "a layer cannot be bound to a name",
+          )
+          _ -> ()
+        }
+        when_some(item.bind, |local| set_local(local, bound_item_ty(item)))
+        item.by match {
+          Some((by, by_span)) -> {
+            infer_supply_args(item.res, item.args, item.span)
+            infer_supply_args(by, item.by_init_args, by_span)
+          }
+          None -> infer_supply_args(item.res, item.args, item.span)
+        }
+      }
+    }
+  })
+}
+
+fn is_layer(d: Int) -> Bool {
+  prog().items.get(d) match {
+    Some(ILayer(_)) -> True
+    _               -> False
+  }
+}
+
+## The capability of the effects a bound item provides: those of a handler, the base of a label,
+## or the label plugged with `by`.
+fn bound_item_ty(item: WithItem) -> Ty {
+  b = bs()
+  tags = item.res match {
+    ResDef(d) -> b.program.items.get(d) match {
+      Some(IHandler(_)) if item.by.is_none() -> Signature.effects_of_handler(b.sigs, d)
+      Some(IEffect(_)) -> Signature.label_base(b.sigs, d).map(|base| {
+        if item.by.is_some() { [Tag(d, [])] } else { [base] }
+      }).or([])
+      _                                      -> []
+    }
+    _ -> []
+  }
+  if tags.is_empty() { TyError } else { cap(tags) }
+}
+
+## For an item of `with` that opens a handler member, the type of opening it and the member. An
+## item without `x =` is E0447.
+fn infer_member_item(item: WithItem) -> Option[(FnTy, Int)] {
+  program = prog()
+  found = (item.res, item.cap) match {
+    (ResDef(member), _) if def_of(program, member).kind == MemberKind -> {
+      (ty, _, _) = instantiate_def(member, item.span)
+      labelled = item.label.map(|l| through_label(ty, l)).or(ty)
+      Some((labelled, member))
+    }
+    (_, Some((capability, name))) -> {
+      cap_ty = infer_expr(capability)
+      shallow_resolve(cap_ty) match {
+        TyCap(tags) -> {
+          hit = tags.filter_map(|t| {
+            effect_members(program, t.def).find(|m| def_of(program, m).name == name.name).map(
+              |m| (t, m),
+            )
+          }).head()
+          hit match {
+            Some((tag, member)) -> {
+              args = base_of(bs().sigs, tag).args
+              ty = Signature.get(bs().sigs, member).map(
+                |s| substitute_bound(s.scheme.ty, args),
+              ) match {
+                Some(TyFn(g)) -> func(g.params, g.ret, g.fails, Ty.row_of([RTag(tag)]))
+                _             -> TyError
+              }
+              Some((ty, member))
+            }
+            None -> {
+              diag(name.span, "E0401", "no operation `#{name.name}`")
+              None
+            }
+          }
+        }
+        TyError -> None
+        _ -> {
+          diag(name.span, "E0312", "no field or function `#{name.name}`")
+          None
+        }
+      }
+    }
+    _ -> None
+  }
+  found.and_then(|(ty, member)| {
+    if item.bind.is_none() {
+      diag(item.span, "E0447", "opening `#{def_of(program, member).name}` needs a name (`x = ...`)")
+    }
+    ty match {
+      TyFn(f) -> Some((f, member))
+      _       -> None
+    }
+  })
+}
+
+## Checks the arguments written after a handler (`WorkerKv(binding: "KV")`) against the
+## parameters of its init. A handler whose init takes parameters needs them (E0434); anything
+## else takes none (E0435).
+fn infer_supply_args(target: Res, args: Option[SupplyArgs], span: Span) -> () {
+  program = prog()
+  sigs = bs().sigs
+  params = target match {
+    ResDef(d) -> program.items.get(d) match {
+      Some(IHandler(_)) -> sigs.init_params.get(d).map(|p| (d, p))
+      _                 -> None
+    }
+    _ -> None
+  }
+  (params, args) match {
+    (None, None) -> ()
+    (Some((h, _)), None) -> diag(
+      span,
+      "E0434",
+      "`#{def_of(program, h).name}` needs the arguments of its init",
+    )
+    (None, Some(a)) -> {
+      when_some(
+        target match {
+          ResDef(d) -> Some(d)
+          _         -> None
+        },
+        |d| diag(a.span, "E0435", "`#{def_of(program, d).name}` takes no arguments"),
+      )
+      a.args.each(|arg| {
+        infer_expr(arg.value)
+        ()
+      })
+    }
+    (Some((h, p)), Some(a)) -> check_args(
+      Some(def_of(program, h).name),
+      Some(p.labels),
+      p.tys,
+      a.args,
+      a.span,
+    )
+  }
+}

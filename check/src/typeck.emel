@@ -1,17 +1,28 @@
 ## Type checking of a resolved program. Follows `check.rs` of the reference type checker: builds
-## the table of named types, collects the declared signatures, then infers the bodies.
-##
-## So far only the declarations are checked.
+## the table of named types, collects the declared signatures, then infers the bodies group by
+## group, callees first.
+import Std.State.{State}
 import Hir.{Program}
-import Signature
-import Tylower.{TyDiag, new_table}
+import Body
+import Groups
+import Signature.{Signatures, insert_sig}
+import Tylower.{TyDiag, TyLower, new_lower, new_table}
 
 ## The diagnostics of type checking, sorted by module and start position (stable), as the
 ## reference reports them. Those without a location come first.
 pub fn check(program: Program) -> List[TyDiag] {
   table = new_table(program)
-  (_, diags) = Signature.collect(program, table)
-  diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
+  (sigs, diags) = Signature.collect(program, table)
+  groups = Groups.groups(program, sigs)
+  (_, lowered) = State.run(new_lower(program, table, []), || {
+    groups.fold(sigs, |known, group| {
+      Body.infer_group(program, table, known, group).fold(
+        known,
+        |acc, (def, sig)| insert_sig(acc, def, sig),
+      )
+    })
+  })
+  diags.append(lowered.diags.reverse()).sort_by(|a, b| Ord.compare(position(a), position(b)))
 }
 
 fn position(d: TyDiag) -> (Int, Int, Int) {

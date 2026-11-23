@@ -1,0 +1,434 @@
+## The order in which definition bodies are inferred. Follows `groups` and `body_refs` of
+## `check.rs` in the reference type checker.
+##
+## Definitions (fns with bodies, consts, handlers, layers, trait default implementations and impl
+## functions with signatures) form a graph with edges to the definitions their bodies refer to.
+## Strongly connected components (groups that refer to each other) are inferred callees first
+## (Tarjan). Definitions without a declared type are generalized once their group is inferred, so
+## recursion between them is not polymorphic.
+import Std.Map.{Map}
+import Std.State.{State}
+import Hir.{
+  Program,
+  DefKind,
+  FnKind,
+  TypeParamKind,
+  SourceModule,
+  Res,
+  ResDef,
+  Span,
+  TPath,
+  Item,
+  IFn,
+  ITraitFn,
+  IConst,
+  IHandler,
+  ILayer,
+  IImpl,
+  ImplFn,
+  Block,
+  SLet,
+  SLocalFn,
+  SExpr,
+  StrPart,
+  Arm,
+  SInterp,
+  WithItem,
+  ExprKind,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  PConst,
+  PCtor,
+  PTuple,
+  PList,
+}
+import Signature.{Signatures}
+import Tylower.{def_of}
+
+## The impl that defines the impl function `def`, and the function.
+pub fn impl_fn(program: Program, def: Int) -> Option[(Int, ImplFn)] {
+  def_of(program, def).parent.and_then(|owner| {
+    program.items.get(owner) match {
+      Some(IImpl(i)) -> i.fns.find(|f| f.def == def).map(|f| (owner, f))
+      _              -> None
+    }
+  })
+}
+
+## The definitions to infer, in groups that refer to each other, callees first. Within a group,
+## in definition order.
+pub fn groups(program: Program, sigs: Signatures) -> List[List[Int]] {
+  has_sig = |def: Int| Signature.get(sigs, def).is_some()
+  nodes = program.defs.keys().filter(|def| {
+    program.items.get(def) match {
+      Some(IFn(f))      -> f.body.is_some()
+      Some(ITraitFn(f)) -> f.body.is_some() && has_sig(def)
+      Some(IConst(_))   -> True
+      Some(IHandler(_)) -> True
+      # The arguments of a layer's items are inferred, as the value of a const.
+      Some(ILayer(_))   -> True
+      # An impl function without a signature (its impl or trait function has an error) is not
+      # inferred.
+      _ -> impl_fn(program, def) match {
+        Some((_, f)) -> f.body.is_some() && has_sig(def)
+        None         -> False
+      }
+    }
+  })
+  is_node = nodes.fold(Map.empty(), |m, d| m.insert(d, True))
+  # A method call `x.f(...)` gets an edge to every fn named f without a declared type that can be
+  # called as a method: the callee is known only during inference.
+  methods = nodes.fold(Map.empty(), |m, def| {
+    if !has_sig(def) && may_be_method(program, def) {
+      name = def_of(program, def).name
+      m.insert(name, m.get(name).or([]).append([def]))
+    } else {
+      m
+    }
+  })
+  edges = nodes.fold(Map.empty(), |m, def| {
+    body = body_refs_and_methods(program, def)
+    refs = body.defs.flat_map(|(r, _)| {
+      program.items.get(r) match {
+        Some(ILayer(_)) -> flatten_layer(program, r)
+        _               -> [r]
+      }
+    })
+    all = refs.append(body.methods.flat_map(|name| methods.get(name).or([])))
+    kept = dedup(all.filter(|r| is_node.contains(r)))
+    m.insert(def, kept)
+  })
+  strongly_connected(nodes, edges)
+}
+
+## Removes consecutive duplicates.
+fn dedup(xs: List[Int]) -> List[Int] {
+  xs.fold([], |acc, x| {
+    acc match {
+      [y, ..] if y == x -> acc
+      _                 -> [x, ..acc]
+    }
+  }).reverse()
+}
+
+## A top-level fn whose first parameter is written as a named type (not a type parameter) defined
+## by the fn's own module.
+fn may_be_method(program: Program, def: Int) -> Bool {
+  program.items.get(def) match {
+    Some(IFn(f)) -> f.sig.params.head().and_then(|p| p.ty).and_then(
+      |t| program.types.get(t),
+    ) match {
+      Some(r) -> r.kind match {
+        TPath(ResDef(d), _) -> {
+          own = def_of(program, def).module match {
+            SourceModule(m) -> defining_module(program, d) == Some(m)
+            _               -> False
+          }
+          def_of(program, d).kind != TypeParamKind && own
+        }
+        _ -> False
+      }
+      None -> False
+    }
+    _ -> False
+  }
+}
+
+## The module that defines the type whose head is `head`. The built-in types and the types of the
+## Prelude have their functions in the core module of the same name (`List`, `String`, `Option`).
+pub fn defining_module(program: Program, head: Int) -> Option[Int] {
+  data = def_of(program, head)
+  own = data.module match {
+    SourceModule(m) -> program.modules.get(m) match {
+      Some(items) if !(items.is_core && items.name == ["Prelude"]) -> Some(m)
+      _                                                            -> None
+    }
+    _ -> None
+  }
+  own match {
+    Some(m) -> Some(m)
+    None -> program.modules.to_list().find(|(_, m)| m.is_core && m.name == [data.name]).map(
+      |(id, _)| id,
+    )
+  }
+}
+
+## The handlers of a layer, flattened in source order. Stops at the second encounter of layers
+## that include each other.
+pub fn flatten_layer(program: Program, lay: Int) -> List[Int] {
+  flatten_in(program, lay, [])
+}
+
+fn flatten_in(program: Program, lay: Int, visiting: List[Int]) -> List[Int] {
+  if visiting.any(|v| v == lay) {
+    []
+  } else {
+    program.items.get(lay) match {
+      Some(ILayer(item)) -> item.members.flat_map(|m| {
+        m.res match {
+          ResDef(d) -> program.items.get(d) match {
+            Some(IHandler(_)) -> [d]
+            Some(ILayer(_))   -> flatten_in(program, d, [lay, ..visiting])
+            _                 -> []
+          }
+          _ -> []
+        }
+      })
+      _ -> []
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# References of bodies
+
+## What a body refers to: definitions with the spans of the references, and the names of method
+## calls (`x.f(...)`), whose callees are known only after type inference. Newest first while
+## collecting.
+type Refs(defs: List[(Int, Span)], methods: List[String])
+
+## The definitions referred to in a definition's body, in source order.
+pub fn body_refs(program: Program, def: Int) -> List[(Int, Span)] {
+  body_refs_and_methods(program, def).defs
+}
+
+fn body_refs_and_methods(program: Program, def: Int) -> Refs {
+  empty = Refs([], [])
+  out = program.items.get(def) match {
+    Some(IFn(f)) -> f.body.map(|b| expr_refs(program, b, empty)).or(empty)
+    Some(ITraitFn(f)) -> f.body.map(|b| expr_refs(program, b, empty)).or(empty)
+    Some(IConst(c)) -> expr_refs(program, c.value, empty)
+    Some(ILayer(l)) -> l.members.fold(empty, |acc, m| {
+      m.args.map(|a| a.args.fold(acc, |acc2, arg| expr_refs(program, arg.value, acc2))).or(acc)
+    })
+    Some(IHandler(h)) -> {
+      bodies = h.init.map(|i| [i]).or([]).append(h.release.map(|(_, b)| [b]).or([])).append(
+        h.ops.filter_map(|op| op.body),
+      )
+      inner = bodies.fold(empty, |acc, b| expr_refs(program, b, acc))
+      # The requirements of inner handlers are the outer handler's (`[effect.handler]`).
+      def_of(program, def).span match {
+        Some(span) -> h.inner.fold(inner, |acc, i| Refs(defs: [(i, span), ..acc.defs], ..acc))
+        None       -> inner
+      }
+    }
+    _ -> impl_fn(program, def).and_then(|(_, f)| f.body).map(|b| expr_refs(program, b, empty)).or(
+      empty,
+    )
+  }
+  Refs(out.defs.reverse(), out.methods.reverse())
+}
+
+fn push_def(out: Refs, def: Int, span: Span) -> Refs {
+  Refs(defs: [(def, span), ..out.defs], ..out)
+}
+
+fn exprs_refs(program: Program, exprs: List[Int], out: Refs) -> Refs {
+  exprs.fold(out, |acc, e| expr_refs(program, e, acc))
+}
+
+fn expr_refs(program: Program, expr: Int, out: Refs) -> Refs {
+  go = |e: Int, o: Refs| expr_refs(program, e, o)
+  program.exprs.get(expr) match {
+    None -> out
+    Some(e) -> e.kind match {
+      EPath(ResDef(d))     -> push_def(out, d, e.span)
+      EMissing             -> out
+      ELit(_)              -> out
+      EPath(_)             -> out
+      EUnit                -> out
+      EUse(_, _)           -> out
+      EInterpolated(parts) -> parts.fold(out, |acc, p| {
+        p match {
+          SInterp(x) -> go(x, acc)
+          _          -> acc
+        }
+      })
+      EField(base, _)      -> go(base, out)
+      ECall(callee, args) -> {
+        named = program.exprs.get(callee).map(|c| c.kind) match {
+          Some(EField(_, name)) -> Refs(methods: [name.name, ..out.methods], ..out)
+          _                     -> out
+        }
+        exprs_refs(program, args.map(|a| a.value), go(callee, named))
+      }
+      EUnary(_, operand)   -> go(operand, out)
+      EBinary(_, lhs, rhs) -> go(rhs, go(lhs, out))
+      ETuple(elems)        -> exprs_refs(program, elems, out)
+      EList(elems, rest) -> {
+        o = exprs_refs(program, elems, out)
+        rest.map(|r| go(r, o)).or(o)
+      }
+      EBlock(block)        -> block_refs(program, block, out)
+      EIf(c, t, el) -> {
+        o = go(t, go(c, out))
+        el.map(|x| go(x, o)).or(o)
+      }
+      EMatch(s, arms)      -> arms_refs(program, arms, go(s, out))
+      EEscape(s, arms)     -> arms_refs(program, arms, go(s, out))
+      EFail(x)             -> go(x, out)
+      EAssert(x)           -> go(x, out)
+      EUpdate(ctor, fields, base) -> go(
+        base,
+        exprs_refs(program, fields.map(|f| f.value), go(ctor, out)),
+      )
+      EWith(items, body) -> {
+        o = items.fold(out, |acc, item| {
+          heads = [(item.res, item.span)].append(item.by.map(|b| [b]).or([]))
+          a1 = heads.fold(acc, |a, (res, span)| {
+            res match {
+              ResDef(h) -> push_def(a, h, span)
+              _         -> a
+            }
+          })
+          exprs_refs(program, item_args(item), a1)
+        })
+        go(body, o)
+      }
+      ELambda(_, body)     -> go(body, out)
+    }
+  }
+}
+
+## The arguments written on an item of `with`: those of the handler's init, then those of the
+## provider plugged into a label.
+pub fn item_args(item: WithItem) -> List[Int] {
+  [item.args, item.by_init_args].flat_map(|a| a.map(|s| s.args.map(|arg| arg.value)).or([]))
+}
+
+fn arms_refs(program: Program, arms: List[Arm], out: Refs) -> Refs {
+  arms.fold(out, |acc, arm| {
+    a1 = pat_refs(program, arm.pat, acc)
+    a2 = arm.guard.map(|g| expr_refs(program, g, a1)).or(a1)
+    expr_refs(program, arm.body, a2)
+  })
+}
+
+fn block_refs(program: Program, block: Block, out: Refs) -> Refs {
+  o = block.stmts.fold(out, |acc, stmt| {
+    stmt match {
+      SLet(pat, _, value) -> expr_refs(program, value, pat_refs(program, pat, acc))
+      SLocalFn(f)         -> expr_refs(program, f.body, acc)
+      SExpr(e)            -> expr_refs(program, e, acc)
+    }
+  })
+  block.tail.map(|t| expr_refs(program, t, o)).or(o)
+}
+
+## The consts referred to in a pattern.
+fn pat_refs(program: Program, pat: Int, out: Refs) -> Refs {
+  program.pats.get(pat) match {
+    None -> out
+    Some(p) -> p.kind match {
+      PConst(ResDef(d)) -> push_def(out, d, p.span)
+      PCtor(_, args, _) -> args.or([]).fold(out, |acc, a| pat_refs(program, a.pat, acc))
+      PTuple(pats)      -> pats.fold(out, |acc, q| pat_refs(program, q, acc))
+      PList(elems, _)   -> elems.fold(out, |acc, q| pat_refs(program, q, acc))
+      _                 -> out
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Strongly connected components (Tarjan)
+
+type Tarjan(
+  edges: Map[Int, List[Int]],
+  index: Map[Int, Int],
+  low: Map[Int, Int],
+  on_stack: Map[Int, Bool],
+  stack: List[Int],
+  next: Int,
+  ## Newest first.
+  found: List[List[Int]],
+)
+
+## The strongly connected components, each sorted in definition order. A component comes after
+## every component reachable from it.
+pub fn strongly_connected(nodes: List[Int], edges: Map[Int, List[Int]]) -> List[List[Int]] {
+  start = Tarjan(edges, Map.empty(), Map.empty(), Map.empty(), [], 0, [])
+  (_, t) = State.run(start, || {
+    nodes.each(|v| {
+      if !(use State[Tarjan]).get().index.contains(v) {
+        visit(v)
+      }
+    })
+  })
+  t.found.reverse()
+}
+
+fn tj() -> Tarjan uses { State[Tarjan] } {
+  (use State[Tarjan]).get()
+}
+
+fn tupd(f: fn(Tarjan) -> Tarjan) -> () uses { State[Tarjan] } {
+  s = use State[Tarjan]
+  s.set(f(s.get()))
+}
+
+fn visit(v: Int) -> () uses { State[Tarjan] } {
+  tupd(|t| {
+    Tarjan(
+      index: t.index.insert(v, t.next),
+      low: t.low.insert(v, t.next),
+      next: t.next + 1,
+      stack: [v, ..t.stack],
+      on_stack: t.on_stack.insert(v, True),
+      ..t,
+    )
+  })
+  tj().edges.get(v).or([]).each(|w| {
+    if !tj().index.contains(w) {
+      visit(w)
+      t = tj()
+      low = min(t.low.get(v).or(0), t.low.get(w).or(0))
+      tupd(|t2| Tarjan(low: t2.low.insert(v, low), ..t2))
+    } else if tj().on_stack.get(w).or(False) {
+      t = tj()
+      low = min(t.low.get(v).or(0), t.index.get(w).or(0))
+      tupd(|t2| Tarjan(low: t2.low.insert(v, low), ..t2))
+    }
+  })
+  t = tj()
+  if t.low.get(v) == t.index.get(v) {
+    (group, rest) = pop_until(t.stack, v, [])
+    tupd(
+      |t2| Tarjan(
+        stack: rest,
+        on_stack: group.fold(t2.on_stack, |m, w| m.insert(w, False)),
+        found: [group.sort(), ..t2.found],
+        ..t2,
+      ),
+    )
+  }
+}
+
+fn pop_until(stack: List[Int], v: Int, acc: List[Int]) -> (List[Int], List[Int]) {
+  stack match {
+    []          -> (acc, [])
+    [w, ..rest] -> if w == v { ([w, ..acc], rest) } else { pop_until(rest, v, [w, ..acc]) }
+  }
+}
+
+fn min(a: Int, b: Int) -> Int {
+  if a < b { a } else { b }
+}

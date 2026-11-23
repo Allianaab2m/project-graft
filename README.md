@@ -94,7 +94,11 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
      the corpus and on the 39 inputs of the name resolution tests of emela-resolve, taken into
      `test_data/resolve`.
   3. Type checking, from monomorphic expressions to polymorphism, effects and error sets (E03xx,
-     E04xx).
+     E04xx). In progress, on the corpus and the 214 inputs of the tests of emela-types
+     (`test_data/types`): the declared signatures, and the types of bodies (expressions,
+     patterns, calls, method calls through the module of a type, handlers and `with` items)
+     report the same diagnostics as `emela check`. Not yet: solving error and effect sets,
+     traits, match coverage, and captures.
 
   The corpus for M3 is what is written to be checked: the 87 programs of
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of

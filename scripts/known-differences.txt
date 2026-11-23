@@ -1,4 +1,3 @@
 # Inputs where Graft is known to differ from the reference, as `<mode> <path> <why>`: for
 # scripts/compare.sh a path relative to the emela checkout, for scripts/check.sh (mode `check`) a
 # unit as the script lists it. Both report them apart and do not fail on them.
-check test_data/types/effects_declaration_sets E0221 on a parameter type of a fn without a declared signature, which body inference reports (not ported yet)

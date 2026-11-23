@@ -1031,3 +1031,13 @@ pub fn has_omitted(program: Program, ty: Int, effects: Bool) -> Bool {
     _                    -> False
   }
 }
+
+## Forgets the sets collected for the omitted clauses of a local fn's parameter types.
+pub fn reset_local_sets() -> () uses { State[TyLower] } {
+  upd(|l| TyLower(local_fails: EMPTY_ROW, local_uses: EMPTY_ROW, ..l))
+}
+
+pub fn report_warning(span: Option[Span], code: String, message: String) -> ()
+  uses { State[TyLower] } {
+  upd(|l| TyLower(diags: [TyDiag(span, code, message, True), ..l.diags], ..l))
+}
