@@ -157,7 +157,7 @@ fn build_js(path: String, core: String, runtime: String, out: String) -> ExitCod
   analysis = Pipeline.analyze(path, core)
   errors = analysis.diagnostics.filter(|d| d.severity == "error")
   (errors, analysis.typed) match {
-    ([], Some(typed)) -> Lower.lower(typed, analysis.entry) match {
+    ([], Some(typed)) -> Lower.lower(typed, analysis.entry, analysis.sources) match {
       LoweredModule(module) -> {
         fs = use FileSystem
         fs.create_directory(out) escape { _ -> () }

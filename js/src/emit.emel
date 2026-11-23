@@ -185,6 +185,8 @@ const RUNTIME: List[String] = [
   "$foreign",
   "$constant",
   "$Fail",
+  "$assertFail",
+  "$assertCmp",
 ]
 
 ## The JS module of `module`.
@@ -497,6 +499,37 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
       v = value_of(e)
       propagate("new $Fail(#{v})")
     }
+    Ir.XAssertBool(cond, text) -> {
+      c = value_of(cond)
+      line("if (!#{c}) {")
+      indented(|| line("$assertFail(#{quote(text)});"))
+      line("}")
+      deliver(dest, "undefined")
+    }
+    Ir.XAssertCmp(op, op_ty, ty, lhs, rhs, text) -> {
+      # Both sides are used twice (compare and show), so they are bound to temporaries.
+      operands = values_in_order([lhs, rhs]).map(|v| {
+        t = tmp()
+        line("const #{t} = #{v};")
+        t
+      })
+      l = operands.get(0).or("undefined")
+      r = operands.get(1).or("undefined")
+      op_text = op match {
+        BEq -> "=="
+        BNe -> "!="
+        BLt -> "<"
+        BLe -> "<="
+        BGt -> ">"
+        _   -> ">="
+      }
+      line("if (!#{binary(op, op_ty, l, r)}) {")
+      left = show_call(module, ty, l)
+      right = show_call(module, ty, r)
+      indented(|| line("$assertCmp(#{quote(text)}, #{quote(op_text)}, #{left}, #{right});"))
+      line("}")
+      deliver(dest, "undefined")
+    }
     XCall(Direct(g, _), args, _, _) if dest == DReturn && em().tail.map(|t| t.f == g).or(False) -> {
       temps = em().tail.map(|t| t.temps).or([])
       vs = values_in_order(args)
@@ -529,13 +562,15 @@ fn discard(expr: Expr) -> () uses { State[Em] } {
 
 fn needs_statements(expr: Expr) -> Bool {
   expr match {
-    XLet(_, _, _) -> True
-    XSeq(_, _)    -> True
-    XIf(_, _, _)  -> True
-    XMatch(_, _)  -> True
-    XEscape(_, _) -> True
-    XFail(_)      -> True
-    _             -> False
+    XLet(_, _, _)                   -> True
+    XSeq(_, _)                      -> True
+    XIf(_, _, _)                    -> True
+    XMatch(_, _)                    -> True
+    XEscape(_, _)                   -> True
+    XFail(_)                        -> True
+    Ir.XAssertBool(_, _)            -> True
+    Ir.XAssertCmp(_, _, _, _, _, _) -> True
+    _                               -> False
   }
 }
 

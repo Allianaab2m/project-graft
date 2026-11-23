@@ -185,6 +185,10 @@ pub enum Expr {
   XEscape(body: Expr, arms: List[Arm])
   ## Seq of statements whose values are dropped, then a value.
   XSeq(first: Expr, rest: Expr)
+  ## `assert cond`, a defect if false. `text` is the source text of the condition.
+  XAssertBool(cond: Expr, text: String)
+  ## `assert lhs op rhs` on values of type `ty`, which shows both sides if false.
+  XAssertCmp(op: BinOp, op_ty: OpTy, ty: Type, lhs: Expr, rhs: Expr, text: String)
 }
 
 pub enum Callee {

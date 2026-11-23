@@ -33,7 +33,8 @@ for name in "${names[@]}"; do
     echo "BUILD FAILS $name: $(head -1 "$work/$name.build")"
     continue
   fi
-  (cd "$out" && node --input-type=module -e "$launcher" -- "$out/main.mjs" \
+  # At most 20 seconds per program (perl's alarm, as macOS has no `timeout`).
+  (cd "$out" && perl -e 'alarm 20; exec @ARGV' node --input-type=module -e "$launcher" -- "$out/main.mjs" \
     >"$work/$name.stdout" 2>"$work/$name.stderr")
   code=$?
   {

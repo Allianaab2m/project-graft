@@ -10,6 +10,7 @@
 ##
 ## Not lowered yet: traits, errors, effects, suspension, consts. What cannot be lowered is
 ## reported, and the build stops.
+import Std.Array.{Array}
 import Std.Map.{Map}
 import Std.State.{State}
 import Check.Hir.{
@@ -215,6 +216,7 @@ type Lowering(
   next_local: Int,
   ## Newest first.
   errors: List[String],
+  sources: Map[Int, Array[Int]],
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -236,7 +238,11 @@ fn set_module(f: fn(Module) -> Module) -> () uses { State[Lowering] } {
 }
 
 ## Lowers the instances reachable from the entry's `main`.
-pub fn lower(checked: Typeck.Checked, entry: Option[Int]) -> Lowered {
+pub fn lower(
+  checked: Typeck.Checked,
+  entry: Option[Int],
+  sources: Map[Int, Array[Int]],
+) -> Lowered {
   program = checked.program
   main = entry.and_then(|m| program.modules.get(m)).and_then(|items| {
     items.items.find(|d| def_of(program, d).name == "main" && def_of(program, d).kind == FnKind)
@@ -244,7 +250,18 @@ pub fn lower(checked: Typeck.Checked, entry: Option[Int]) -> Lowered {
   main match {
     None -> LowerErrors(["the entry has no `main`"])
     Some(root) -> {
-      start = Lowering(program, checked, empty_module(), Map.empty(), [], [], Map.empty(), 0, [])
+      start = Lowering(
+        program,
+        checked,
+        empty_module(),
+        Map.empty(),
+        [],
+        [],
+        Map.empty(),
+        0,
+        [],
+        sources,
+      )
       (_, done) = State.run(start, || {
         instance(root, [])
         drain()
@@ -624,8 +641,8 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
         locals = params.map(|p| new_local(p.local))
         XLambda(locals, expr_type(expr), lower_expr(body), False)
       }
-      Hir.EUpdate(_, _, _)  -> unsupported("a record update")
-      Hir.EAssert(_)        -> unsupported("assert")
+      Hir.EUpdate(ctor, _, base) -> lower_update(expr, ctor, base)
+      Hir.EAssert(cond)     -> lower_assert(cond)
       Hir.EFail(inner)      -> XFail(lower_expr(inner))
       Hir.EEscape(inner, arms) -> {
         body = lower_expr(inner)
@@ -642,6 +659,64 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
       _                     -> unsupported("this kind of expression")
     }
   }
+}
+
+## `C(f: e, ..base)`: the written fields in order, then the others from `base`, evaluated once.
+fn lower_update(expr: Int, ctor: Int, base: Int) -> Expr uses { State[Lowering] } {
+  program = st().program
+  slots = st().checked.types.calls.get(expr).or([])
+  ctor_def = program.exprs.get(ctor).map(|c| c.kind) match {
+    Some(EPath(ResDef(d))) -> Some(d)
+    _                      -> None
+  }
+  ctor_def match {
+    None -> unsupported("this record update")
+    Some(d) -> {
+      ref = ctor_ref(d)
+      written = slots.map(|s| s.map(lower_expr))
+      b = lower_expr(base)
+      bound = fresh_local("base", expr_type(base), None)
+      args = written.enumerate().map(|(i, w)| w.or(XField(XVar(bound), ref, i)))
+      XLet(bound, b, XCtor(ref, enum_args(expr), args))
+    }
+  }
+}
+
+## `assert`: a comparison shows both sides when it is false (spec 13.2).
+fn lower_assert(cond: Int) -> Expr uses { State[Lowering] } {
+  program = st().program
+  text = program.exprs.get(cond).map(|e| source_text(e.span)).or("")
+  comparison = program.exprs.get(cond).map(|e| e.kind) match {
+    Some(EBinary(op, lhs, rhs)) -> {
+      bin = op match {
+        OpEq -> Some(BEq)
+        OpNe -> Some(BNe)
+        OpLt -> Some(BLt)
+        OpLe -> Some(BLe)
+        OpGt -> Some(BGt)
+        OpGe -> Some(BGe)
+        _    -> None
+      }
+      bin.map(|b| (b, lhs, rhs))
+    }
+    _ -> None
+  }
+  comparison match {
+    Some((b, lhs, rhs)) -> {
+      ty = expr_type(lhs)
+      l = lower_expr(lhs)
+      r = lower_expr(rhs)
+      Ir.XAssertCmp(b, op_ty(ty), ty, l, r, text)
+    }
+    None -> Ir.XAssertBool(lower_expr(cond), text)
+  }
+}
+
+## The source text of a span.
+fn source_text(span: Hir.Span) -> String uses { State[Lowering] } {
+  st().sources.get(span.module).map(|src| {
+    String.concat(src.slice(span.start, span.end).to_list().filter_map(String.from_code_point))
+  }).or("")
 }
 
 ## A reference to a definition as a value: a constructor without fields, a constructor or fn as a
@@ -669,7 +744,19 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
       callable(expr, def) match {
         Some(f) if data.kind == Hir.ConstKind -> XCall(Direct(f, []), [], False, False)
         Some(f)                               -> XFn(f, [])
-        None                                  -> unsupported("a reference to #{def_name(def)}")
+        None -> {
+          # An intrinsic as a function value: a closure calling the builtin.
+          fn_ty = expr_type(expr)
+          ptys = fn_ty match {
+            CFn(f) -> f.params
+            _      -> []
+          }
+          locals = ptys.map(|t| fresh_local("x", t, None))
+          builtin_call(expr, def, locals.map(XVar)) match {
+            Some(b) -> XLambda(locals, fn_ty, b, False)
+            None    -> unsupported("a reference to #{def_name(def)}")
+          }
+        }
       }
     }
   }

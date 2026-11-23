@@ -133,13 +133,22 @@ pub type Analysis(
   entry: Option[Int],
   library_only: Bool,
   files: Map[Int, String],
+  ## The source of each module read, as code points.
+  sources: Map[Int, Array[Int]],
 )
 
 pub fn analyze(path: String, core_lib: String) -> Analysis uses { FileSystem } {
   given = normalize(path)
   input(given) match {
-    Rejected(code) -> Analysis([Checked("error", code, "-", None)], None, None, False, Map.empty())
-    Resolved(inp)  -> check_input(inp, core_lib)
+    Rejected(code) -> Analysis(
+      [Checked("error", code, "-", None)],
+      None,
+      None,
+      False,
+      Map.empty(),
+      Map.empty(),
+    )
+    Resolved(inp) -> check_input(inp, core_lib)
   }
 }
 
@@ -224,7 +233,7 @@ fn check_input(inp: Input, core_lib: String) -> Analysis uses { FileSystem } {
   files = List.range(0, count).fold(Map.empty(), |m, i| {
     get(map, i).map(|d| m.insert(i, d.file)).or(m)
   })
-  Analysis(diagnostics, typed, entry, inp.library_only, files)
+  Analysis(diagnostics, typed, entry, inp.library_only, files, reads.map_values(|r| r.src))
 }
 
 fn normalize(path: String) -> String {
