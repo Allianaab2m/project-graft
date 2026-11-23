@@ -1,0 +1,516 @@
+## Splits a source into tokens, keeping trivia. Follows `[lex]` and `[grammar.lex]` of the
+## specification and the token boundaries of the reference implementation (emela-syntax).
+##
+## The source is read as an array of code points, and token positions count code points.
+## Diagnostics are not reported yet.
+import Std.Array.{Array}
+import Token.{
+  Kind,
+  Token,
+  Whitespace,
+  Newline,
+  Comment,
+  DocComment,
+  IntLit,
+  FloatLit,
+  StringQuote,
+  TripleQuote,
+  StringText,
+  InterpStart,
+  InterpEnd,
+  LowerName,
+  TypeName,
+  UpperName,
+  Underscore,
+  FnKw,
+  TypeKw,
+  EnumKw,
+  ErrorKw,
+  ConstKw,
+  TraitKw,
+  ImplKw,
+  EffectKw,
+  HandlerKw,
+  LayerKw,
+  ImportKw,
+  PubKw,
+  OpaqueKw,
+  SuspendKw,
+  IfKw,
+  ElseKw,
+  MatchKw,
+  FailKw,
+  EscapeKw,
+  UseKw,
+  WithKw,
+  AssertKw,
+  SelfKw,
+  SelfTypeKw,
+  AsKw,
+  ReservedKw,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  Comma,
+  Dot,
+  Dot2,
+  Colon,
+  Eq,
+  ThinArrow,
+  Pipe,
+  PipeGt,
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  Percent,
+  Bang,
+  Eq2,
+  Neq,
+  Lt,
+  LtEq,
+  LeftArrow,
+  Gt,
+  GtEq,
+  Amp2,
+  Pipe2,
+  At,
+  ErrorToken,
+}
+
+const TAB = 0x09
+const LF = 0x0A
+const CR = 0x0D
+const SPACE = 0x20
+const BANG = 0x21
+const QUOTE = 0x22
+const HASH = 0x23
+const PERCENT = 0x25
+const AMP = 0x26
+const L_PAREN = 0x28
+const R_PAREN = 0x29
+const STAR = 0x2A
+const PLUS = 0x2B
+const COMMA = 0x2C
+const MINUS = 0x2D
+const DOT = 0x2E
+const SLASH = 0x2F
+const COLON = 0x3A
+const LT = 0x3C
+const EQ = 0x3D
+const GT = 0x3E
+const AT = 0x40
+const L_BRACK = 0x5B
+const BACKSLASH = 0x5C
+const R_BRACK = 0x5D
+const UNDERSCORE = 0x5F
+const L_BRACE = 0x7B
+const PIPE = 0x7C
+const R_BRACE = 0x7D
+
+## What the lexer is inside. The bottom of the stack is always Code.
+enum Mode {
+  Code
+  Str
+  MultiStr
+  ## An interpolation, with the number of `{` open inside it.
+  Interp(Int)
+}
+
+## The result of one step: the token read (if any), the next position and the modes after it.
+type Step(tokens: List[Token], next: Int, modes: List[Mode])
+
+pub fn lex(text: String) -> List[Token] {
+  tokens(Array.from_list(String.code_points(text)))
+}
+
+pub fn tokens(src: Array[Int]) -> List[Token] {
+  List.reverse(run(src, 0, [Code], []))
+}
+
+## The text of the code points from `start` to `end`.
+pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
+  Array.slice(src, start, end)
+    |> Array.to_list
+    |> List.filter_map(String.from_code_point)
+    |> String.concat
+}
+
+fn run(src: Array[Int], pos: Int, modes: List[Mode], acc: List[Token]) -> List[Token] {
+  if pos >= Array.size(src) {
+    acc
+  } else {
+    step = modes match {
+      [Str, ..]      -> string_step(src, pos, modes)
+      [MultiStr, ..] -> multi_string_step(src, pos, modes)
+      _              -> code_step(src, pos, modes)
+    }
+    run(src, step.next, step.modes, List.append(List.reverse(step.tokens), acc))
+  }
+}
+
+## The code point at `i`, or -1 past the end.
+fn at(src: Array[Int], i: Int) -> Int {
+  Array.get(src, i) match {
+    Some(c) -> c
+    None    -> -1
+  }
+}
+
+## The first position from `i` whose code point does not satisfy `f`.
+fn skip_while(src: Array[Int], i: Int, f: fn(Int) -> Bool) -> Int {
+  c = at(src, i)
+  if c >= 0 && f(c) { skip_while(src, i + 1, f) } else { i }
+}
+
+fn one(kind: Kind, start: Int, end: Int, modes: List[Mode]) -> Step {
+  Step([Token(kind, start, end)], end, modes)
+}
+
+fn pop(modes: List[Mode]) -> List[Mode] {
+  List.tail(modes)
+}
+
+# Code
+
+fn code_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
+  (kind, end) = scan_code(src, pos)
+  kind match {
+    StringQuote -> one(StringQuote, pos, end, [Str, ..modes])
+    TripleQuote -> one(TripleQuote, pos, end, [MultiStr, ..modes])
+    LBrace -> modes match {
+      [Interp(depth), ..rest] -> one(LBrace, pos, end, [Interp(depth + 1), ..rest])
+      _                       -> one(LBrace, pos, end, modes)
+    }
+    RBrace -> modes match {
+      [Interp(0), ..rest]     -> one(InterpEnd, pos, end, rest)
+      [Interp(depth), ..rest] -> one(RBrace, pos, end, [Interp(depth - 1), ..rest])
+      _                       -> one(RBrace, pos, end, modes)
+    }
+    _           -> one(kind, pos, end, modes)
+  }
+}
+
+fn scan_code(src: Array[Int], pos: Int) -> (Kind, Int) {
+  c = at(src, pos)
+  next = at(src, pos + 1)
+  if is_blank(c) {
+    (Whitespace, skip_while(src, pos + 1, is_blank))
+  } else if c == LF {
+    (Newline, pos + 1)
+  } else if c == CR {
+    if next == LF { (Newline, pos + 2) } else { (ErrorToken, pos + 1) }
+  } else if c == HASH {
+    kind = if next == HASH { DocComment } else { Comment }
+    (kind, skip_while(src, pos + 1, |d| d != LF && d != CR))
+  } else if is_word_start(c) {
+    end = skip_while(src, pos + 1, is_word)
+    (classify_word(slice(src, pos, end)), end)
+  } else if is_digit(c) {
+    scan_number(src, pos)
+  } else if c == QUOTE {
+    if next == QUOTE && at(src, pos + 2) == QUOTE {
+      (TripleQuote, pos + 3)
+    } else {
+      (StringQuote, pos + 1)
+    }
+  } else {
+    scan_punct(src, pos, c, next)
+  }
+}
+
+fn scan_punct(src: Array[Int], pos: Int, c: Int, next: Int) -> (Kind, Int) {
+  single = |kind| (kind, pos + 1)
+  double = |kind| (kind, pos + 2)
+  c match {
+    L_PAREN -> single(LParen)
+    R_PAREN -> single(RParen)
+    L_BRACK -> single(LBrack)
+    R_BRACK -> single(RBrack)
+    L_BRACE -> single(LBrace)
+    R_BRACE -> single(RBrace)
+    COMMA   -> single(Comma)
+    COLON   -> single(Colon)
+    PLUS    -> single(Plus)
+    STAR    -> single(Star)
+    SLASH   -> single(Slash)
+    PERCENT -> single(Percent)
+    AT      -> single(At)
+    DOT     -> if next == DOT { double(Dot2) } else { single(Dot) }
+    EQ      -> if next == EQ { double(Eq2) } else { single(Eq) }
+    MINUS   -> if next == GT { double(ThinArrow) } else { single(Minus) }
+    BANG    -> if next == EQ { double(Neq) } else { single(Bang) }
+    GT      -> if next == EQ { double(GtEq) } else { single(Gt) }
+    LT -> next match {
+      EQ    -> double(LtEq)
+      MINUS -> double(LeftArrow)
+      _     -> single(Lt)
+    }
+    PIPE -> next match {
+      GT   -> double(PipeGt)
+      PIPE -> double(Pipe2)
+      _    -> single(Pipe)
+    }
+    AMP     -> if next == AMP { double(Amp2) } else { single(ErrorToken) }
+    _       -> single(ErrorToken)
+  }
+}
+
+## Numbers are cut by the longest of the following matches. A well-formed literal wins a tie
+## with a malformed chunk (`0xFF`, `1.0e9`).
+##
+## - an integer `[0-9][0-9_]*`, or `0x` / `0b` followed by its digits
+## - a float `[0-9][0-9_]*.[0-9][0-9_]*`, with an optional exponent
+## - a malformed chunk: a number followed directly by letters (`1e9` `3px` `0XFF`), or a hex or
+##   binary fraction (`0x1.5`)
+fn scan_number(src: Array[Int], pos: Int) -> (Kind, Int) {
+  int_end = skip_while(src, pos + 1, is_digit_)
+  first = at(src, pos)
+  prefix = at(src, pos + 1)
+  radix_end = if first == 0x30 && prefix == 0x78 && is_hex(at(src, pos + 2)) {
+    skip_while(src, pos + 3, |c| is_hex(c) || c == UNDERSCORE)
+  } else if first == 0x30 && prefix == 0x62 && is_bin(at(src, pos + 2)) {
+    skip_while(src, pos + 3, |c| is_bin(c) || c == UNDERSCORE)
+  } else {
+    -1
+  }
+  fraction_end = if at(src, int_end) == DOT && is_digit(at(src, int_end + 1)) {
+    skip_while(src, int_end + 2, is_digit_)
+  } else {
+    -1
+  }
+  float_end = if fraction_end < 0 { -1 } else { exponent_end(src, fraction_end) }
+  # A number followed by letters, with or without a fraction.
+  letters_after = |i| if i >= 0 && is_letter(at(src, i)) {
+    skip_while(src, i + 1, is_word)
+  } else {
+    -1
+  }
+  bad_fraction = if first == 0x30 && (prefix == 0x78 || prefix == 0x62) {
+    j = skip_while(src, pos + 2, is_word)
+    if at(src, j) == DOT && is_digit(at(src, j + 1)) {
+      skip_while(src, j + 2, is_word)
+    } else {
+      -1
+    }
+  } else {
+    -1
+  }
+  good = Int.max(int_end, radix_end)
+  bad = Int.max(Int.max(letters_after(int_end), letters_after(fraction_end)), bad_fraction)
+  if bad > Int.max(good, float_end) {
+    (ErrorToken, bad)
+  } else if float_end > good {
+    (FloatLit, float_end)
+  } else {
+    (IntLit, good)
+  }
+}
+
+## The end of a float that may have an exponent after `end`. An exponent without digits is not
+## part of it.
+fn exponent_end(src: Array[Int], end: Int) -> Int {
+  e = at(src, end)
+  if e == 0x65 || e == 0x45 {
+    sign = at(src, end + 1)
+    digits = if sign == PLUS || sign == MINUS { end + 2 } else { end + 1 }
+    if is_digit(at(src, digits)) { skip_while(src, digits + 1, is_digit_) } else { end }
+  } else {
+    end
+  }
+}
+
+## Classifies a word cut as `[A-Za-z_][A-Za-z0-9_]*` (`[lex.name]`, `[kw]`).
+fn classify_word(word: String) -> Kind {
+  word match {
+    "fn"      -> FnKw
+    "type"    -> TypeKw
+    "enum"    -> EnumKw
+    "error"   -> ErrorKw
+    "const"   -> ConstKw
+    "trait"   -> TraitKw
+    "impl"    -> ImplKw
+    "effect"  -> EffectKw
+    "handler" -> HandlerKw
+    "layer"   -> LayerKw
+    "import"  -> ImportKw
+    "pub"     -> PubKw
+    "opaque"  -> OpaqueKw
+    "suspend" -> SuspendKw
+    "if"      -> IfKw
+    "else"    -> ElseKw
+    "match"   -> MatchKw
+    "fail"    -> FailKw
+    "escape"  -> EscapeKw
+    "use"     -> UseKw
+    "with"    -> WithKw
+    "assert"  -> AssertKw
+    "self"    -> SelfKw
+    "Self"    -> SelfTypeKw
+    "as"      -> AsKw
+    "var"     -> ReservedKw
+    "return"  -> ReservedKw
+    "while"   -> ReservedKw
+    "loop"    -> ReservedKw
+    "let"     -> ReservedKw
+    "mut"     -> ReservedKw
+    "in"      -> ReservedKw
+    "where"   -> ReservedKw
+    "do"      -> ReservedKw
+    "try"     -> ReservedKw
+    "catch"   -> ReservedKw
+    "throw"   -> ReservedKw
+    "async"   -> ReservedKw
+    "yield"   -> ReservedKw
+    "defer"   -> ReservedKw
+    "macro"   -> ReservedKw
+    "mod"     -> ReservedKw
+    "_"       -> Underscore
+    _         -> classify_name(String.code_points(word))
+  }
+}
+
+fn classify_name(cs: List[Int]) -> Kind {
+  cs match {
+    [c, ..] if is_lower(c) || c == UNDERSCORE -> LowerName
+    [c, ..] if is_upper(c) -> {
+      if List.all(cs, |d| is_upper(d) || is_digit(d) || d == UNDERSCORE) {
+        UpperName
+      } else if List.all(cs, |d| is_letter(d) || is_digit(d)) {
+        TypeName
+      } else {
+        ErrorToken
+      }
+    }
+    _                                         -> ErrorToken
+  }
+}
+
+# Strings
+
+fn string_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
+  c = at(src, pos)
+  if c == QUOTE {
+    one(StringQuote, pos, pos + 1, pop(modes))
+  } else if c == HASH && at(src, pos + 1) == L_BRACE {
+    one(InterpStart, pos, pos + 2, [Interp(0), ..modes])
+  } else if c == LF || c == CR {
+    # An unterminated string. The newline is read again as code.
+    Step([], pos, pop(modes))
+  } else {
+    one(StringText, pos, scan_string_text(src, pos), modes)
+  }
+}
+
+## Stops before the closing `"`, an interpolation `#{`, a newline, or the end of the input.
+fn scan_string_text(src: Array[Int], i: Int) -> Int {
+  c = at(src, i)
+  if c < 0 || c == QUOTE || c == LF || c == CR {
+    i
+  } else if c == HASH && at(src, i + 1) == L_BRACE {
+    i
+  } else if c == BACKSLASH {
+    escape_end(src, i) match {
+      Some(next) -> scan_string_text(src, next)
+      None       -> i + 1
+    }
+  } else {
+    scan_string_text(src, i + 1)
+  }
+}
+
+fn multi_string_step(src: Array[Int], pos: Int, modes: List[Mode]) -> Step {
+  closing = if at(src, pos - 1) == LF { closing_indent(src, pos) } else { None }
+  closing match {
+    Some(indent) -> one(TripleQuote, pos, pos + indent + 3, pop(modes))
+    None -> {
+      if is_triple_quote(src, pos) {
+        one(TripleQuote, pos, pos + 3, pop(modes))
+      } else if at(src, pos) == HASH && at(src, pos + 1) == L_BRACE {
+        one(InterpStart, pos, pos + 2, [Interp(0), ..modes])
+      } else {
+        one(StringText, pos, scan_multiline_text(src, pos), modes)
+      }
+    }
+  }
+}
+
+## Stops before `"""` and `#{`, and at the start of a line holding only the closing `"""`.
+fn scan_multiline_text(src: Array[Int], i: Int) -> Int {
+  c = at(src, i)
+  if c < 0 || is_triple_quote(src, i) {
+    i
+  } else if c == HASH && at(src, i + 1) == L_BRACE {
+    i
+  } else if c == LF {
+    closing_indent(src, i + 1) match {
+      Some(_) -> i + 1
+      None    -> scan_multiline_text(src, i + 1)
+    }
+  } else if c == BACKSLASH {
+    # A `\` before a newline does not end the body.
+    scan_multiline_text(src, Option.or(escape_end(src, i), i + 1))
+  } else {
+    scan_multiline_text(src, i + 1)
+  }
+}
+
+## If the line from `i` holds only whitespace and `"""`, the width of the whitespace.
+fn closing_indent(src: Array[Int], i: Int) -> Option[Int] {
+  j = skip_while(src, i, is_blank)
+  if is_triple_quote(src, j) { Some(j - i) } else { None }
+}
+
+fn is_triple_quote(src: Array[Int], i: Int) -> Bool {
+  at(src, i) == QUOTE && at(src, i + 1) == QUOTE && at(src, i + 2) == QUOTE
+}
+
+## The end of the escape whose `\` is at `i`. None if nothing follows the `\` on its line.
+fn escape_end(src: Array[Int], i: Int) -> Option[Int] {
+  c = at(src, i + 1)
+  if c < 0 || c == LF || c == CR {
+    None
+  } else if c == 0x75 {
+    Some(unicode_escape_end(src, i))
+  } else {
+    Some(i + 2)
+  }
+}
+
+## A `\u{...}` ends after `}`. A malformed one ends at the last character read.
+fn unicode_escape_end(src: Array[Int], i: Int) -> Int {
+  after_u = i + 2
+  if at(src, after_u) != L_BRACE {
+    after_u
+  } else {
+    digits_end = skip_while(src, after_u + 1, is_hex)
+    if at(src, digits_end) == R_BRACE { digits_end + 1 } else { digits_end }
+  }
+}
+
+# Character classes
+
+fn is_blank(c: Int) -> Bool { c == SPACE || c == TAB }
+
+fn is_digit(c: Int) -> Bool { c >= 0x30 && c <= 0x39 }
+
+fn is_digit_(c: Int) -> Bool { is_digit(c) || c == UNDERSCORE }
+
+fn is_hex(c: Int) -> Bool {
+  is_digit(c) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
+}
+
+fn is_bin(c: Int) -> Bool { c == 0x30 || c == 0x31 }
+
+fn is_lower(c: Int) -> Bool { c >= 0x61 && c <= 0x7A }
+
+fn is_upper(c: Int) -> Bool { c >= 0x41 && c <= 0x5A }
+
+fn is_letter(c: Int) -> Bool { is_lower(c) || is_upper(c) }
+
+fn is_word_start(c: Int) -> Bool { is_letter(c) || c == UNDERSCORE }
+
+fn is_word(c: Int) -> Bool { is_letter(c) || is_digit(c) || c == UNDERSCORE }

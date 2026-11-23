@@ -1,0 +1,272 @@
+import Brix.Pbt.Gen
+import Brix.Pbt.Property
+import Std.Array
+import Lexer
+import Token.{
+  Kind,
+  Whitespace,
+  Newline,
+  Comment,
+  DocComment,
+  IntLit,
+  FloatLit,
+  StringQuote,
+  TripleQuote,
+  StringText,
+  InterpStart,
+  InterpEnd,
+  LowerName,
+  TypeName,
+  UpperName,
+  Underscore,
+  FnKw,
+  ReservedKw,
+  LParen,
+  RParen,
+  LBrace,
+  RBrace,
+  Dot,
+  Dot2,
+  Eq,
+  Eq2,
+  ThinArrow,
+  Pipe,
+  PipeGt,
+  Plus,
+  Minus,
+  LtEq,
+  GtEq,
+  Neq,
+  Amp2,
+  Pipe2,
+  At,
+  Lt,
+  LeftArrow,
+  ErrorToken,
+}
+
+fn kinds(src: String) -> List[Kind] {
+  List.map(Lexer.lex(src), |t| t.kind)
+}
+
+## The text of each token.
+fn texts(src: String) -> List[String] {
+  code_points = Array.from_list(String.code_points(src))
+  List.map(Lexer.lex(src), |t| Lexer.slice(code_points, t.start, t.end))
+}
+
+@test
+fn punctuation_is_cut_by_longest_match() {
+  assert kinds("|> || | -> - .. . == = <= >= != && @")
+    == [
+      PipeGt,
+      Whitespace,
+      Pipe2,
+      Whitespace,
+      Pipe,
+      Whitespace,
+      ThinArrow,
+      Whitespace,
+      Minus,
+      Whitespace,
+      Dot2,
+      Whitespace,
+      Dot,
+      Whitespace,
+      Eq2,
+      Whitespace,
+      Eq,
+      Whitespace,
+      LtEq,
+      Whitespace,
+      GtEq,
+      Whitespace,
+      Neq,
+      Whitespace,
+      Amp2,
+      Whitespace,
+      At,
+    ]
+  assert kinds("a<-1") == [LowerName, LeftArrow, IntLit]
+  assert kinds("a < -1") == [LowerName, Whitespace, Lt, Whitespace, Minus, IntLit]
+}
+
+@test
+fn comments_end_before_the_newline() {
+  assert kinds("# a\n## b\r\n") == [Comment, Newline, DocComment, Newline]
+  assert texts("# a\r\n") == ["# a", "\r\n"]
+}
+
+@test
+fn unrecognized_characters_are_one_token_each() {
+  assert kinds("( & ü )")
+    == [LParen, Whitespace, ErrorToken, Whitespace, ErrorToken, Whitespace, RParen]
+  assert kinds("a\rb") == [LowerName, ErrorToken, LowerName]
+}
+
+@test
+fn names_and_reserved_words() {
+  assert kinds("user_id User MAX_SIZE A _ fn return Http_client")
+    == [
+      LowerName,
+      Whitespace,
+      TypeName,
+      Whitespace,
+      UpperName,
+      Whitespace,
+      UpperName,
+      Whitespace,
+      Underscore,
+      Whitespace,
+      FnKw,
+      Whitespace,
+      ReservedKw,
+      Whitespace,
+      ErrorToken,
+    ]
+}
+
+@test
+fn numbers() {
+  assert kinds("42 1_000_000 3.14 1.0e9 2.5E-3")
+    == [
+      IntLit,
+      Whitespace,
+      IntLit,
+      Whitespace,
+      FloatLit,
+      Whitespace,
+      FloatLit,
+      Whitespace,
+      FloatLit,
+    ]
+  assert kinds("1..2") == [IntLit, Dot2, IntLit]
+  assert kinds("1.x") == [IntLit, Dot, LowerName]
+  assert kinds("0xFF 0xdead_BEEF 0b1010 0b1111_0000 0x0")
+    == [IntLit, Whitespace, IntLit, Whitespace, IntLit, Whitespace, IntLit, Whitespace, IntLit]
+  assert kinds("0b1..0x2") == [IntLit, Dot2, IntLit]
+}
+
+@test
+fn a_number_followed_by_letters_is_one_error() {
+  bad = [
+    "1e9",
+    "1.0e",
+    "3px",
+    "1.0e9x",
+    "0XFF",
+    "0B1",
+    "0o17",
+    "0x",
+    "0b",
+    "0xFG",
+    "0b102",
+    "0x_1",
+    "0x1.5",
+    "0b1.0",
+  ]
+  List.each(bad, |src| assert kinds(src) == [ErrorToken])
+  # A missing exponent digit makes everything up to the sign an error.
+  assert kinds("1.0e+") == [ErrorToken, Plus]
+}
+
+@test
+fn interpolation() {
+  assert kinds("\"\"") == [StringQuote, StringQuote]
+  assert kinds("\"\#{x}\"") == [StringQuote, InterpStart, LowerName, InterpEnd, StringQuote]
+  assert kinds("\"hello \#{user.name}!\"")
+    == [
+      StringQuote,
+      StringText,
+      InterpStart,
+      LowerName,
+      Dot,
+      LowerName,
+      InterpEnd,
+      StringText,
+      StringQuote,
+    ]
+}
+
+@test
+fn braces_and_strings_inside_an_interpolation() {
+  assert kinds("\"\#{f({})}\"")
+    == [StringQuote, InterpStart, LowerName, LParen, LBrace, RBrace, RParen, InterpEnd, StringQuote]
+  assert kinds("\"\#{\"\#{x}\"}\"")
+    == [
+      StringQuote,
+      InterpStart,
+      StringQuote,
+      InterpStart,
+      LowerName,
+      InterpEnd,
+      StringQuote,
+      InterpEnd,
+      StringQuote,
+    ]
+  assert kinds("}") == [RBrace]
+}
+
+@test
+fn escapes_do_not_end_a_string() {
+  assert texts("\"a\\\"b\\\#{c\\u{41}\"") == ["\"", "a\\\"b\\\#{c\\u{41}", "\""]
+}
+
+@test
+fn an_unterminated_string_ends_at_the_newline() {
+  assert kinds("\"\nx") == [StringQuote, Newline, LowerName]
+  assert kinds("\"\#{x") == [StringQuote, InterpStart, LowerName]
+}
+
+@test
+fn a_multiline_body_is_one_piece_except_interpolations() {
+  src = "\"\"\"\n  a # b \\\"\"\" c\n  \"\"\""
+  assert kinds(src) == [TripleQuote, StringText, TripleQuote]
+  assert texts(src) == ["\"\"\"", "\n  a # b \\\"\"\" c\n", "  \"\"\""]
+  assert kinds("\"\"\"\n  \#{x}\n  \"\"\"")
+    == [TripleQuote, StringText, InterpStart, LowerName, InterpEnd, StringText, TripleQuote]
+}
+
+## Pieces that tend to open and close strings, interpolations and escapes.
+const PIECES = [
+  "\"\"\"",
+  "\"",
+  "\#{",
+  "}",
+  "{",
+  "\\",
+  "u{",
+  "0x",
+  "0b",
+  "\n",
+  "\r",
+  "  ",
+  "#",
+  "a",
+  "Z",
+  "0",
+  "_",
+  ".",
+  "e",
+  "-",
+  "<",
+  "|",
+  "é",
+  "😀",
+]
+
+fn source_of(indices: List[Int]) -> String {
+  pieces = Array.from_list(PIECES)
+  indices |> List.filter_map(|i| Array.get(pieces, i)) |> String.concat
+}
+
+@test
+fn tokens_concatenate_back_to_the_source() {
+  gen = Gen.list(Gen.int_between(0, List.length(PIECES) - 1)) |> Gen.map(source_of)
+  Property.check(gen, |src| {
+    assert String.concat(texts(src)) == src
+    # No gaps and no overlaps.
+    end = List.fold(Lexer.lex(src), 0, |pos, t| if t.start == pos { t.end } else { -1 })
+    assert end == List.length(String.code_points(src))
+  })
+}

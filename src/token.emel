@@ -1,0 +1,94 @@
+## The kinds of tokens. Trivia (whitespace, newlines and comments) is kept, so the tokens of a
+## source concatenate back to the source.
+pub enum Kind {
+  # Trivia
+  Whitespace
+  Newline
+  Comment
+  DocComment
+
+  # Literals. `"a #{x} b"` is StringQuote StringText InterpStart LowerName InterpEnd StringText
+  # StringQuote.
+  IntLit
+  FloatLit
+  StringQuote
+  ## The opening `"""`, or the closing one with the whitespace before it on its line.
+  TripleQuote
+  StringText
+  InterpStart
+  InterpEnd
+
+  # Names
+  LowerName
+  TypeName
+  UpperName
+  Underscore
+
+  # Reserved words
+  FnKw
+  TypeKw
+  EnumKw
+  ErrorKw
+  ConstKw
+  TraitKw
+  ImplKw
+  EffectKw
+  HandlerKw
+  LayerKw
+  ImportKw
+  PubKw
+  OpaqueKw
+  SuspendKw
+  IfKw
+  ElseKw
+  MatchKw
+  FailKw
+  EscapeKw
+  UseKw
+  WithKw
+  AssertKw
+  SelfKw
+  SelfTypeKw
+  AsKw
+  ## Words reserved for the future. They have no syntax, so they share one kind.
+  ReservedKw
+
+  # Punctuation
+  LParen
+  RParen
+  LBrack
+  RBrack
+  LBrace
+  RBrace
+  Comma
+  Dot
+  Dot2
+  Colon
+  Eq
+  ThinArrow
+  Pipe
+  PipeGt
+  Plus
+  Minus
+  Star
+  Slash
+  Percent
+  Bang
+  Eq2
+  Neq
+  Lt
+  LtEq
+  LeftArrow
+  Gt
+  GtEq
+  Amp2
+  Pipe2
+  At
+
+  ## A character or a chunk the lexer did not recognize.
+  ErrorToken
+} derive Eq, Show
+
+## A token over the code points `start` (inclusive) to `end` (exclusive) of the source.
+pub type Token(kind: Kind, start: Int, end: Int)
+  derive Eq, Show

@@ -1,0 +1,46 @@
+## The command line of Graft.
+##
+## - `graft roundtrip <file>...` lexes each file and checks that its tokens concatenate back to
+##   the file without gaps.
+import Std.Array.{Array}
+import Std.Console.{Console}
+import Std.FileSystem.{FileSystem}
+import Std.Process.{Process, Args, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
+import Lexer
+
+fn main() -> ExitCode {
+  with Process {
+    args = use Args
+    console = use Console
+    args.list() match {
+      ["roundtrip", ..files] -> roundtrip(files)
+      _ -> {
+        console.print_error_line("usage: graft roundtrip <file>...")
+        Process.exit_code(2)
+      }
+    }
+  }
+}
+
+fn roundtrip(files: List[String]) -> ExitCode uses { Console, FileSystem } {
+  console = use Console
+  failed = List.filter(files, |path| !roundtrips(path))
+  List.each(failed, |path| console.print_line("FAILED #{path}"))
+  console.print_line(
+    "#{List.length(files) - List.length(failed)}/#{List.length(files)} files round-trip",
+  )
+  if List.is_empty(failed) { EXIT_SUCCESS } else { EXIT_FAILURE }
+}
+
+fn roundtrips(path: String) -> Bool uses { FileSystem } {
+  fs = use FileSystem
+  Some(fs.read_text(path)) escape { _ -> None } match {
+    None -> False
+    Some(text) -> {
+      src = Array.from_list(String.code_points(text))
+      tokens = Lexer.tokens(src)
+      end = List.fold(tokens, 0, |pos, t| if t.start == pos && t.end > pos { t.end } else { -1 })
+      end == Array.size(src)
+    }
+  }
+}
