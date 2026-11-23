@@ -169,6 +169,8 @@ import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
 
 行き先: proposal．L1 と同じく、名前の種類によって修飾できるかが変わる．
 
+M3 の `src/check.emel` でも、`Modules.CORE`（core モジュールの表）と書いて同じエラーになり、import に直した．
+
 ### L9. 関数名と、同じモジュールの型のフィールド名が衝突する
 
 やりたかったこと: 構文木のノード型 `Node(children: ...)` と、ノードだけを返す関数 `children(node)` を同じモジュールに置く．

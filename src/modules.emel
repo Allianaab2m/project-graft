@@ -1,0 +1,267 @@
+## Collects the `.emel` files under a source root and maps them to module names (spec chapter 4).
+## Follows `source.rs`, `naming.rs` and the bundled core table (`emela-core/src/sources.rs`) of
+## the reference implementation.
+##
+## Each file is one module, named by its path from the root: `src/http/client.emel` is
+## `Http.Client`.
+import Std.FileSystem.{FileSystem}
+import Std.Map.{Map}
+import Std.Path
+
+## A module name's segments: `["Http", "Client"]`.
+pub type ModuleData(name: List[String], file: String)
+
+## The modules, in the order they were added (by path within a root, then the core modules).
+## `by_name` maps a joined name to the index of the module that name points to: a core module
+## hides a source module of the same name.
+pub type ModuleMap(modules: List[ModuleData], by_name: Map[String, Int], core_from: Int)
+
+## A diagnostic of collecting: on a file or directory, without a range.
+pub type FileDiagnostic(code: String, path: String, message: String)
+
+pub fn display(name: List[String]) -> String {
+  String.join(name, ".")
+}
+
+pub fn empty() -> ModuleMap {
+  ModuleMap([], Map.empty(), -1)
+}
+
+pub fn get(map: ModuleMap, index: Int) -> Option[ModuleData] {
+  map.modules.get(index)
+}
+
+pub fn lookup(map: ModuleMap, name: List[String]) -> Option[Int] {
+  map.by_name.get(display(name))
+}
+
+pub fn is_core(map: ModuleMap, index: Int) -> Bool {
+  map.core_from >= 0 && index >= map.core_from
+}
+
+fn insert(map: ModuleMap, data: ModuleData) -> (ModuleMap, Int) {
+  index = map.modules.length()
+  (
+    ModuleMap(
+      modules: map.modules.append([data]),
+      by_name: map.by_name.insert(display(data.name), index),
+      ..map,
+    ),
+    index,
+  )
+}
+
+# ---------------------------------------------------------------------------------------------
+# Names of files and directories (`naming.rs`)
+
+## The type name a file or directory name converts to, or why it does not convert.
+pub enum Converted {
+  Converted(name: String)
+  NotConverted(why: String)
+}
+
+## `json_codec` becomes `JsonCodec`, `http2` becomes `Http2`.
+pub fn to_type_name(name: String) -> Converted {
+  if !is_snake_case(name) {
+    NotConverted("not lower snake_case")
+  } else {
+    converted = String.concat(name.split("_").map(capitalize))
+    if is_type_name(converted) {
+      Converted(converted)
+    } else {
+      NotConverted("the converted name `#{converted}` is not a valid type name")
+    }
+  }
+}
+
+fn capitalize(word: String) -> String {
+  word.code_points() match {
+    [] -> ""
+    [c, ..rest] -> {
+      first = if c >= 0x61 && c <= 0x7A { c - 0x20 } else { c }
+      [first, ..rest].filter_map(String.from_code_point) |> String.concat
+    }
+  }
+}
+
+## Rejects empty words (a leading, trailing or doubled `_`).
+fn is_snake_case(name: String) -> Bool {
+  name != ""
+    && name.code_points().all(|c| (c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39) || c == 0x5F)
+    && name.split("_").all(|w| w != "")
+}
+
+## The lexical class of type names (spec 2.3): starts with an uppercase letter, contains at least
+## one lowercase letter, alphanumeric only.
+pub fn is_type_name(name: String) -> Bool {
+  cs = name.code_points()
+  upper = |c| c >= 0x41 && c <= 0x5A
+  lower = |c| c >= 0x61 && c <= 0x7A
+  digit = |c| c >= 0x30 && c <= 0x39
+  cs.head().map(upper) == Some(True)
+    && cs.any(lower)
+    && cs.all(|c| upper(c) || lower(c) || digit(c))
+}
+
+# ---------------------------------------------------------------------------------------------
+# Collecting (`collect_modules`)
+
+const PRELUDE = "Prelude"
+const STD = "Std"
+
+type Collected(map: ModuleMap, diagnostics: List[FileDiagnostic])
+
+## The modules under `root` and the diagnostics of their names. With `shallow`, only the files
+## directly under `root` (a single file's directory).
+pub fn collect(root: String, shallow: Bool) -> (ModuleMap, List[FileDiagnostic])
+  uses { FileSystem } {
+  done = walk(root, [], shallow, Collected(empty(), []))
+  (done.map, done.diagnostics.reverse())
+}
+
+## Diagnostics newest first.
+fn walk(dir: String, prefix: List[String], shallow: Bool, acc: Collected) -> Collected
+  uses { FileSystem } {
+  fs = use FileSystem
+  # The current directory is "" so that its files are joined without a `./`.
+  listed = if dir == "" { "." } else { dir }
+  Some(fs.list_directory(listed)) escape { _ -> None } match {
+    None -> Collected(
+      diagnostics: [FileDiagnostic("E0902", dir, "cannot read directory"), ..acc.diagnostics],
+      ..acc,
+    )
+    Some(names) -> names.fold(acc, |a, name| {
+      path = Path.join(dir, name)
+      # Hidden files and directories (editor temp files, .git, ...) are skipped.
+      if name.starts_with(".") {
+        a
+      } else if fs.is_directory(if dir == "" { name } else { path }) {
+        if shallow { a } else { directory(path, name, prefix, a) }
+      } else if Path.extension(name) == Some("emel") {
+        file(path, name, prefix, a)
+      } else {
+        a
+      }
+    })
+  }
+}
+
+fn report(acc: Collected, code: String, path: String, message: String) -> Collected {
+  Collected(diagnostics: [FileDiagnostic(code, path, message), ..acc.diagnostics], ..acc)
+}
+
+fn directory(path: String, name: String, prefix: List[String], acc: Collected) -> Collected
+  uses { FileSystem } {
+  to_type_name(name) match {
+    # `std/` at the root is reserved for the bundled std modules (spec 4.1, 15.2).
+    Converted(segment) if prefix.is_empty() && segment == STD -> {
+      report(acc, "E0203", path, "module name `Std` is reserved")
+    }
+    Converted(segment) -> walk(path, prefix.append([segment]), False, acc)
+    NotConverted(why)  -> report(acc, "E0202", path, "invalid directory name `#{name}`: #{why}")
+  }
+}
+
+fn file(path: String, name: String, prefix: List[String], acc: Collected) -> Collected {
+  stem = String.concat(
+    name.code_points().take(name.code_points().length() - 5).filter_map(String.from_code_point),
+  )
+  to_type_name(stem) match {
+    NotConverted(why) -> report(acc, "E0201", path, "invalid file name `#{stem}`: #{why}")
+    Converted(segment) -> {
+      module = prefix.append([segment])
+      if prefix.is_empty() && (segment == PRELUDE || segment == STD) {
+        report(acc, "E0203", path, "module name `#{display(module)}` is reserved")
+      } else {
+        lookup(acc.map, module) match {
+          Some(_) -> report(acc, "E0204", path, "module `#{display(module)}` is defined twice")
+          None -> {
+            (map, _) = insert(acc.map, ModuleData(module, path))
+            Collected(map:, ..acc)
+          }
+        }
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# The bundled core (`emela-core/src/sources.rs`)
+
+## The bundled sources: module name and path under the `lib` directory of emela-core, Prelude
+## first, then core (usable without import), then std.
+pub const CORE = [
+  ("Prelude", "core/prelude.emel"),
+  ("List", "core/list.emel"),
+  ("Option", "core/option.emel"),
+  ("String", "core/string.emel"),
+  ("Int", "core/int.emel"),
+  ("Int64", "core/int64.emel"),
+  ("Float", "core/float.emel"),
+  ("Bool", "core/bool.emel"),
+  ("Std.Array", "std/array.emel"),
+  ("Std.Bytes", "std/bytes.emel"),
+  ("Std.Duration", "std/duration.emel"),
+  ("Std.Instant", "std/instant.emel"),
+  ("Std.Map", "std/map.emel"),
+  ("Std.Set", "std/set.emel"),
+  ("Std.Dynamic.Number", "std/dynamic/number.emel"),
+  ("Std.Dynamic", "std/dynamic.emel"),
+  ("Std.Shape", "std/shape.emel"),
+  ("Std.Dynamic.Presence", "std/dynamic/presence.emel"),
+  ("Std.Json", "std/json.emel"),
+  ("Std.State", "std/state.emel"),
+  ("Std.Console", "std/console.emel"),
+  ("Std.Process", "std/process.emel"),
+  ("Std.Random", "std/random.emel"),
+  ("Std.Env", "std/env.emel"),
+  ("Std.Clock", "std/clock.emel"),
+  ("Std.Http.Request", "std/http/request.emel"),
+  ("Std.Http.Response", "std/http/response.emel"),
+  ("Std.Http", "std/http.emel"),
+  ("Std.Path", "std/path.emel"),
+  ("Std.FileSystem", "std/file_system.emel"),
+  ("Std.Platform", "std/platform.emel"),
+  ("Std.Cause", "std/cause.emel"),
+  ("Std.Deferred", "std/deferred.emel"),
+  ("Std.Semaphore", "std/semaphore.emel"),
+  ("Std.Queue", "std/queue.emel"),
+  ("Std.Exit", "std/exit.emel"),
+  ("Std.Fiber", "std/fiber.emel"),
+]
+
+## The virtual path of a core module in diagnostics: `<core>/list.emel` for `List`,
+## `<core>/std/console.emel` for `Std.Console` (segments become directories, CamelCase becomes
+## snake_case).
+pub fn core_path(module: String) -> String {
+  segments = module.split(".").map(snake)
+  Path.join("<core>", String.join(segments, "/")) |> String.append(".emel")
+}
+
+fn snake(segment: String) -> String {
+  segment.code_points().enumerate().map(|(i, c)| {
+    if c >= 0x41 && c <= 0x5A {
+      lower = String.from_code_point(c + 0x20).or("")
+      if i > 0 { "_#{lower}" } else { lower }
+    } else {
+      String.from_code_point(c).or("")
+    }
+  }) |> String.concat
+}
+
+## Adds the core modules after the collected ones. A source module with the name of a core module
+## is hidden, and gets a reserved-name diagnostic.
+pub fn add_core(map: ModuleMap) -> (ModuleMap, List[FileDiagnostic]) {
+  start = ModuleMap(core_from: map.modules.length(), ..map)
+  CORE.fold((start, []), |(m, found), (module, _)| {
+    name = module.split(".")
+    shadowed = lookup(m, name) match {
+      Some(i) -> get(m, i).map(|d| {
+        FileDiagnostic("E0203", d.file, "module name `#{module}` is reserved")
+      })
+      None -> None
+    }
+    (next, _) = insert(m, ModuleData(name, core_path(module)))
+    (next, shadowed.map(|d| found.append([d])).or(found))
+  })
+}

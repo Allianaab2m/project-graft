@@ -6,6 +6,9 @@
 ##   format of `tools/oracle`.
 ## - `graft fmt <file> [width]` prints the file formatted (at `width`, 100 by default), `error`
 ##   if it has syntax errors, or `internal error`, in the format of `tools/oracle`.
+## - `graft check <path> <core lib>` prints the diagnostics of checking a file or a project, up to
+##   the import graph, in the format of `tools/oracle check`. `core lib` is the `lib` directory of
+##   emela-core, with the bundled core and std sources.
 ## - `graft parse <file>...` parses each file and prints the number of diagnostics, to time the
 ##   parser.
 ## - `graft tree <file>` prints the syntax tree of a file and the diagnostics of the parser, in the
@@ -14,6 +17,7 @@ import Std.Array.{Array}
 import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
 import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
+import Check
 import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
 import Lexer
 import Parse
@@ -27,6 +31,7 @@ fn main() -> ExitCode {
     args.list() match {
       ["roundtrip", ..files] -> roundtrip(files)
       ["tokens", path]       -> tokens(path)
+      ["check", path, core]  -> check(path, core)
       ["fmt", path]          -> fmt(path, DEFAULT_WIDTH)
       ["fmt", path, width] -> Some(Int.parse(width)) escape { _ -> None } match {
         Some(w) -> fmt(path, w)
@@ -41,7 +46,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode uses { Console } {
   (use Console).print_error_line(
-    "usage: graft roundtrip <file>... | graft parse <file>... | graft tokens <file> | graft tree <file> | graft fmt <file> [width]",
+    "usage: graft roundtrip <file>... | graft parse <file>... | graft tokens <file> | graft tree <file> | graft fmt <file> [width] | graft check <path> <emela-core lib>",
   )
   Process.exit_code(2)
 }
@@ -139,4 +144,16 @@ fn fmt(path: String, width: Int) -> ExitCode uses { Console, FileSystem, Stdout 
       EXIT_SUCCESS
     }
   }
+}
+
+fn check(path: String, core: String) -> ExitCode uses { FileSystem, Stdout } {
+  lines = Check.check(path, core).map(|d| {
+    place = d.range match {
+      Some((start, end)) -> "#{d.file}:#{start}..#{end}"
+      None               -> d.file
+    }
+    "#{d.severity}[#{d.code}]@#{place}\n"
+  })
+  (use Stdout).print(String.concat(lines))
+  EXIT_SUCCESS
 }

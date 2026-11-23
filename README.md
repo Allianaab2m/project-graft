@@ -49,6 +49,7 @@ $ scripts/compare.sh tree <emela-lang/emela checkout>    # syntax trees against 
 $ scripts/compare.sh fmt <emela-lang/emela checkout>     # formatted output against the reference
 $ scripts/fuzz.py tree <emela-lang/emela checkout> <out dir> # trees of broken corpus files
 $ scripts/fuzz.py fmt <emela-lang/emela checkout> <out dir>  # fmt of reflowed files, any width
+$ scripts/check.sh <emela-lang/emela checkout>      # check diagnostics against the reference
 $ emela run . -- parse <file>...                     # parses the files, to time the parser
 ```
 
@@ -71,7 +72,9 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   formatting its largest file (18 KB) takes 50 ms.
 - M3: started. `tools/oracle check <path>` prints the diagnostics of `emela check`. The plan:
   1. Modules: collecting the files of a single file or a project, the bundled core and std
-     modules, and the import graph (E0201 to E0210).
+     modules, and the import graph (E0201 to E0210). Done: `graft check <path> <emela-core lib>`
+     prints the same syntax, module and import graph diagnostics as `emela check` on every unit
+     of the corpus and on the cases of `test_data/check` (`scripts/check.sh`).
   2. Name resolution: lowering the tree to HIR, where every name points to its definition
      (E0211 to E0225, W0201, W0202).
   3. Type checking, from monomorphic expressions to polymorphism, effects and error sets (E03xx,

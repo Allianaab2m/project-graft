@@ -1,0 +1,355 @@
+## The `emela check` stage up to name resolution: decides the source root from the path, collects
+## the modules, reads and parses the reached ones, and checks the import graph. Follows `check` of
+## `pipeline.rs` and `graph.rs` of the reference implementation.
+##
+## Paths stay as given (relative or absolute); `Pome.toml` is looked for in the given directory
+## and above it through `..`. Projects are read without their tests and Pome dependencies.
+import Std.Array.{Array}
+import Std.FileSystem.{FileSystem}
+import Std.Map.{Map}
+import Std.Path
+import Cst.{
+  Node,
+  children,
+  child_token,
+  descendants,
+  significant_children,
+  tokens,
+  TokenElement,
+  NodeElement,
+}
+import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, lookup, is_core}
+import Parse
+import Sink
+import Source.{slice}
+import Syntax.{Diagnostic, Import, ImportList, Error}
+import Token.{TypeName, RBrace}
+
+## A diagnostic of check: `range` is None for one about a whole file or directory.
+pub type Checked(severity: String, code: String, file: String, range: Option[(Int, Int)])
+
+## An import of a module: the path's segments and the range of the path.
+type ImportOf(path: List[String], start: Int, end: Int)
+
+type Input(root: String, entry: Option[String], single_file: Bool)
+
+## Why a path cannot be checked (`Input::resolve`), with its code.
+enum Resolved {
+  Resolved(input: Input)
+  Rejected(code: String)
+}
+
+## Where the modules of `path` come from (`Input::resolve`): the project of the nearest
+## `Pome.toml`, whose source root is `src`, or the directory of a single file.
+fn input(path: String) -> Resolved uses { FileSystem } {
+  fs = use FileSystem
+  is_file = !fs.is_directory(path)
+  # A file without a directory is in the current one, whose files are joined with "".
+  start = if is_file { Path.parent(path).or("") } else { path }
+  project_of(start) match {
+    Some(project) -> {
+      root = Path.join(project, "src")
+      # Only the project itself, or a file or directory under its source or test root.
+      inside = (
+        under(path, root)
+          || under(path, Path.join(project, "test"))
+          || (!is_file && path == project)
+      )
+      entry = if is_file {
+        Some(path)
+      } else if fs.exists(Path.join(root, "main.emel")) {
+        Some(Path.join(root, "main.emel"))
+      } else if fs.exists(Path.join(root, "lib.emel")) {
+        Some(Path.join(root, "lib.emel"))
+      } else {
+        None
+      }
+      if inside { Resolved(Input(root, entry, False)) } else { Rejected("E0208") }
+    }
+    None -> Resolved(Input(start, Some(path), True))
+  }
+}
+
+## Whether `path` is `dir` or under it, comparing components.
+fn under(path: String, dir: String) -> Bool {
+  d = components(dir)
+  components(path).take(d.length()) == d
+}
+
+## The nearest directory from `dir` upwards with a `Pome.toml`: `dir`, each of its parents, and
+## for a relative path then `..`, `../..` and so on (up to 32 levels).
+fn project_of(dir: String) -> Option[String] uses { FileSystem } {
+  fs = use FileSystem
+  ancestors(dir).find(|d| fs.exists(Path.join(d, "Pome.toml")))
+}
+
+## `dir` and its ancestors, nearest first. The current directory is "".
+fn ancestors(dir: String) -> List[String] {
+  absolute = dir.starts_with("/")
+  parts = components(dir)
+  own = List.range(0, parts.length() + 1).reverse().map(|n| {
+    joined = String.join(parts.take(n), "/")
+    if absolute { "/#{joined}" } else { joined }
+  })
+  above = if absolute {
+    []
+  } else {
+    List.range(1, 33).map(|k| String.join(List.range(0, k).map(|_| ".."), "/"))
+  }
+  own.append(above)
+}
+
+## Reads a module's text: a core module from `core_lib` (emela-core's `lib`), a source module
+## from its file.
+fn read(map: ModuleMap, index: Int, core_lib: String) -> Option[String] uses { FileSystem } {
+  fs = use FileSystem
+  get(map, index).and_then(|data| {
+    file = if is_core(map, index) {
+      CORE.find(|(m, _)| m == display(data.name)).map(|(_, p)| Path.join(core_lib, p))
+    } else {
+      Some(data.file)
+    }
+    file.and_then(|f| Some(fs.read_text(f)) escape { _ -> None })
+  })
+}
+
+type Read(index: Int, src: Array[Int], parsed: Sink.Built)
+
+## Every diagnostic of `emela check <path>` up to the import graph, in the reference's order.
+pub fn check(path: String, core_lib: String) -> List[Checked] uses { FileSystem } {
+  given = normalize(path)
+  input(given) match {
+    Rejected(code) -> [Checked("error", code, "-", None)]
+    Resolved(inp)  -> check_input(inp, core_lib)
+  }
+}
+
+fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem } {
+  (collected, collect_diagnostics) = Modules.collect(inp.root, inp.single_file)
+  (map, shadowed) = Modules.add_core(collected)
+  entry = inp.entry.and_then(|e| {
+    map.modules.enumerate().find(|(_, d)| d.file == e).map(|(i, _)| i)
+  })
+  count = map.modules.length()
+  all = List.range(0, count)
+  start = if inp.single_file {
+    entry.map(|e| [e]).or([]).append(all.filter(|i| is_core(map, i)))
+  } else {
+    all
+  }
+  reads = read_all(map, core_lib, start, Map.empty(), inp.single_file, Map.empty())
+  reached = reads
+  # For a single file, only diagnostics about reached modules are reported.
+  concerns = |d: FileDiagnostic| {
+    (
+      !inp.single_file
+        || inp.entry == Some(d.path)
+        || map.modules.enumerate().any(|(i, m)| m.file == d.path && reached.contains(i))
+    )
+  }
+  first = collect_diagnostics.append(shadowed).filter(concerns).map(|d| {
+    Checked("error", d.code, d.path, None)
+  })
+  per_module = all.flat_map(|i| {
+    reads.get(i) match {
+      None -> []
+      Some(r) -> {
+        file = get(map, i).map(|d| d.file).or("")
+        r.parsed.diagnostics.map(|d| Checked("error", d.code, file, Some((d.start, d.end))))
+      }
+    }
+  })
+  not_module = (inp.entry, entry) match {
+    (Some(e), None) -> [Checked("error", "E0210", e, None)]
+    _               -> []
+  }
+  imports = reads.map_values(|r| imports_of(r.src, r.parsed))
+  first.append(per_module).append(not_module).append(graph(map, imports))
+}
+
+fn normalize(path: String) -> String {
+  if path.starts_with("./") {
+    normalize(String.concat(path.code_points().drop(2).filter_map(String.from_code_point)))
+  } else if path.ends_with("/") && path != "/" {
+    String.concat(
+      path.code_points().take(path.code_points().length() - 1).filter_map(String.from_code_point),
+    )
+  } else {
+    path
+  }
+}
+
+## Reads the modules of `work`, and for a single file the modules they import, by index.
+fn read_all(
+  map: ModuleMap,
+  core_lib: String,
+  work: List[Int],
+  queued: Map[Int, Bool],
+  single_file: Bool,
+  done: Map[Int, Read],
+) -> Map[Int, Read] uses { FileSystem } {
+  work match {
+    [] -> done
+    [index, ..rest] if queued.contains(index) -> read_all(
+      map,
+      core_lib,
+      rest,
+      queued,
+      single_file,
+      done,
+    )
+    [index, ..rest] -> {
+      marked = queued.insert(index, True)
+      read(map, index, core_lib) match {
+        None -> read_all(map, core_lib, rest, marked, single_file, done)
+        Some(text) -> {
+          src = Array.from_list(text.code_points())
+          parsed = Parse.parse(src)
+          more = if single_file {
+            imports_of(src, parsed).filter_map(|imp| lookup(map, imp.path))
+          } else {
+            []
+          }
+          next = done.insert(index, Read(index, src, parsed))
+          read_all(map, core_lib, more.append(rest), marked, single_file, next)
+        }
+      }
+    }
+  }
+}
+
+## The imports of a module that can be read. An import with a syntax error inside, an unclosed
+## `.{`, or an Error right after it is skipped: a syntax diagnostic was reported.
+fn imports_of(src: Array[Int], parsed: Sink.Built) -> List[ImportOf] {
+  root = Cst.root(parsed.tree)
+  elements = significant_children(root)
+  elements.enumerate().filter_map(|(i, e)| {
+    e match {
+      NodeElement(n) if n.kind == Import && !broken(n, elements.drop(i + 1)) -> {
+        children(n).find(|c| c.kind == Syntax.Path).map(|p| {
+          segments = tokens(p).filter(|t| t.kind == TypeName).map(|t| slice(src, t.start, t.end))
+          ImportOf(segments, p.start, p.end)
+        })
+      }
+      _ -> None
+    }
+  })
+}
+
+fn broken(node: Node, after: List[Cst.Element]) -> Bool {
+  has_error = descendants(node).any(|d| d.kind == Error)
+  unclosed = children(node).find(|c| c.kind == ImportList).map(|list| {
+    child_token(list, RBrace).is_none()
+  })
+    == Some(True)
+  trailing = after.head() match {
+    Some(NodeElement(n)) -> n.kind == Error
+    _                    -> False
+  }
+  has_error || unclosed || trailing
+}
+
+# ---------------------------------------------------------------------------------------------
+# The import graph (`graph.rs`)
+
+## Undefined modules and import cycles, sorted by file (stably).
+fn graph(map: ModuleMap, imports: Map[Int, List[ImportOf]]) -> List[Checked] {
+  count = map.modules.length()
+  file_of = |i| get(map, i).map(|d| d.file).or("")
+  # The edges of each module, in import order: (target, start, end).
+  edges = List.range(0, count).map(|i| {
+    imports.get(i).or([]).filter_map(|imp| lookup(map, imp.path).map(|t| (t, imp.start, imp.end)))
+  }) |> Array.from_list
+  edges_of = |i| edges.get(i).or([])
+  undefined = List.range(0, count).flat_map(|i| {
+    imports.get(i).or([]).filter(|imp| lookup(map, imp.path).is_none()).map(|imp| {
+      Checked("error", "E0205", file_of(i), Some((imp.start, imp.end)))
+    })
+  })
+  reach = List.range(0, count).map(|i| reachable(edges_of, [i], Map.empty())) |> Array.from_list
+  reaches = |a, b| reach.get(a).map(|r| r.contains(b)) == Some(True)
+  # A module starts a cycle diagnostic if it is the first (lowest index) of its strongly
+  # connected component, and the component is a cycle.
+  cycles = List.range(0, count).filter_map(|i| {
+    component = List.range(0, count).filter(|j| reaches(i, j) && reaches(j, i))
+    is_first = component.head() == Some(i)
+    self_loop = edges_of(i).any(|(t, _, _)| t == i)
+    if !is_first || (component.length() == 1 && !self_loop) {
+      None
+    } else {
+      cycle = if component.length() == 1 { [i] } else { shortest_cycle(edges_of, component, i) }
+      next = cycle.get(1).or(i)
+      range = edges_of(i).find(|(t, _, _)| t == next).map(|(_, s, e)| (s, e))
+      Some(Checked("error", "E0206", file_of(i), range))
+    }
+  })
+  undefined.append(cycles).sort_by(|a, b| Ord.compare(components(a.file), components(b.file)))
+}
+
+## The components of a path, which paths are ordered by.
+fn components(path: String) -> List[String] {
+  path.split("/").filter(|c| c != "")
+}
+
+## The modules reachable from `work` through one or more edges.
+fn reachable(
+  edges_of: fn(Int) -> List[(Int, Int, Int)] fails {} uses {},
+  work: List[Int],
+  seen: Map[Int, Bool],
+) -> Map[Int, Bool] {
+  work match {
+    [] -> seen
+    [i, ..rest] -> {
+      new = edges_of(i).map(|(t, _, _)| t).filter(|t| !seen.contains(t))
+      marked = new.fold(seen, |m, t| m.insert(t, True))
+      reachable(edges_of, new.append(rest), marked)
+    }
+  }
+}
+
+## The shortest path from `start` back to `start` within the component, breadth first.
+fn shortest_cycle(
+  edges_of: fn(Int) -> List[(Int, Int, Int)] fails {} uses {},
+  component: List[Int],
+  start: Int,
+) -> List[Int] {
+  bfs(edges_of, component, start, [start], Map.empty())
+}
+
+fn bfs(
+  edges_of: fn(Int) -> List[(Int, Int, Int)] fails {} uses {},
+  component: List[Int],
+  start: Int,
+  queue: List[Int],
+  parent: Map[Int, Int],
+) -> List[Int] {
+  queue match {
+    [] -> [start]
+    [node, ..rest] -> {
+      targets = edges_of(node).map(|(t, _, _)| t)
+      if targets.any(|t| t == start) {
+        path_back(parent, start, node, [node])
+      } else {
+        (more, next_parent) = targets.fold(([], parent), |(q, p), t| {
+          if component.any(|c| c == t) && !p.contains(t) && t != start {
+            (q.append([t]), p.insert(t, node))
+          } else {
+            (q, p)
+          }
+        })
+        bfs(edges_of, component, start, rest.append(more), next_parent)
+      }
+    }
+  }
+}
+
+fn path_back(parent: Map[Int, Int], start: Int, current: Int, path: List[Int]) -> List[Int] {
+  if current == start {
+    path
+  } else {
+    parent.get(current) match {
+      Some(p) -> path_back(parent, start, p, [p, ..path])
+      None    -> path
+    }
+  }
+}

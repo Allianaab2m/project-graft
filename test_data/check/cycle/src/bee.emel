@@ -1,0 +1,2 @@
+import Cee
+fn b() -> Int { 1 }

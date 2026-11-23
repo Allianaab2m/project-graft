@@ -89,3 +89,5 @@ jobs:
         run: scripts/compare.sh tree corpus/emela
       - name: Compare formatted output with the reference
         run: scripts/compare.sh fmt corpus/emela
+      - name: Compare check diagnostics with the reference (M3)
+        run: scripts/check.sh corpus/emela
