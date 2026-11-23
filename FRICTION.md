@@ -258,6 +258,20 @@ pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
 
 行き先: 本体 issue（std への追加）．
 
+### S3. Option の `or` は引数を先に評価し、遅延版がない
+
+やりたかったこと: M4 の lowering で、`Option` が None のときだけ「未対応」を記録する．
+
+```emel
+st().types.ops.get(expr).map(|o| op_value(expr, base, o)).or(record_field(expr, base))
+```
+
+起きたこと: `or` の引数は値なので、Some のときも `record_field` が評価され、未対応の記録という副作用が残った．`use` の lowering でも同じ形で踏み、どちらも build が「未対応」で落ちる原因が分からず時間を使った．match に書き直した．Option には `map`、`and_then`、`or`、`is_some`、`is_none`、`or_fail` しかない（`each` もない）．
+
+本来の形: `Option.or_else(f: fn() -> A)`．副作用のない既定値には `or`、計算が要る既定値には `or_else` と使い分けられる．`Option.each` もあると、None のときに何もしない処理を match なしで書ける．
+
+行き先: 本体 issue（std への追加）．
+
 ## ツール
 
 ### T1. wasm で FileSystem を使うプログラムがコンパイルに通る

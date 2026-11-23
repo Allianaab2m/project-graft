@@ -291,6 +291,10 @@ pub fn type_key(ty: Type) -> String {
     CEnum(id, targs) -> "E#{id}(#{list(targs)})"
     CParam(i)        -> "P#{i}"
     CFn(f)           -> "fn(#{list(f.params)})#{type_key(f.ret)}"
+    CSet(sum) -> {
+      flag = |b: Bool, c: String| if b { c } else { "" }
+      "{#{flag(sum.fails, "f")}#{flag(sum.suspends, "s")}#{flag(sum.ev, "e")}}"
+    }
     _                -> "?"
   }
 }

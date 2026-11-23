@@ -222,6 +222,8 @@ type Lowering(
   ## Newest first.
   errors: List[String],
   sources: Map[Int, Array[Int]],
+  ## The source file of each module.
+  files: Map[Int, String],
   ## The built-in Bytes and Array types → their definitions.
   intrinsic_types: Map[String, Int],
   ## The local holding the evidence table where the expression being lowered runs.
@@ -258,6 +260,7 @@ pub fn lower(
   checked: Typeck.Checked,
   entry: Option[Int],
   sources: Map[Int, Array[Int]],
+  files: Map[Int, String],
 ) -> Lowered {
   program = checked.program
   main = entry.and_then(|m| program.modules.get(m)).and_then(|items| {
@@ -277,6 +280,7 @@ pub fn lower(
         0,
         [],
         sources,
+        files,
         Map.empty(),
         -1,
         [],
@@ -355,7 +359,9 @@ fn def_name(def: Int) -> String {
 }
 
 fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
-  if inst.role != 0 {
+  if inst.role == 4 {
+    lower_derived(inst)
+  } else if inst.role != 0 {
     lower_handler_part(inst)
   } else {
     lower_plain_fn(inst)
@@ -427,13 +433,18 @@ fn ref_args(expr: Int, def: Int) -> List[Type] uses { State[Lowering] } {
 ## Whether an instance may suspend: its R with the type arguments placed. A handler's init and
 ## release may suspend as its dependencies do.
 fn instance_suspends(def: Int, args: List[Type], role: Int) -> Bool uses { State[Lowering] } {
+  external_suspend = st().program.items.get(def) match {
+    Some(IFn(f)) -> f.is_external && f.sig.is_suspend
+    _            -> False
+  }
   role match {
+    0 if external_suspend -> True
     0 -> Signature.get(st().checked.sigs, def).map(|s| s.scheme.ty) match {
       Some(TyFn(f)) -> summary(f.uses, args).suspends
       _             -> False
     }
-    2 -> False
-    _ -> handler_suspends(def)
+    2                     -> False
+    _                     -> handler_suspends(def)
   }
 }
 
@@ -519,7 +530,7 @@ fn lower_plain_fn(inst: Instance) -> () uses { State[Lowering] } {
         False,
         XLit(VUnit),
         Some(Ir.External(bindings)),
-        False,
+        f.sig.is_suspend,
         False,
         def_of(program, def).name,
       )
@@ -567,7 +578,15 @@ fn host_ref(def: Int, args: List[String]) -> Ir.HostRef uses { State[Lowering] }
       host = if module.starts_with("./") && bundled {
         Ir.ModBundled("std/#{file}")
       } else if module.starts_with("./") || module.starts_with("../") {
-        Ir.ModFile(module)
+        # A file next to the declaring source, by its path from there.
+        source = def_of(program, def).module match {
+          SourceModule(m) -> st().files.get(m).or("")
+          _               -> ""
+        }
+        cps = source.code_points()
+        slash = cps.enumerate().fold(-1, |acc, (i, c)| if c == 47 { i } else { acc })
+        dir = String.concat(cps.take(slash).filter_map(String.from_code_point))
+        Ir.ModFile(if dir == "" { module } else { "#{dir}/#{module}" })
       } else {
         Ir.ModNamed(module)
       }
@@ -766,7 +785,7 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
   written match {
     Some((f, head)) -> {
       id = instance(f, impl_args(head, self_ty).append(targs.drop(1)))
-      direct(id, args.append([ev_var()]), False)
+      direct(id, args.append([ev_var()]), declared_fails(def))
     }
     None -> {
       trait_name = def_of(program, trait_def).name
@@ -775,8 +794,15 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
         Some(Hir.ITraitFn(t)) -> t.body.is_some()
         _                     -> False
       }
-      if default && !prelude {
-        direct(instance(def, targs), args.append([ev_var()]), False)
+      std_derive = ["Encode", "Decode", "ObjectKey", "Shaped"].any(|t| t == trait_name)
+      derived = head_def(self_ty).map(|h| st().checked.traits.derived.contains((trait_def, h))).or(
+        False,
+      )
+      if std_derive && derived && derive_op(def) != "" {
+        f = instance_of(def, [self_ty], 4)
+        direct(f, args.append([ev_var()]), declared_fails(def))
+      } else if default && !prelude {
+        direct(instance(def, targs), args.append([ev_var()]), declared_fails(def))
       } else {
         builtin_trait_call(trait_name, name, self_ty, args)
       }
@@ -790,7 +816,16 @@ fn builtin_trait_call(trait_name: String, name: String, ty: Type, args: List[Exp
   a = args.get(0).or(XLit(VUnit))
   b = args.get(1).or(XLit(VUnit))
   (trait_name, name) match {
-    ("Eq", "eq")     -> XBinary(BEq, op_ty(ty), a, b)
+    ("Eq", "eq") if structural_eq(ty, []) -> XBinary(BEq, op_ty(ty), a, b)
+    ("Eq", "eq") -> {
+      eq_def = Tylower.prelude_def(st().program, "Eq").and_then(|t| {
+        st().program.items.get(t) match {
+          Some(Hir.ITrait(tr)) -> tr.fns.find(|d| def_of(st().program, d).name == "eq")
+          _                    -> None
+        }
+      }).or(-1)
+      direct(instance_of(eq_def, [ty], 4), [a, b, ev_var()], False)
+    }
     ("Ord", "compare") -> {
       when_some(Tylower.prelude_def(st().program, "Ordering"), |o| {
         enum_def(o)
@@ -1422,9 +1457,90 @@ fn lower_binary(op: BinaryOp, lhs: Int, rhs: Int) -> Expr uses { State[Lowering]
     OpOr  -> Some(BOr)
     _     -> None
   }
+  full = expr_type(lhs)
   bin match {
-    Some(b) -> XBinary(b, ty, lower_expr(lhs), lower_expr(rhs))
-    None    -> unsupported("this operator")
+    Some(BEq) if ty == OpStructural -> eq_expr(full, lower_expr(lhs), lower_expr(rhs))
+    Some(BNe) if ty == OpStructural -> XUnary(
+      UNot,
+      OpBool,
+      eq_expr(full, lower_expr(lhs), lower_expr(rhs)),
+    )
+    Some(b) if ty == OpStructural && b != BAnd && b != BOr -> compare_expr(
+      b,
+      full,
+      lower_expr(lhs),
+      lower_expr(rhs),
+    )
+    Some(b)                         -> XBinary(b, ty, lower_expr(lhs), lower_expr(rhs))
+    None                            -> unsupported("this operator")
+  }
+}
+
+## `a < b` (and the others) on values of a type other than the primitive ones: through
+## `Ord.compare`, then the Ordering it gives.
+fn compare_expr(op: Ir.BinOp, ty: Type, a: Expr, b: Expr) -> Expr uses { State[Lowering] } {
+  program = st().program
+  compare_def = Tylower.prelude_def(program, "Ord").and_then(|t| {
+    program.items.get(t) match {
+      Some(Hir.ITrait(tr)) -> tr.fns.find(|d| def_of(program, d).name == "compare")
+      _                    -> None
+    }
+  }).or(-1)
+  ordering = trait_call(compare_def, [ty], [a, b])
+  ord_def = Tylower.prelude_def(program, "Ordering").or(-1)
+  enum_def(ord_def)
+  variant = |k: Int| QCtor(CtorRef(ord_def, k), [])
+  # Less is 0, Equal 1, Greater 2.
+  (k, yes) = op match {
+    BLt -> (0, True)
+    BGe -> (0, False)
+    BGt -> (2, True)
+    _   -> (2, False)
+  }
+  XMatch(ordering, [Arm(variant(k), None, XLit(VBool(yes))), Arm(QWild, None, XLit(VBool(!yes)))])
+}
+
+## `a == b` on values of type `ty`: by the structure (`$eq`) when that is what Eq gives for the
+## type, and otherwise through its Eq: a written impl, or the derived comparison made for the type.
+fn eq_expr(ty: Type, a: Expr, b: Expr) -> Expr uses { State[Lowering] } {
+  if structural_eq(ty, []) {
+    XBinary(BEq, op_ty(ty), a, b)
+  } else {
+    eq_def = Tylower.prelude_def(st().program, "Eq").and_then(|t| {
+      st().program.items.get(t) match {
+        Some(Hir.ITrait(tr)) -> tr.fns.find(|d| def_of(st().program, d).name == "eq")
+        _                    -> None
+      }
+    }).or(-1)
+    trait_call(eq_def, [ty], [a, b])
+  }
+}
+
+## Whether Eq of `ty` compares the structure: the built-in types, and types whose Eq is derived
+## (or core's impl of Option), with every field compared by its structure too. `seen` guards
+## recursive types.
+fn structural_eq(ty: Type, seen: List[Int]) -> Bool uses { State[Lowering] } {
+  ty match {
+    CTuple(es) -> es.all(|e| structural_eq(e, seen))
+    CList(e)   -> structural_eq(e, seen)
+    CArray(_)  -> False
+    CBytes     -> False
+    CEnum(d, args) -> if seen.any(|x| x == d) {
+      True
+    } else if d == option_def() {
+      args.all(|a| structural_eq(a, seen))
+    } else {
+      eq_trait = Tylower.prelude_def(st().program, "Eq").or(-1)
+      written = st().checked.traits.impls.contains((eq_trait, d))
+        && !st().checked.traits.derived.contains((eq_trait, d))
+      if written {
+        False
+      } else {
+        (_, ctors) = deriving(ty)
+        ctors.all(|c| c.fields.all(|(_, t)| structural_eq(t, [d, ..seen])))
+      }
+    }
+    _          -> True
   }
 }
 
@@ -2145,4 +2261,378 @@ fn permits_call(args: List[Expr], f_ty: Option[Ty], try_: Bool) -> Expr uses { S
   }
   values = [s, n, f].zip(args)
   values.reverse().fold(body, |acc, (l, v)| XLet(l, v, acc))
+}
+
+# ---------------------------------------------------------------------------------------------
+# The derived impls of Encode, Decode and ObjectKey (`lower/derive_std.rs`)
+#
+# A derived impl is a function per Self type (an instance with role 4 of the trait fn): it walks
+# the fields, the keys and the tags, and calls the trait functions for the fields and the
+# functions of `Std.Dynamic` whose names start with `derived_`, which do the rest.
+
+## What a trait fn of a std derivable trait does, or "" for one left to its default.
+fn derive_op(def: Int) -> String uses { State[Lowering] } {
+  program = st().program
+  data = def_of(program, def)
+  trait_name = data.parent.map(|t| def_of(program, t).name).or("")
+  ("#{trait_name}.#{data.name}") match {
+    "Encode.to_dynamic"       -> "encode"
+    "Decode.from_dynamic"     -> "decode"
+    "Decode.from_dynamic_all" -> "decode_all"
+    "ObjectKey.to_key"        -> "to_key"
+    "ObjectKey.from_key"      -> "from_key"
+    "Shaped.shape_in"         -> "shape"
+    "Eq.eq"                   -> "eq"
+    _                         -> ""
+  }
+}
+
+## Whether calls of `def` may fail: its declared E is not empty.
+fn declared_fails(def: Int) -> Bool uses { State[Lowering] } {
+  Signature.get(st().checked.sigs, def).map(|s| s.scheme.ty) match {
+    Some(TyFn(f)) -> !f.fails.elems.is_empty()
+    _             -> False
+  }
+}
+
+## A constructor of a deriving type: its reference, tag, fields (key and type), and whether its
+## fields are named.
+type DCtor(ctor: CtorRef, tag: String, fields: List[(String, Type)], named: Bool)
+
+## The definition `name` of the bundled `Std.Dynamic`.
+fn dynamic_def(name: String, fn_like: Bool) -> Int uses { State[Lowering] } {
+  std_def(["Std", "Dynamic"], name, fn_like)
+}
+
+## The definition `name` of the bundled module `module`, a fn or not.
+fn std_def(module: List[String], name: String, fn_like: Bool) -> Int uses { State[Lowering] } {
+  program = st().program
+  found = program.modules.fold(None, |acc, _, items| {
+    acc match {
+      Some(_) -> acc
+      None if items.is_core && items.name == module -> items.items.find(|d| {
+        data = def_of(program, d)
+        kind_ok = if fn_like { data.kind == FnKind } else { data.kind != FnKind }
+        data.name == name && kind_ok
+      })
+      None    -> None
+    }
+  })
+  found.or(-1)
+}
+
+## A call of the function `name` of `Std.Dynamic`.
+fn dynamic_call(name: String, targs: List[Type], args: List[Expr]) -> Expr
+  uses { State[Lowering] } {
+  def = dynamic_def(name, True)
+  direct(instance(def, targs), args.append([ev_var()]), declared_fails(def))
+}
+
+## A call of the function `name` of `Std.Shape`.
+fn shape_call(name: String, targs: List[Type], args: List[Expr]) -> Expr uses { State[Lowering] } {
+  def = std_def(["Std", "Shape"], name, True)
+  direct(instance(def, targs), args.append([ev_var()]), declared_fails(def))
+}
+
+## The trait fn `name` of the std trait `trait_name` called for Self `ty`.
+fn derived_trait_call(trait_name: String, name: String, ty: Type, args: List[Expr]) -> Expr
+  uses { State[Lowering] } {
+  program = st().program
+  module = if trait_name == "Shaped" { ["Std", "Shape"] } else { ["Std", "Dynamic"] }
+  trait_def = std_def(module, trait_name, False)
+  f = program.items.get(trait_def) match {
+    Some(Hir.ITrait(t)) -> t.fns.find(|d| def_of(program, d).name == name).or(-1)
+    _                   -> -1
+  }
+  trait_call(f, [ty], args)
+}
+
+fn str_lit(s: String) -> Expr {
+  XLit(VString(s))
+}
+
+fn int_lit(n: Int) -> Expr {
+  XLit(VInt(n))
+}
+
+## The constructors of the type `ty`, with the field types for its type arguments.
+fn deriving(ty: Type) -> (Bool, List[DCtor]) uses { State[Lowering] } {
+  program = st().program
+  (def, targs) = ty match {
+    CEnum(d, a) -> (d, a)
+    _           -> (-1, [])
+  }
+  (ctors, tags, is_enum) = program.items.get(def) match {
+    Some(IType(t))      -> (t.ctor.map(|c| [c]).or([]), [], False)
+    Some(IEnum(e))      -> (e.variants, e.tags, True)
+    Some(Hir.IError(_)) -> ([def], [], False)
+    _                   -> ([], [], False)
+  }
+  made = ctors.enumerate().map(|(i, c)| {
+    fields = ctor_fields(c)
+    tys = Signature.get(st().checked.sigs, c).map(|s| s.scheme.ty) match {
+      Some(TyFn(f)) -> f.params.map(|p| convert(p, targs))
+      _             -> []
+    }
+    (named, keys) = fields match {
+      NoFields            -> (True, [])
+      NamedFields(fs)     -> (True, fs.map(|f| f.key.or(f.name)))
+      PositionalFields(t) -> (False, List.range(0, t.length()).map(|k| "#{k}"))
+    }
+    tag = tags.get(i).and_then(|t| t).or(def_of(program, c).name)
+    DCtor(ctor_ref(c), tag, keys.zip(tys), named || !is_enum)
+  })
+  (is_enum, made)
+}
+
+## `x match { C(xs..) -> body(c, xs) ... }` over the constructors.
+fn match_ctors(
+  ctors: List[DCtor],
+  x: Int,
+  body: fn(DCtor, List[Int]) -> Expr uses { State[Lowering] },
+) -> Expr
+  uses { State[Lowering] } {
+  arms = ctors.map(|c| {
+    xs = c.fields.map(|(_, t)| fresh_local("x", t, None))
+    Arm(QCtor(c.ctor, xs.map(QBind)), None, body(c, xs))
+  })
+  XMatch(XVar(x), arms)
+}
+
+## `if tag == "A" { a } else if ... else unknown[Self]("one of A, B", tag)`.
+fn by_tag(
+  ty: Type,
+  ctors: List[DCtor],
+  tag: Expr,
+  unknown: String,
+  variant: fn(DCtor) -> Expr uses { State[Lowering] },
+) -> Expr
+  uses { State[Lowering] } {
+  t = fresh_local("tag", CString, None)
+  expected = "one of #{String.join(ctors.map(|c| c.tag), ", ")}"
+  fallback = dynamic_call(unknown, [ty], [str_lit(expected), XVar(t)])
+  body = ctors.reverse().fold(fallback, |acc, c| {
+    XIf(XBinary(BEq, OpString, XVar(t), str_lit(c.tag)), variant(c), acc)
+  })
+  XLet(t, tag, body)
+}
+
+fn then_(first: Expr, rest: Expr) -> Expr {
+  XSeq(first, rest)
+}
+
+fn lower_derived(inst: Instance) -> () uses { State[Lowering] } {
+  upd(|l| Lowering(locals: Map.empty(), subst: [], withs: [], ..l))
+  ty = inst.args.head().or(CUnit)
+  op = derive_op(inst.def)
+  (is_enum, ctors) = deriving(ty)
+  x = fresh_local("self", ty, None)
+  visiting = fresh_local("visiting", CList(CString), None)
+  ev = fresh_ev()
+  other = fresh_local("other", ty, None)
+  body = op match {
+    "shape" -> derived_shape(ty, is_enum, ctors, visiting)
+    "eq" -> {
+      # Same constructor, and every field equal.
+      arms = ctors.map(|c| {
+        xs = c.fields.map(|(_, t)| fresh_local("x", t, None))
+        ys = c.fields.map(|(_, t)| fresh_local("y", t, None))
+        test = c.fields.enumerate().fold(XLit(VBool(True)), |acc, (i, (_, t))| {
+          x_i = XVar(xs.get(i).or(-1))
+          y_i = XVar(ys.get(i).or(-1))
+          XBinary(BAnd, OpBool, acc, eq_expr(t, x_i, y_i))
+        })
+        Arm(QTuple([QCtor(c.ctor, xs.map(QBind)), QCtor(c.ctor, ys.map(QBind))]), None, test)
+      })
+      XMatch(XTuple([XVar(x), XVar(other)]), arms.append([Arm(QWild, None, XLit(VBool(False)))]))
+    }
+    "encode" -> match_ctors(ctors, x, |c, xs| {
+      contents = if c.named {
+        pairs = c.fields.zip(xs).map(|((key, t), v)| {
+          XTuple([str_lit(key), derived_trait_call("Encode", "to_field", t, [XVar(v)])])
+        })
+        dynamic_call("derived_object", [], [XList(CUnit, pairs, None)])
+      } else {
+        values = c.fields.zip(xs).map(
+          |((_, t), v)| derived_trait_call("Encode", "to_dynamic", t, [XVar(v)]),
+        )
+        dynamic_call("derived_items", [], [XList(CUnit, values, None)])
+      }
+      if !is_enum {
+        contents
+      } else if c.fields.is_empty() {
+        dynamic_call("derived_unit_variant", [], [str_lit(c.tag)])
+      } else {
+        dynamic_call("derived_variant", [], [str_lit(c.tag), contents])
+      }
+    })
+    "decode" -> if !is_enum {
+      c = ctors.head().or(DCtor(CtorRef(0, 0), "", [], True))
+      XCtor(
+        c.ctor,
+        [],
+        c.fields.map(|(key, t)| dynamic_call("derived_field", [t], [XVar(x), str_lit(key)])),
+      )
+    } else {
+      tag = dynamic_call("tag", [], [XVar(x)])
+      by_tag(ty, ctors, tag, "derived_unknown_tag", |c| {
+        if c.named {
+          XCtor(
+            c.ctor,
+            [],
+            c.fields.map(|(key, t)| {
+              dynamic_call("derived_contents_field", [t], [XVar(x), str_lit(key)])
+            }),
+          )
+        } else {
+          check = dynamic_call("derived_contents_items", [], [XVar(x), int_lit(c.fields.length())])
+          args = c.fields.enumerate().map(|(i, (_, t))| {
+            dynamic_call("derived_contents_index", [t], [XVar(x), int_lit(i)])
+          })
+          then_(check, XCtor(c.ctor, [], args))
+        }
+      })
+    }
+    "decode_all" -> if !is_enum {
+      c = ctors.head().or(DCtor(CtorRef(0, 0), "", [], True))
+      parts = c.fields.map(
+        |(key, t)| (t, dynamic_call("derived_field_all", [t], [XVar(x), str_lit(key)])),
+      )
+      check_fields(c, "derived_fields_all", x, all_or_fail(c, parts))
+    } else {
+      tag = dynamic_call("derived_tag_all", [], [XVar(x)])
+      by_tag(ty, ctors, tag, "derived_unknown_tag_all", |c| {
+        if c.named {
+          parts = c.fields.map(|(key, t)| {
+            (t, dynamic_call("derived_contents_field_all", [t], [XVar(x), str_lit(key)]))
+          })
+          check_fields(c, "derived_contents_fields_all", x, all_or_fail(c, parts))
+        } else {
+          check = dynamic_call(
+            "derived_contents_items_all",
+            [],
+            [XVar(x), int_lit(c.fields.length())],
+          )
+          parts = c.fields.enumerate().map(|(i, (_, t))| {
+            (t, dynamic_call("derived_contents_index_all", [t], [XVar(x), int_lit(i)]))
+          })
+          then_(check, all_or_fail(c, parts))
+        }
+      })
+    }
+    "to_key" -> match_ctors(ctors, x, |c, xs| {
+      (c.fields.head(), xs.head()) match {
+        (Some((_, t)), Some(v)) if !is_enum -> derived_trait_call(
+          "ObjectKey",
+          "to_key",
+          t,
+          [XVar(v)],
+        )
+        _ -> str_lit(c.tag)
+      }
+    })
+    _ -> if !is_enum {
+      c = ctors.head().or(DCtor(CtorRef(0, 0), "", [], True))
+      XCtor(
+        c.ctor,
+        [],
+        c.fields.map(|(_, t)| derived_trait_call("ObjectKey", "from_key", t, [XVar(x)])),
+      )
+    } else {
+      by_tag(ty, ctors, XVar(x), "derived_unknown_key", |c| XCtor(c.ctor, [], []))
+    }
+  }
+  type_name = ty match {
+    CEnum(d, _) -> def_name(d)
+    _           -> "derived"
+  }
+  name = "#{type_name}$#{op}$#{inst.id}"
+  ret = CUnit
+  params = if op == "shape" {
+    [x, visiting, ev]
+  } else if op == "eq" {
+    [x, other, ev]
+  } else {
+    [x, ev]
+  }
+  fun = Function(name, False, params, ret, 0, False, body, None, False, False, name)
+  set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
+}
+
+## `Shaped.shape_in(None: Option[t], visiting)` for a field of type `t`.
+fn field_shape(t: Type, visiting: Int) -> Expr uses { State[Lowering] } {
+  proxy = shape_call("derived_proxy", [t], [])
+  derived_trait_call("Shaped", "shape_in", t, [proxy, XVar(visiting)])
+}
+
+## The shape of a type: `Ref(name)` if its name is being visited, and otherwise a Record or
+## Variants whose fields are read with the name added (`Std.Shape.visit`).
+fn derived_shape(ty: Type, is_enum: Bool, ctors: List[DCtor], visiting: Int) -> Expr
+  uses { State[Lowering] } {
+  program = st().program
+  (def, targs) = ty match {
+    CEnum(d, a) -> (d, a)
+    _           -> (-1, [])
+  }
+  type_name = def_of(program, def).name
+  name = if targs.is_empty() {
+    str_lit(type_name)
+  } else {
+    shape_call(
+      "generic_name",
+      [],
+      [str_lit(type_name), XList(CUnit, targs.map(|t| field_shape(t, visiting)), None)],
+    )
+  }
+  n = fresh_local("name", CString, None)
+  inner = fresh_local("visiting", CList(CString), None)
+  fields_of = |c: DCtor| {
+    XList(
+      CUnit,
+      c.fields.map(
+        |(key, t)| shape_call("derived_field", [], [str_lit(key), field_shape(t, inner)]),
+      ),
+      None,
+    )
+  }
+  build = if is_enum {
+    variants = ctors.map(|c| {
+      if c.fields.is_empty() {
+        shape_call("derived_no_fields", [], [str_lit(c.tag)])
+      } else if c.named {
+        shape_call("derived_named_fields", [], [str_lit(c.tag), fields_of(c)])
+      } else {
+        shapes = XList(CUnit, c.fields.map(|(_, t)| field_shape(t, inner)), None)
+        shape_call("derived_positional_fields", [], [str_lit(c.tag), shapes])
+      }
+    })
+    shape_call("derived_variants", [], [XVar(n), XList(CUnit, variants, None)])
+  } else {
+    first = ctors.head().or(DCtor(CtorRef(0, 0), "", [], True))
+    shape_call("derived_record", [], [XVar(n), fields_of(first)])
+  }
+  enter = shape_call("derived_enter", [], [XVar(n), XVar(visiting)])
+  visited = shape_call("derived_visited", [], [XVar(n), XVar(visiting)])
+  reference = shape_call("derived_ref", [], [XVar(n)])
+  XLet(n, name, XIf(visited, reference, XLet(inner, enter, build)))
+}
+
+## `check(v); value` when `c` has fields.
+fn check_fields(c: DCtor, check: String, v: Int, value: Expr) -> Expr uses { State[Lowering] } {
+  if c.fields.is_empty() { value } else { then_(dynamic_call(check, [], [XVar(v)]), value) }
+}
+
+## Reads every part into an `Attempt`, fails with all their failures if any failed, and otherwise
+## constructs `c`.
+fn all_or_fail(c: DCtor, parts: List[(Type, Expr)]) -> Expr uses { State[Lowering] } {
+  if parts.is_empty() {
+    XCtor(c.ctor, [], [])
+  } else {
+    binds = parts.map(|(t, read)| (fresh_local("a", CUnit, None), t, read))
+    errors = binds.map(|(a, t, _)| dynamic_call("errors_of", [t], [XVar(a)]))
+    check = dynamic_call("derived_check", [], [XList(CUnit, errors, None)])
+    args = binds.map(|(a, t, _)| dynamic_call("derived_decoded", [t], [XVar(a)]))
+    body = then_(check, XCtor(c.ctor, [], args))
+    binds.reverse().fold(body, |acc, (a, _, read)| XLet(a, read, acc))
+  }
 }

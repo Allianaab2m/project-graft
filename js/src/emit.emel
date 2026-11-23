@@ -225,6 +225,11 @@ const RUNTIME: List[String] = [
   "$causeKind",
   "$causeToString",
   "$causeRaise",
+  "$await",
+  "$abortable",
+  "$wellFormed",
+  "$hold",
+  "$unhold",
 ]
 
 ## The comparison of derived and built-in Ord impls: by `<` on primitive values, element by
@@ -395,15 +400,39 @@ fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) 
         }
         None                      -> "(() => { throw new Error(\"no js binding\"); })"
       }
-      call = "#{target}(#{params})"
-      inner = if f.ret == CUnit {
-        ["    #{call};", "    return undefined;"]
+      # A String from the host is made well formed.
+      from_host = |v: String| if f.ret == CString { "$wellFormed(#{v})" } else { v }
+      if f.suspends {
+        # An `@external suspend fn` gets an AbortSignal last, and its Promise is awaited by the
+        # scheduler, which aborts it when the waiting fiber is interrupted (spec 12.2).
+        signal_args = if params == "" { "$c.signal" } else { "#{params}, $c.signal" }
+        wait = "(yield $await($p, $c))"
+        tail = if f.ret == CUnit {
+          ["  #{wait};", "  return undefined;"]
+        } else {
+          ["  const $v = #{wait};", "  return #{from_host("$v")};"]
+        }
+        [
+          "function* #{f.name}(#{params}) {",
+          "  const $c = $abortable();",
+          "  let $p;",
+          "  try {",
+          "    $p = #{target}(#{signal_args});",
+          "  } catch ($e) {",
+          "    throw $foreign($e);",
+          "  }",
+        ].append(tail).append(["}"])
       } else {
-        ["    return #{call};"]
+        call = "#{target}(#{params})"
+        inner = if f.ret == CUnit {
+          ["    #{call};", "    return undefined;"]
+        } else {
+          ["    return #{from_host(call)};"]
+        }
+        ["function #{f.name}(#{params}) {", "  try {"].append(inner).append(
+          ["  } catch ($e) {", "    throw $foreign($e);", "  }", "}"],
+        )
       }
-      ["function #{f.name}(#{params}) {", "  try {"].append(inner).append(
-        ["  } catch ($e) {", "    throw $foreign($e);", "  }", "}"],
-      )
     }
     None if f.constant -> [
       "const #{f.name}$cell = { state: 0, value: undefined };",
@@ -606,15 +635,29 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
       })
       line("} finally {")
       indented(|| {
+        # A release that may suspend is not interrupted while it runs (spec 11.4).
+        held = if em().generator && suspends_in(cleanup) {
+          t = tmp()
+          line("const #{t} = $hold();")
+          Some(t)
+        } else {
+          None
+        }
         line("try {")
         indented(|| discard(cleanup))
         line("} catch ($e) {")
         indented(|| line("throw $releaseDefect(#{thrown}, $e, #{quote(name)});"))
         line("} finally {")
-        # A release that is not a handler's (the permits of a semaphore) retires nothing.
-        if h != "undefined" {
-          indented(|| line("$retire(#{h}, #{quote(name)});"))
-        }
+        indented(|| {
+          # A release that is not a handler's (the permits of a semaphore) retires nothing.
+          if h != "undefined" {
+            line("$retire(#{h}, #{quote(name)});")
+          }
+          held match {
+            Some(t) -> line("$unhold(#{t});")
+            None    -> ()
+          }
+        })
         line("}")
       })
       line("}")
@@ -1114,6 +1157,16 @@ fn paused(call: String) -> String {
   "($spend() && (yield $pause()), #{call})"
 }
 
+## Whether evaluating `expr` may suspend: a suspending call in it, outside closures.
+fn suspends_in(expr: Expr) -> Bool {
+  expr match {
+    XCall(_, args, _, s) -> s || args.any(suspends_in)
+    XSeq(a, b)           -> suspends_in(a) || suspends_in(b)
+    XLet(_, v, b)        -> suspends_in(v) || suspends_in(b)
+    _                    -> False
+  }
+}
+
 fn keyword(generator: Bool) -> String {
   if generator { "function*" } else { "function" }
 }
@@ -1265,8 +1318,18 @@ fn show_enum_fn(module: Module, id: Int, def: EnumDef) -> List[String] {
     (k, "return `#{escape_template(variant.name)}#{String.concat(pieces)}#{close}`;")
   })
   head = "function $show$#{enum_name(module, id)}(#{String.join(params, ", ")}) {"
+  # The external types the runtime holds are shown by what they are (`[trait.builtin]`).
+  runtime_display = if def.name == "Std_Semaphore_Semaphore" {
+    Some("<semaphore>")
+  } else if def.name == "Std_Queue_Queue" {
+    Some("<queue>")
+  } else {
+    None
+  }
   # With one constructor (an error's `$tag` is its descriptor) there is nothing to switch on.
-  body = if cases.length() == 1 {
+  body = if runtime_display.is_some() {
+    ["  return #{quote(runtime_display.or(""))};"]
+  } else if cases.length() == 1 {
     cases.map(|(_, c)| "  #{c}")
   } else {
     ["  switch (v.$tag) {"].append(cases.map(|(k, c)| "    case #{k}: #{c}")).append(

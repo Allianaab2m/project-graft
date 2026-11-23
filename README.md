@@ -109,23 +109,17 @@ is installed as the default (`PATH=~/.emela/versions/v0.28.2:$PATH`).
   `crates/emela-codegen-c/tests/programs` and `crates/emela-cli/tests`, the 11 projects of
   `examples/` and `tests/laws` (all check without errors), Graft itself, and the inputs embedded in
   the tests of emela-resolve and emela-types, which do have errors.
-- M4: started. `scripts/run.sh` builds the 73 test programs of
-  `crates/emela-codegen-c/tests/programs` with `graft build` and runs the JS with Node through the
-  launcher of `emela run`; each must give the exit code, stdout and stderr in its `.expected` (the
-  output of `emela run`). The JS runtime (`emela-codegen-js/src/runtime.mjs`) and the launcher are
-  read from the checkout, so Graft's JS runs on the reference's runtime. The plan follows
-  emela-core and emela-codegen-js:
-  1. Keeping what type checking learns about bodies: the types of expressions, patterns and
-     locals, call arguments by parameter, type arguments at references, methods and operations.
-  2. The Core IR and the lowering of pure code: fns, literals, operators, strings, records and
-     enums, match, lists, closures and local fns, self tail calls as loops; monomorphization; the
-     JS output.
-  3. Traits and derived impls, `dbg` and `inspect`.
-  4. Errors (`fail`, `escape`) and effects (evidence passing, handlers, `with`, layers).
-  5. Suspension (generators) and fibers.
+- M4: done. `graft build <path> <emela-core lib> <runtime.mjs> <out dir>` writes `main.mjs`, and
+  `scripts/run.sh` builds the 73 test programs of `crates/emela-codegen-c/tests/programs` with it
+  and runs the JS with Node through the launcher of `emela run`: all 73 give the exit code, stdout
+  and stderr in their `.expected` (the output of `emela run`). So do the projects of `examples/`
+  other than `http` and `http-service` (not tried). The JS runtime
+  (`emela-codegen-js/src/runtime.mjs`) and the launcher are read from the checkout, so Graft's JS
+  runs on the reference's runtime. The steps followed emela-core and emela-codegen-js: what type
+  checking learns about bodies; the Core IR and lowering of pure code; traits and derived impls;
+  errors and effects; suspension and fibers.
 
-  Unlike the reference, Graft monomorphizes while lowering (each instance of a definition is
-  lowered with its type arguments), and every function and closure takes the evidence table as
-  its last parameter. 38 of the 73 programs behave as on `emela run`: what remains is labels and
-  handler members in `with`, suspend fn implementations, fibers, `State.run`, and the derived
-  `ObjectKey` and `Encode`.
+  Graft differs from the reference in two places. It monomorphizes while lowering: each instance
+  of a definition is lowered with its type arguments, set type arguments included as summaries
+  (whether the set may fail or suspend). And every function and closure takes the evidence table
+  as its last parameter, so the calling convention does not depend on types.
