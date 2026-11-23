@@ -289,6 +289,25 @@ error: internal error: cannot format this file: the output has a syntax error: e
 
 行き先: 我慢（native の対応待ち）．
 
+### T5. 同じリポジトリの Pome をつなぐ `[replace]` を、ルートで書き直す必要がある
+
+やりたかったこと: Graft を `syntax`、`fmt`、`check` とルート（CLI）の4つの Pome に分け、同じリポジトリの中で手元のディレクトリを使ってつなぐ．
+
+実際に書いたコード: `fmt` と `check` はそれぞれ `syntax` を `[replace]` で `../syntax` に置き換えている．それでもルートの `Pome.toml` には、3つすべての置き換えを書き直した．
+
+```toml
+[replace]
+"github.com/Allianaab2m/project-graft/syntax" = { path = "syntax" }
+"github.com/Allianaab2m/project-graft/fmt" = { path = "fmt" }
+"github.com/Allianaab2m/project-graft/check" = { path = "check" }
+```
+
+`[replace]` は、その Pome をビルドするときにしか効かない（`[module.pome]`）．依存先の `[replace]` は読まれないので、推移的に使う Pome も、ビルドする側がすべて書く．仕様どおりで、公開された Pome の置き換えが利用者に漏れないための規則なのはわかる．ただ、同じリポジトリの Pome が増えるほど、ルートの置き換えの表が長くなり、子の Pome の表と食い違っても気づきにくい．
+
+本来の形: 同じリポジトリ（同じ source path の下）のディレクトリ Pome どうしは、`[replace]` なしで手元のディレクトリを使う．または、ワークスペースのように、リポジトリのルートでまとめて宣言する．
+
+行き先: proposal を検討．
+
 ## Brix
 
 ### B1. 文字列の生成器と「候補から選ぶ」生成器がない
