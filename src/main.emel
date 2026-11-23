@@ -163,6 +163,12 @@ fn build_js(path: String, core: String, runtime: String, out: String) -> ExitCod
         fs.create_directory(out) escape { _ -> () }
         fs.write_text("#{out}/main.mjs", Emit.emit(module))
         fs.write_text("#{out}/emela_runtime.mjs", fs.read_text(runtime))
+        # The host files of the bundled std, which external fns import.
+        fs.create_directory("#{out}/emela_core") escape { _ -> () }
+        fs.create_directory("#{out}/emela_core/std") escape { _ -> () }
+        fs.list_directory("#{core}/std").filter(|n| n.ends_with(".mjs")).each(|n| {
+          fs.write_text("#{out}/emela_core/std/#{n}", fs.read_text("#{core}/std/#{n}"))
+        })
         EXIT_SUCCESS
       } escape {
         _ -> {
