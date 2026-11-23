@@ -2,6 +2,7 @@ import Brix.Pbt.Gen
 import Brix.Pbt.Property
 import Std.Array
 import Lexer
+import Source
 import Token.{
   Kind,
   Whitespace,
@@ -41,7 +42,6 @@ import Token.{
   Pipe2,
   At,
   Lt,
-  LeftArrow,
   ErrorToken,
 }
 
@@ -52,7 +52,7 @@ fn kinds(src: String) -> List[Kind] {
 ## The text of each token.
 fn texts(src: String) -> List[String] {
   code_points = Array.from_list(String.code_points(src))
-  List.map(Lexer.lex(src), |t| Lexer.slice(code_points, t.start, t.end))
+  List.map(Lexer.lex(src), |t| Source.slice(code_points, t.start, t.end))
 }
 
 @test
@@ -87,7 +87,7 @@ fn punctuation_is_cut_by_longest_match() {
       Whitespace,
       At,
     ]
-  assert kinds("a<-1") == [LowerName, LeftArrow, IntLit]
+  assert kinds("a<-1") == [LowerName, Lt, Minus, IntLit]
   assert kinds("a < -1") == [LowerName, Whitespace, Lt, Whitespace, Minus, IntLit]
 }
 

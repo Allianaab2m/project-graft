@@ -4,6 +4,8 @@
 ## The source is read as an array of code points, and token positions count code points.
 ## Diagnostics are not reported yet.
 import Std.Array.{Array}
+import Continuation
+import Source.{slice}
 import Token.{
   Kind,
   Token,
@@ -72,7 +74,6 @@ import Token.{
   Neq,
   Lt,
   LtEq,
-  LeftArrow,
   Gt,
   GtEq,
   Amp2,
@@ -128,15 +129,8 @@ pub fn lex(text: String) -> List[Token] {
 }
 
 pub fn tokens(src: Array[Int]) -> List[Token] {
-  List.reverse(run(src, 0, [Code], []))
-}
-
-## The text of the code points from `start` to `end`.
-pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
-  Array.slice(src, start, end)
-    |> Array.to_list
-    |> List.filter_map(String.from_code_point)
-    |> String.concat
+  raw = Array.from_list(List.reverse(run(src, 0, [Code], [])))
+  Continuation.mark(src, raw)
 }
 
 fn run(src: Array[Int], pos: Int, modes: List[Mode], acc: List[Token]) -> List[Token] {
@@ -244,11 +238,7 @@ fn scan_punct(src: Array[Int], pos: Int, c: Int, next: Int) -> (Kind, Int) {
     MINUS   -> if next == GT { double(ThinArrow) } else { single(Minus) }
     BANG    -> if next == EQ { double(Neq) } else { single(Bang) }
     GT      -> if next == EQ { double(GtEq) } else { single(Gt) }
-    LT -> next match {
-      EQ    -> double(LtEq)
-      MINUS -> double(LeftArrow)
-      _     -> single(Lt)
-    }
+    LT      -> if next == EQ { double(LtEq) } else { single(Lt) }
     PIPE -> next match {
       GT   -> double(PipeGt)
       PIPE -> double(Pipe2)
