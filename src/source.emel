@@ -1,0 +1,10 @@
+## Sources as arrays of code points.
+import Std.Array.{Array}
+
+## The text of the code points from `start` (inclusive) to `end` (exclusive).
+pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
+  Array.slice(src, start, end)
+    |> Array.to_list
+    |> List.filter_map(String.from_code_point)
+    |> String.concat
+}

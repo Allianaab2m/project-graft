@@ -1,0 +1,11 @@
+[package]
+name = "graft-oracle"
+description = "Dumps what the reference implementation of Emela makes of a source, for Graft to compare with"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# Keep the tag equal to `emela` in ../../Pome.toml (CI checks it).
+emela-syntax = { git = "https://github.com/emela-lang/emela", tag = "v0.28.2" }
+rowan = "0.17"

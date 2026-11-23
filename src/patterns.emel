@@ -1,0 +1,231 @@
+## Patterns (spec 17.6). Follows `grammar/patterns.rs` of the reference implementation.
+import Std.State.{State}
+import Parser.{
+  Parser,
+  at,
+  at_eof,
+  bump,
+  current,
+  eat,
+  err_recover,
+  report,
+  expect,
+  finish,
+  literal,
+  nth,
+  start,
+}
+import Syntax.{
+  NodeKind,
+  Error,
+  WildcardPat,
+  IdentPat,
+  LiteralPat,
+  ConstPat,
+  VariantPat,
+  PatArgList,
+  FieldPat,
+  UnitPat,
+  TuplePat,
+  ListPat,
+  RestPat,
+}
+import Token.{
+  Kind,
+  Newline,
+  IntLit,
+  FloatLit,
+  StringQuote,
+  TripleQuote,
+  InterpStart,
+  InterpEnd,
+  LowerName,
+  TypeName,
+  UpperName,
+  Underscore,
+  IfKw,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  Comma,
+  Colon,
+  Eq,
+  ThinArrow,
+  Minus,
+  Dot2,
+}
+import Types.{path}
+
+## When a pattern fails to parse, stop without consuming the next token if it belongs to what
+## follows.
+const RECOVERY = [RParen, RBrack, LBrace, RBrace, Comma, Eq, Colon, ThinArrow, IfKw, Newline]
+
+fn is_number(kind: Kind) -> Bool {
+  kind == IntLit || kind == FloatLit
+}
+
+## Whether `pattern` can read something here.
+pub fn at_pattern_start() -> Bool uses { State[Parser] } {
+  kind = current()
+  kind match {
+    Minus -> is_number(nth(1))
+    _ -> (
+      kind == Underscore
+        || kind == LowerName
+        || kind == UpperName
+        || is_number(kind)
+        || kind == StringQuote
+        || kind == TripleQuote
+        || kind == TypeName
+        || kind == LParen
+        || kind == LBrack
+    )
+  }
+}
+
+pub fn pattern() -> () uses { State[Parser] } {
+  current() match {
+    Underscore  -> token_node(WildcardPat)
+    LowerName   -> token_node(IdentPat)
+    UpperName   -> token_node(ConstPat)
+    IntLit      -> literal_pat()
+    FloatLit    -> literal_pat()
+    StringQuote -> literal_pat()
+    TripleQuote -> literal_pat()
+    # A negative number is a pattern-only form (spec 6.5): the `-` belongs to the literal.
+    Minus if is_number(nth(1)) -> {
+      m = start()
+      bump()
+      literal(interp_in_pattern)
+      finish(m, LiteralPat)
+    }
+    TypeName    -> variant_pat()
+    LParen      -> paren_pat()
+    LBrack      -> list_pat()
+    _           -> err_recover("E0113", "expected pattern", RECOVERY)
+  }
+}
+
+fn token_node(kind: NodeKind) -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  finish(m, kind)
+}
+
+fn literal_pat() -> () uses { State[Parser] } {
+  m = start()
+  literal(interp_in_pattern)
+  finish(m, LiteralPat)
+}
+
+## Interpolation in a pattern string has no meaning, so report it and skip to `}`.
+fn interp_in_pattern() -> () uses { State[Parser] } {
+  report("E0117", "string interpolation is not allowed in a pattern")
+  m = start()
+  skip_interp(0)
+  finish(m, Error)
+}
+
+fn skip_interp(depth: Int) -> () uses { State[Parser] } {
+  if !(at_eof() || depth == 0 && at(InterpEnd)) {
+    next = current() match {
+      InterpStart -> depth + 1
+      InterpEnd   -> depth - 1
+      _           -> depth
+    }
+    bump()
+    skip_interp(next)
+  }
+}
+
+## `type_ref [ "(" pat_args ")" ]`
+fn variant_pat() -> () uses { State[Parser] } {
+  m = start()
+  path()
+  if at(LParen) { pat_args() }
+  finish(m, VariantPat)
+}
+
+## `".." | pat_arg { "," pat_arg } [ "," ".." ]`. `pat_arg = pattern | lower_name ":" [ pattern ]`
+fn pat_args() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  pat_arg_elements(False)
+  expect(RParen)
+  finish(m, PatArgList)
+}
+
+fn pat_arg_elements(seen_rest: Bool) -> () uses { State[Parser] } {
+  if !at(RParen) && !at_eof() {
+    if seen_rest { report("E0114", "`..` must come last") }
+    rest = if at(Dot2) {
+      rest_pat(False)
+      True
+    } else if at(LowerName) && nth(1) == Colon {
+      f = start()
+      bump()
+      bump()
+      if !at(Comma) && !at(RParen) { pattern() }
+      finish(f, FieldPat)
+      seen_rest
+    } else {
+      pattern()
+      seen_rest
+    }
+    if eat(Comma) { pat_arg_elements(rest) }
+  }
+}
+
+## `()` or a tuple of two or more.
+fn paren_pat() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  count = paren_pat_elements(0)
+  if count == 1 { report("E0112", "a tuple pattern needs at least two elements") }
+  expect(RParen)
+  finish(m, if count == 0 { UnitPat } else { TuplePat })
+}
+
+fn paren_pat_elements(count: Int) -> Int uses { State[Parser] } {
+  if at(RParen) || at_eof() {
+    count
+  } else {
+    pattern()
+    if eat(Comma) { paren_pat_elements(count + 1) } else { count + 1 }
+  }
+}
+
+## `"[" "]" | "[" pattern { "," pattern } [ "," ".." [ lower_name ] ] "]"`
+fn list_pat() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  list_pat_elements(False, False)
+  expect(RBrack)
+  finish(m, ListPat)
+}
+
+fn list_pat_elements(has_element: Bool, seen_rest: Bool) -> () uses { State[Parser] } {
+  if !at(RBrack) && !at_eof() {
+    if seen_rest { report("E0114", "`..` must come last") }
+    (element, rest) = if at(Dot2) {
+      if !has_element { report("E0115", "`..` needs at least one element before it") }
+      rest_pat(True)
+      (has_element, True)
+    } else {
+      pattern()
+      (True, seen_rest)
+    }
+    if eat(Comma) { list_pat_elements(element, rest) }
+  }
+}
+
+## In a list, a name may follow.
+fn rest_pat(named: Bool) -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  if named && at(LowerName) { bump() }
+  finish(m, RestPat)
+}

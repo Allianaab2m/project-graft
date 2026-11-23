@@ -52,6 +52,97 @@ const L_BRACE = 0x7B
 
 行き先: proposal を検討．ただし文字列のコードポイントを走査するプログラムが Graft 以外にどれだけあるかを先に確かめる．
 
+### L3. 同じ effect を書く `uses` 節を 190 回書いた
+
+やりたかったこと: parser の状態を `State[Parser]` に持ち、文法の関数から読み書きする．
+
+実際に書いたコード: 文法の関数すべてに同じ節を付けた．`src/` 全体で 190 回．
+
+```emel
+fn param_list() -> () uses { State[Parser] } {
+fn arm_list() -> () uses { State[Parser] } {
+fn with_items() -> () uses { State[Parser] } {
+```
+
+効果の集合に名前を付ける手段がない．関数を引数に取る箇所（`delimited` や `separated_items`）は型にも同じ節が入るので、シグネチャが1行に収まらず引数を折り返している．
+
+本来の形: effect の集合の別名（`effects ParserEffects = { State[Parser] }` のようなもの）．またはモジュール単位で既定の `uses` を宣言する．
+
+行き先: proposal．State で手続き的なアルゴリズムを書くプログラムなら、関数の数だけ同じ節が並ぶ．
+
+### L4. パターンの or がない
+
+やりたかったこと: 二項演算子の結合力を種別ごとに返す．
+
+実際に書いたコード: 比較演算子 6 つを1行ずつ書いた．`infix_power` は 15 本の arm になった．
+
+```emel
+Eq2     -> 4
+Neq     -> 4
+Lt      -> 4
+LtEq    -> 4
+Gt      -> 4
+GtEq    -> 4
+```
+
+arm を並べられない条件（`at_pattern_start` など）は `kind == A || kind == B || ...` の連鎖にした．
+
+本来の形: `Eq2 | Neq | Lt | LtEq | Gt | GtEq -> 4`．
+
+行き先: proposal．
+
+### L5. 値を捨てて `()` にする書き方がない
+
+やりたかったこと: `if at(LBrace) { block() } else { expect(LBrace) }` のように、値を返す関数を副作用のためだけに呼ぶ．
+
+実際に書いたコード: ブロックの最後に `()` を足した．`src/grammar.emel` だけで 27 か所．
+
+```emel
+if at(LParen) {
+  arg_list()
+} else {
+  expect(LParen)
+  ()
+}
+```
+
+`else` のない `if` の本体や、`()` を返す関数の最後の式が値を持つと型エラー（E0301）になる．文の途中なら値は黙って捨てられるので、最後の式だけ扱いが違う．Rust は `;` で捨てられる．
+
+本来の形: 文の位置と同じく、`()` が期待される最後の式の値も捨てる．または値を捨てる組み込み（`ignore(expect(LParen))`）．
+
+行き先: proposal を検討．書き忘れても型エラーで気づけるので、優先度は低い．
+
+### L6. ループがないので、Rust の文法関数 94 個が 152 個になった
+
+やりたかったこと: Rust の `while` と `loop` を移植する．
+
+実際に書いたコード: ループごとに末尾呼び出しの補助関数を作った（`delimited_elements`、`block_items`、`skip_line` など）．ループの中で更新していた変数（`count`、`trailing_comma`、`seen_rest`）は引数と戻り値のタプルに移した．
+
+```emel
+fn paren_elements(count: Int) -> (Int, Bool) uses { State[Parser] } {
+  if at(RParen) || at_eof() {
+    (count, count > 0)
+  } else {
+    expr()
+    if eat(Comma) { paren_elements(count + 1) } else { (count + 1, False) }
+  }
+}
+```
+
+行き先: 我慢．ループを持たないのは言語の判断で、末尾呼び出しは保証されている．補助関数がモジュールの別の場所に散るのが読みにくさの主因なので、次はローカル fn（`[fn.local]`）で呼び出し元の中に置く書き方を試す．
+
+### L7. 引数の関数型が、書いていない fails と uses について多相になる
+
+やりたかったこと: `fn update(f: fn(Parser) -> Parser)` で受け取った関数を `State.update` に渡す．
+
+起きたこと: `State.update` は純粋な関数を求めるので、E0321（`expected fails {}, found fails E(f)`）と E0403 になった．引数の型に節を書かないと、その関数はどんな error と effect も持ちうる扱いになる．
+
+対応: `st.set(f(st.get()))` と書き換えた．
+
+本来の形: 純粋な関数だけを受け取ると型に書く方法（`fn(Parser) -> Parser fails {} uses {}` のような形）が、仕様か診断の help で示されているとよい．
+
+行き先: 我慢．診断に help を足す本体 issue にするかは、仕様を確かめてから決める．
+
 ## std
 
 ### S1. String を位置で読めない
@@ -88,6 +179,22 @@ pub fn slice(src: Array[Int], start: Int, end: Int) -> String {
 本来の形: wasm で使えない handler に届くプログラムは、ビルド時に診断が出る．
 
 行き先: 本体 issue．失敗したときの error の中身はまだ確かめていない（Graft 側で `escape { _ -> None }` していて見えない）．
+
+### T2. reference の parser が、壊れた handler の `init` で panic する
+
+起きたこと: Graft と reference の構文木を、corpus を壊した入力 4,400 件で突き合わせたら、reference が 6 件 panic した．どれも同じ箇所．
+
+```emel
+handler Hd: Kv {
+  init(a
+}
+```
+
+`emela check` も `expected to be at L_BRACE, found R_BRACE`（`parser.rs:219`）で落ちる．`handler_decl` が `init` の引数リストを読んだ後、`{` があるか確かめずに `block` を呼び、`block` は `{` を前提に `bump_kind(L_BRACE)` する．main のコードも同じ．入力途中の `init(a` で落ちるので、エディタの language server も落ちる．
+
+本来の形: `{` がなければ診断を出して読み進める（`block_or_error` と同じ扱い）．
+
+行き先: 本体 issue（未提出）．Graft は reference の木に合わせる都合で、同じ箇所を検査なしで読んでいる．
 
 ## Brix
 
@@ -129,3 +236,5 @@ gen = Gen.list(Gen.int_between(0, List.length(PIECES) - 1)) |> Gen.map(source_of
 起きたこと: 本体リポジトリの `main` の spec を見て effect alias `x <- E` を書いたら、0.28.2 では `x < -E` という比較として読まれた．`emela fmt` もそのとおりに書き換えた．`x <- E` は 0.28.2 の後に main へ入った機能（emela-lang/emela#791）．
 
 対応: spec はリリースタグで読む（README の Rules に追記済み）．本体には何も出さない．
+
+lexer にも `<-` を1トークンにする処理が残っていた．corpus に `<-` がないのでトークン列の比較では見つからず、M2 で token の一覧を見直したときに気づいて消した．

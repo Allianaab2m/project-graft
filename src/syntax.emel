@@ -1,0 +1,170 @@
+## Syntax trees: the kinds of nodes and the lossless tree the parser builds.
+##
+## Node kinds follow `SyntaxKind` of the reference implementation in PascalCase (`FN_DECL` is
+## FnDecl), so that `graft tree` prints what `tools/oracle` prints.
+import Token.{Token}
+
+pub enum NodeKind {
+  # Declarations (spec 17.3)
+  Root
+  Import
+  ImportList
+  Annotation
+  AnnotArgList
+  AnnotArg
+  AnnotPath
+  FnDecl
+  LocalFn
+  TypeDecl
+  ErrorDecl
+  EnumDecl
+  FieldList
+  Field
+  VariantList
+  Variant
+  TupleFieldList
+  DeriveClause
+  ConstDecl
+  EffectDecl
+  OpSig
+  EffectLabel
+  MemberSig
+  HandlerDecl
+  HandlerEffect
+  HandlerInit
+  HandlerRelease
+  LayerDecl
+  TraitDecl
+  ImplDecl
+  ImplType
+  ItemList
+  TypeParamList
+  TypeParam
+
+  # Types (spec 17.4)
+  Path
+  PathType
+  TypeArgList
+  TypeVar
+  SelfType
+  UnitType
+  TupleType
+  ParenType
+  FnType
+  CapType
+  ParamTypeList
+  RetType
+  FailsClause
+  ErrorSet
+  UsesClause
+  EffectSet
+
+  # Literals
+  Literal
+  String
+  Interp
+
+  # Patterns (spec 17.6)
+  WildcardPat
+  IdentPat
+  LiteralPat
+  ConstPat
+  VariantPat
+  PatArgList
+  FieldPat
+  UnitPat
+  TuplePat
+  ListPat
+  RestPat
+
+  # Expressions (spec 17.5)
+  NameRef
+  PathExpr
+  UnderscoreExpr
+  UnitExpr
+  ParenExpr
+  TupleExpr
+  ListExpr
+  RestExpr
+  CallExpr
+  ArgList
+  NamedArg
+  SpreadArg
+  FieldExpr
+  PrefixExpr
+  BinExpr
+  UseExpr
+  FailExpr
+  AssertExpr
+  BlockExpr
+  Binding
+  IfExpr
+  MatchExpr
+  MatchArmList
+  MatchArm
+  MatchGuard
+  WithExpr
+  WithBy
+  Supply
+  WithBind
+  CapMember
+  EscapeExpr
+  LambdaExpr
+  ParamList
+  Param
+
+  ## A range the parser skipped during error recovery.
+  Error
+} derive Eq, Show
+
+## Whether a node takes the doc comment `##` right before it.
+pub fn takes_doc(kind: NodeKind) -> Bool {
+  kind match {
+    FnDecl         -> True
+    LocalFn        -> True
+    TypeDecl       -> True
+    ErrorDecl      -> True
+    EnumDecl       -> True
+    ConstDecl      -> True
+    EffectDecl     -> True
+    OpSig          -> True
+    MemberSig      -> True
+    HandlerDecl    -> True
+    HandlerInit    -> True
+    HandlerRelease -> True
+    LayerDecl      -> True
+    TraitDecl      -> True
+    ImplDecl       -> True
+    Field          -> True
+    Variant        -> True
+    DeriveClause   -> True
+    _              -> False
+  }
+}
+
+## A tree whose leaves are all the tokens of the source, trivia included, so its text is the
+## source. A node spans the code points `start` to `end`; an empty node sits where it was opened.
+pub enum Tree {
+  Branch(kind: NodeKind, start: Int, end: Int, children: List[Tree])
+  Leaf(token: Token)
+}
+
+## A diagnostic over the code points `start` to `end`. `code` is of the form `E0110`.
+pub type Diagnostic(code: String, start: Int, end: Int, message: String)
+
+## The tree as `Kind@start..end` lines, nested elements indented by two spaces, in the format of
+## `tools/oracle`.
+pub fn dump(tree: Tree) -> List[String] {
+  List.reverse(dump_onto(tree, "", []))
+}
+
+fn dump_onto(tree: Tree, indent: String, acc: List[String]) -> List[String] {
+  tree match {
+    Leaf(t) -> ["#{indent}#{t.kind}@#{t.start}..#{t.end}\n", ..acc]
+    Branch(kind, start, end, children) -> {
+      line = "#{indent}#{kind}@#{start}..#{end}\n"
+      inner = "#{indent}  "
+      List.fold(children, [line, ..acc], |lines, child| dump_onto(child, inner, lines))
+    }
+  }
+}

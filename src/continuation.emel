@@ -1,0 +1,213 @@
+## Line continuation (`[lex.continuation]`). Retags as NewlineCont each Newline that continues the
+## previous line. Follows `mark_continuations` of the reference implementation.
+import Std.Array.{Array}
+import Source.{slice}
+import Token.{
+  Kind,
+  Token,
+  is_trivia,
+  Newline,
+  NewlineCont,
+  LowerName,
+  TypeName,
+  UpperName,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  InterpStart,
+  InterpEnd,
+  Dot,
+  Pipe,
+  MatchKw,
+  Star,
+  Slash,
+  Percent,
+  Plus,
+  Eq2,
+  Neq,
+  Lt,
+  LtEq,
+  Gt,
+  GtEq,
+  Amp2,
+  PipeGt,
+  EscapeKw,
+  ElseKw,
+  ThinArrow,
+}
+
+## Rule 5 follows the tokens of the error set of a fails clause: `fails` followed by an error item
+## (a type name, possibly qualified, or an uppercase name), then `|` and error items. A line that
+## ends right after an item continues when the next line starts with `|`.
+enum ErrorSet {
+  Outside
+  ## Right after `fails`, or after `|` inside the set.
+  BeforeItem
+  ## Right after an error item (`NotFound`, `Http.Error`, `E`).
+  AfterItem
+  ## After the `.` of a qualified item.
+  AfterDot
+} derive Eq
+
+pub fn mark(src: Array[Int], tokens: Array[Token]) -> List[Token] {
+  List.reverse(run(src, tokens, 0, [], Outside, []))
+}
+
+fn run(
+  src: Array[Int],
+  tokens: Array[Token],
+  i: Int,
+  stack: List[Kind],
+  error_set: ErrorSet,
+  acc: List[Token],
+) -> List[Token] {
+  Array.get(tokens, i) match {
+    None -> acc
+    Some(token) -> {
+      kind = token.kind
+      set = if is_trivia(kind) || kind == Newline {
+        error_set
+      } else {
+        next_error_set(error_set, src, token)
+      }
+      if opens(kind) {
+        run(src, tokens, i + 1, [kind, ..stack], set, [token, ..acc])
+      } else if closes(kind) {
+        run(src, tokens, i + 1, List.tail(stack), set, [token, ..acc])
+      } else if kind == Newline {
+        inside = stack match {
+          [LParen, ..]      -> True
+          [LBrack, ..]      -> True
+          [InterpStart, ..] -> True
+          _                 -> False
+        }
+        next = next_significant(tokens, i)
+        continues = (
+          inside
+            || Option.map(next, |t| starts_continuation(t.kind)) == Some(True)
+            || postfix_match_follows(tokens, i)
+            || starts_clause(src, tokens, i)
+            || (set == AfterItem && Option.map(next, |t| t.kind) == Some(Pipe))
+        )
+        if continues {
+          cont = Token(NewlineCont, token.start, token.end)
+          run(src, tokens, i + 1, stack, set, [cont, ..acc])
+        } else {
+          run(src, tokens, i + 1, stack, Outside, [token, ..acc])
+        }
+      } else {
+        run(src, tokens, i + 1, stack, set, [token, ..acc])
+      }
+    }
+  }
+}
+
+fn opens(kind: Kind) -> Bool {
+  kind == LParen || kind == LBrack || kind == LBrace || kind == InterpStart
+}
+
+fn closes(kind: Kind) -> Bool {
+  kind == RParen || kind == RBrack || kind == RBrace || kind == InterpEnd
+}
+
+fn next_error_set(set: ErrorSet, src: Array[Int], token: Token) -> ErrorSet {
+  kind = token.kind
+  if kind == LowerName && slice(src, token.start, token.end) == "fails" {
+    BeforeItem
+  } else if (set == BeforeItem || set == AfterDot) && kind == TypeName {
+    AfterItem
+  } else if set == BeforeItem && kind == UpperName {
+    AfterItem
+  } else if set == AfterItem && kind == Dot {
+    AfterDot
+  } else if set == AfterItem && kind == Pipe {
+    BeforeItem
+  } else {
+    Outside
+  }
+}
+
+## The position of the first token after `i` that is neither trivia nor a newline.
+fn next_significant_index(tokens: Array[Token], i: Int) -> Option[Int] {
+  Array.get(tokens, i + 1) match {
+    None                                              -> None
+    Some(t) if is_trivia(t.kind) || t.kind == Newline -> next_significant_index(tokens, i + 1)
+    Some(_)                                           -> Some(i + 1)
+  }
+}
+
+fn next_significant(tokens: Array[Token], i: Int) -> Option[Token] {
+  next_significant_index(tokens, i) match {
+    None    -> None
+    Some(j) -> Array.get(tokens, j)
+  }
+}
+
+## Rule 1 for `match`: a line starting with `match {` continues the previous one. Otherwise the
+## line is a prefix match (E0142) and starts a new statement, so that the parser can report it.
+fn postfix_match_follows(tokens: Array[Token], i: Int) -> Bool {
+  next_significant_index(tokens, i) match {
+    None -> False
+    Some(j) -> {
+      is_match = Option.map(Array.get(tokens, j), |t| t.kind) == Some(MatchKw)
+      is_match && Option.map(next_significant(tokens, j), |t| t.kind) == Some(LBrace)
+    }
+  }
+}
+
+## Rule 4: a line starting with `fails` or `uses` followed, on that line, by a type name, an
+## uppercase name or `{` continues the previous one.
+fn starts_clause(src: Array[Int], tokens: Array[Token], i: Int) -> Bool {
+  next_significant_index(tokens, i) match {
+    None -> False
+    Some(j) -> {
+      first = Array.get(tokens, j)
+      word = Option.map(
+        first,
+        |t| if t.kind == LowerName { slice(src, t.start, t.end) } else { "" },
+      )
+      if word == Some("fails") || word == Some("uses") {
+        after = next_on_line(tokens, j + 1)
+        after == Some(TypeName) || after == Some(UpperName) || after == Some(LBrace)
+      } else {
+        False
+      }
+    }
+  }
+}
+
+## The kind of the first token from `i` that is not trivia. A Newline counts, as it ends the line.
+fn next_on_line(tokens: Array[Token], i: Int) -> Option[Kind] {
+  Array.get(tokens, i) match {
+    None                         -> None
+    Some(t) if is_trivia(t.kind) -> next_on_line(tokens, i + 1)
+    Some(t)                      -> Some(t.kind)
+  }
+}
+
+## Rules 1 and 3. `-` and `||` can also start an operand, so a line starting with them starts a new
+## statement.
+fn starts_continuation(kind: Kind) -> Bool {
+  [
+    Star,
+    Slash,
+    Percent,
+    Plus,
+    Eq2,
+    Neq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Amp2,
+    PipeGt,
+    Dot,
+    EscapeKw,
+    ElseKw,
+    ThinArrow,
+  ]
+    |> List.any(|k| k == kind)
+}

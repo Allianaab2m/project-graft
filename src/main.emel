@@ -2,11 +2,21 @@
 ##
 ## - `graft roundtrip <file>...` lexes each file and checks that its tokens concatenate back to
 ##   the file without gaps.
+## - `graft tokens <file>` prints the tokens of a file as `Kind@start..end`, one per line, in the
+##   format of `tools/oracle`.
+## - `graft parse <file>...` parses each file and prints the number of diagnostics, to time the
+##   parser.
+## - `graft tree <file>` prints the syntax tree of a file and the diagnostics of the parser, in the
+##   format of `tools/oracle`.
 import Std.Array.{Array}
 import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
-import Std.Process.{Process, Args, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
+import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
+import Grammar
 import Lexer
+import Parser
+import Sink
+import Syntax
 
 fn main() -> ExitCode {
   with Process {
@@ -14,8 +24,13 @@ fn main() -> ExitCode {
     console = use Console
     args.list() match {
       ["roundtrip", ..files] -> roundtrip(files)
+      ["tokens", path]       -> tokens(path)
+      ["parse", ..files]     -> parse(files)
+      ["tree", path]         -> tree(path)
       _ -> {
-        console.print_error_line("usage: graft roundtrip <file>...")
+        console.print_error_line(
+          "usage: graft roundtrip <file>... | graft parse <file>... | graft tokens <file> | graft tree <file>",
+        )
         Process.exit_code(2)
       }
     }
@@ -41,6 +56,63 @@ fn roundtrips(path: String) -> Bool uses { FileSystem } {
       tokens = Lexer.tokens(src)
       end = List.fold(tokens, 0, |pos, t| if t.start == pos && t.end > pos { t.end } else { -1 })
       end == Array.size(src)
+    }
+  }
+}
+
+fn tokens(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
+  console = use Console
+  fs = use FileSystem
+  Some(fs.read_text(path)) escape { _ -> None } match {
+    None -> {
+      console.print_error_line("cannot read #{path}")
+      EXIT_FAILURE
+    }
+    Some(text) -> {
+      lines = Lexer.lex(text) |> List.map(|t| "#{t.kind}@#{t.start}..#{t.end}\n")
+      (use Stdout).print(String.concat(lines))
+      EXIT_SUCCESS
+    }
+  }
+}
+
+fn parse(files: List[String]) -> ExitCode uses { Console, FileSystem } {
+  console = use Console
+  fs = use FileSystem
+  counts = List.map(files, |path| {
+    Some(fs.read_text(path)) escape { _ -> None } match {
+      None       -> -1
+      Some(text) -> List.length(build(text).diagnostics)
+    }
+  })
+  unread = List.length(List.filter(counts, |n| n < 0))
+  diagnostics = List.fold(counts, 0, |sum, n| if n > 0 { sum + n } else { sum })
+  console.print_line(
+    "#{List.length(files) - unread} files parsed, #{diagnostics} diagnostics, #{unread} unreadable",
+  )
+  if unread == 0 { EXIT_SUCCESS } else { EXIT_FAILURE }
+}
+
+fn build(text: String) -> Sink.Built {
+  src = Array.from_list(String.code_points(text))
+  tokens = Lexer.tokens(src)
+  p = Parser.run(src, tokens, Grammar.source_file)
+  Sink.build(src, Array.from_list(tokens), p)
+}
+
+fn tree(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
+  console = use Console
+  fs = use FileSystem
+  Some(fs.read_text(path)) escape { _ -> None } match {
+    None -> {
+      console.print_error_line("cannot read #{path}")
+      EXIT_FAILURE
+    }
+    Some(text) -> {
+      built = build(text)
+      errors = List.map(built.diagnostics, |d| "error[#{d.code}]@#{d.start}..#{d.end}\n")
+      (use Stdout).print(String.concat(List.append(Syntax.dump(built.tree), errors)))
+      EXIT_SUCCESS
     }
   }
 }

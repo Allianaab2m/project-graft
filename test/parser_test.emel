@@ -1,0 +1,188 @@
+import Brix.Pbt.Gen
+import Brix.Pbt.Property
+import Std.Array
+import Grammar
+import Lexer
+import Parser
+import Sink
+import Syntax.{Tree, Branch, Leaf, dump}
+import Token.{Token}
+
+## The tree and the diagnostics of `src` as `graft tree` prints them, one line per element.
+fn tree(src: String) -> List[String] {
+  built = build(src)
+  errors = List.map(built.diagnostics, |d| "error[#{d.code}]@#{d.start}..#{d.end}")
+  List.append(List.map(dump(built.tree), trim_newline), errors)
+}
+
+fn build(src: String) -> Sink.Built {
+  code_points = Array.from_list(String.code_points(src))
+  tokens = Lexer.tokens(code_points)
+  p = Parser.run(code_points, tokens, Grammar.source_file)
+  Sink.build(code_points, Array.from_list(tokens), p)
+}
+
+fn trim_newline(line: String) -> String {
+  String.code_points(line)
+    |> List.filter(|c| c != 0x0A)
+    |> List.filter_map(String.from_code_point)
+    |> String.concat
+}
+
+@test
+fn a_binary_operator_wraps_its_left_operand_later() {
+  assert tree("const N = a + b * c")
+    == [
+      "Root@0..19",
+      "  ConstDecl@0..19",
+      "    ConstKw@0..5",
+      "    Whitespace@5..6",
+      "    UpperName@6..7",
+      "    Whitespace@7..8",
+      "    Eq@8..9",
+      "    Whitespace@9..10",
+      "    BinExpr@10..19",
+      "      NameRef@10..11",
+      "        LowerName@10..11",
+      "      Whitespace@11..12",
+      "      Plus@12..13",
+      "      Whitespace@13..14",
+      "      BinExpr@14..19",
+      "        NameRef@14..15",
+      "          LowerName@14..15",
+      "        Whitespace@15..16",
+      "        Star@16..17",
+      "        Whitespace@17..18",
+      "        NameRef@18..19",
+      "          LowerName@18..19",
+    ]
+}
+
+@test
+fn a_doc_comment_goes_inside_the_declaration_and_trailing_trivia_inside_root() {
+  assert tree("## Doc.\nfn f() {}\n")
+    == [
+      "Root@0..18",
+      "  FnDecl@0..17",
+      "    DocComment@0..7",
+      "    Newline@7..8",
+      "    FnKw@8..10",
+      "    Whitespace@10..11",
+      "    LowerName@11..12",
+      "    ParamList@12..14",
+      "      LParen@12..13",
+      "      RParen@13..14",
+      "    Whitespace@14..15",
+      "    BlockExpr@15..17",
+      "      LBrace@15..16",
+      "      RBrace@16..17",
+      "  Newline@17..18",
+    ]
+}
+
+@test
+fn a_statement_not_followed_by_a_newline_is_skipped_to_the_line_end() {
+  assert tree("fn f() {\n  x = 1 2\n}\n")
+    == [
+      "Root@0..21",
+      "  FnDecl@0..20",
+      "    FnKw@0..2",
+      "    Whitespace@2..3",
+      "    LowerName@3..4",
+      "    ParamList@4..6",
+      "      LParen@4..5",
+      "      RParen@5..6",
+      "    Whitespace@6..7",
+      "    BlockExpr@7..20",
+      "      LBrace@7..8",
+      "      Newline@8..9",
+      "      Whitespace@9..11",
+      "      Binding@11..16",
+      "        NameRef@11..12",
+      "          LowerName@11..12",
+      "        Whitespace@12..13",
+      "        Eq@13..14",
+      "        Whitespace@14..15",
+      "        Literal@15..16",
+      "          IntLit@15..16",
+      "      Whitespace@16..17",
+      "      Error@17..18",
+      "        IntLit@17..18",
+      "      Newline@18..19",
+      "      RBrace@19..20",
+      "  Newline@20..21",
+      "error[E0122]@17..18",
+    ]
+}
+
+## Pieces of declarations, expressions and their errors.
+const PIECES = [
+  "fn ",
+  "f",
+  "(",
+  ")",
+  "{",
+  "}",
+  "[",
+  "]",
+  "\n",
+  " = ",
+  "1",
+  " + ",
+  " < ",
+  " match ",
+  " -> ",
+  "|",
+  ", ",
+  ": ",
+  "## d\n",
+  "@a",
+  "type ",
+  "T",
+  "\"",
+  "\#{",
+  "..",
+  "pub ",
+  "derive ",
+  "fails ",
+  "handler ",
+  "init",
+]
+
+fn source_of(indices: List[Int]) -> String {
+  pieces = Array.from_list(PIECES)
+  indices |> List.filter_map(|i| Array.get(pieces, i)) |> String.concat
+}
+
+fn leaves(tree: Tree, acc: List[Token]) -> List[Token] {
+  tree match {
+    Leaf(t)                   -> [t, ..acc]
+    Branch(_, _, _, children) -> List.fold(children, acc, |a, c| leaves(c, a))
+  }
+}
+
+## Every node spans its children, which follow each other without gaps.
+fn spans(tree: Tree) -> Bool {
+  tree match {
+    Leaf(_) -> True
+    Branch(_, start, end, children) -> {
+      last = List.fold(children, start, |pos, c| {
+        c match {
+          Leaf(t)            -> if t.start == pos { t.end } else { -1 }
+          Branch(_, s, e, _) -> if s == pos && spans(c) { e } else { -1 }
+        }
+      })
+      last == end
+    }
+  }
+}
+
+@test
+fn the_tree_holds_every_token_in_order() {
+  gen = Gen.list(Gen.int_between(0, List.length(PIECES) - 1)) |> Gen.map(source_of)
+  Property.check(gen, |src| {
+    built = build(src)
+    assert List.reverse(leaves(built.tree, [])) == Lexer.lex(src)
+    assert spans(built.tree)
+  })
+}

@@ -46,8 +46,9 @@ jobs:
             fi
           done
 
-  # M1: every .emel of emela-lang/emela, at the tag of the release Graft is built with, lexes into
-  # tokens that concatenate back to the file.
+  # Every .emel of emela-lang/emela, at the tag of the release Graft is built with:
+  # - M1: lexes into tokens that concatenate back to the file
+  # - Graft's tokens and syntax tree equal those of the reference implementation (tools/oracle)
   corpus:
     runs-on: ubuntu-latest
     steps:
@@ -70,3 +71,18 @@ jobs:
         run: emela pome install
       - name: Round-trip the corpus
         run: scripts/roundtrip.sh corpus/emela
+      - name: Check that the oracle is built from the same release
+        run: |
+          tag='tag = "v${{ steps.version.outputs.emela }}"'
+          if ! grep -qF "$tag" tools/oracle/Cargo.toml; then
+            echo "::error file=tools/oracle/Cargo.toml::emela-syntax must be at $tag, as emela in Pome.toml"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/oracle
+      - name: Compare tokens with the reference
+        run: scripts/compare.sh tokens corpus/emela
+      - name: Compare syntax trees with the reference
+        run: scripts/compare.sh tree corpus/emela

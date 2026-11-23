@@ -1,0 +1,448 @@
+## The state of the parser and the primitives the grammar is written with. Follows `parser.rs` and
+## `grammar.rs` of the reference implementation.
+##
+## The grammar functions read and advance the state through `State[Parser]`. The parser does not
+## build the tree; it appends events, and `Sink` builds the tree and inserts trivia.
+##
+## The reference implementation patches its event list in place: completing a node overwrites
+## the placeholder it opened with, and wrapping a completed node in a new parent writes an offset
+## into the child's start event. Here events are only appended. A node opens with `Open(id)` for
+## the id of its marker; the kind of each completed marker and the parent attached later by
+## `precede` are kept in maps by id, which the sink looks up. An `Open` without a kind is an
+## abandoned marker and never reaches the tree.
+import Std.Array.{Array}
+import Std.Map.{Map}
+import Std.State.{State}
+import Source.{slice}
+import Syntax.{NodeKind, Error, Literal, String, Interp}
+import Token.{
+  Kind,
+  Token,
+  describe,
+  is_trivia,
+  Newline,
+  NewlineCont,
+  DocComment,
+  LowerName,
+  StringQuote,
+  TripleQuote,
+  StringText,
+  InterpStart,
+  InterpEnd,
+  FnKw,
+  PubKw,
+  SuspendKw,
+  OpaqueKw,
+  TypeKw,
+  EnumKw,
+  ErrorKw,
+  ConstKw,
+  EffectKw,
+  HandlerKw,
+  LayerKw,
+  TraitKw,
+  ImplKw,
+  ImportKw,
+  At,
+  LParen,
+  LBrace,
+  RBrace,
+  Comma,
+  Eof,
+}
+
+const TAB = 0x09
+const LF = 0x0A
+const SPACE = 0x20
+
+pub enum Event {
+  ## Opens the node of the marker `id`, if the marker was completed.
+  Open(id: Int)
+  ## Moves the next significant token into the current node.
+  Bump
+  ## Closes the current node.
+  Close
+  ## A diagnostic at the next significant token.
+  Report(code: String, message: String)
+}
+
+## A token that is not trivia, with what the grammar needs to know of the trivia before it.
+pub type ParserToken(
+  kind: Kind,
+  start: Int,
+  end: Int,
+  ## There is a newline since the previous token, continuation newlines (trivia) included.
+  line_start: Bool,
+  ## There is a doc comment `##` since the previous token.
+  doc_before: Bool,
+)
+
+pub type Parser(
+  src: Array[Int],
+  tokens: Array[ParserToken],
+  pos: Int,
+  ## Newest first.
+  events: List[Event],
+  next_id: Int,
+  ## The kind of each completed marker.
+  kinds: Map[Int, NodeKind],
+  ## The parent that `precede` attached to a completed marker.
+  parents: Map[Int, Int],
+  ## Reading the parameter list of an anonymous function outside any bracket opened inside it.
+  ## There a `|` closes the list instead of joining an error set (`[grammar.expr]`).
+  in_closure_params: Bool,
+  ## Every `{` of the input has a matching `}` and every `}` a matching `{`. Then the grammar alone
+  ## decides where a block ends.
+  braces_balance: Bool,
+)
+
+## An open node.
+pub type Marker(id: Int)
+
+## A completed node, which `precede` can wrap in a parent.
+pub type Completed(id: Int)
+
+## Tokens that start a declaration. Error recovery stops at one at the start of a line instead of
+## skipping it.
+const DECL_START = [
+  FnKw,
+  PubKw,
+  SuspendKw,
+  OpaqueKw,
+  TypeKw,
+  EnumKw,
+  ErrorKw,
+  ConstKw,
+  EffectKw,
+  HandlerKw,
+  LayerKw,
+  TraitKw,
+  ImplKw,
+  ImportKw,
+  At,
+]
+
+## `tokens` are all the tokens of `src`, trivia included.
+pub fn new(src: Array[Int], tokens: List[Token]) -> Parser {
+  significant = significant_tokens(tokens, True, False, [])
+  Parser(
+    src:,
+    tokens: Array.from_list(significant),
+    pos: 0,
+    events: [],
+    next_id: 0,
+    kinds: Map.empty(),
+    parents: Map.empty(),
+    in_closure_params: False,
+    braces_balance: braces_balance(significant, 0),
+  )
+}
+
+fn significant_tokens(
+  tokens: List[Token],
+  line_start: Bool,
+  doc_before: Bool,
+  acc: List[ParserToken],
+) -> List[ParserToken] {
+  tokens match {
+    [] -> List.reverse(acc)
+    [t, ..rest] -> {
+      starts = line_start || t.kind == NewlineCont
+      doc = doc_before || t.kind == DocComment
+      if is_trivia(t.kind) {
+        significant_tokens(rest, starts, doc, acc)
+      } else {
+        token = ParserToken(t.kind, t.start, t.end, starts, doc)
+        significant_tokens(rest, t.kind == Newline, False, [token, ..acc])
+      }
+    }
+  }
+}
+
+fn braces_balance(tokens: List[ParserToken], depth: Int) -> Bool {
+  tokens match {
+    [] -> depth == 0
+    [t, ..rest] -> {
+      next = if t.kind == LBrace {
+        depth + 1
+      } else if t.kind == RBrace {
+        depth - 1
+      } else {
+        depth
+      }
+      if next < 0 { False } else { braces_balance(rest, next) }
+    }
+  }
+}
+
+pub fn parser() -> Parser uses { State[Parser] } {
+  (use State[Parser]).get()
+}
+
+fn update(f: fn(Parser) -> Parser) -> () uses { State[Parser] } {
+  st = use State[Parser]
+  st.set(f(st.get()))
+}
+
+## Runs `f` with `in_closure_params` set to `value`, then restores it.
+pub fn with_closure_params[T](value: Bool, f: fn() -> T uses { State[Parser] }) -> T
+  uses { State[Parser] } {
+  saved = parser().in_closure_params
+  update(|p| Parser(in_closure_params: value, ..p))
+  out = f()
+  update(|p| Parser(in_closure_params: saved, ..p))
+  out
+}
+
+pub fn in_closure_params() -> Bool uses { State[Parser] } {
+  parser().in_closure_params
+}
+
+pub fn braces_balanced() -> Bool uses { State[Parser] } {
+  parser().braces_balance
+}
+
+## The number of tokens read, used to check that a grammar function advanced.
+pub fn position() -> Int uses { State[Parser] } {
+  parser().pos
+}
+
+fn token_at(n: Int) -> Option[ParserToken] uses { State[Parser] } {
+  p = parser()
+  Array.get(p.tokens, p.pos + n)
+}
+
+pub fn nth(n: Int) -> Kind uses { State[Parser] } {
+  token_at(n) match {
+    Some(t) -> t.kind
+    None    -> Eof
+  }
+}
+
+pub fn current() -> Kind uses { State[Parser] } {
+  nth(0)
+}
+
+pub fn at(kind: Kind) -> Bool uses { State[Parser] } {
+  current() == kind
+}
+
+pub fn at_eof() -> Bool uses { State[Parser] } {
+  at(Eof)
+}
+
+## Contextual words (`fails` and so on) lex as LowerName, so they are told apart by text.
+pub fn nth_at_contextual_kw(n: Int, kw: String) -> Bool uses { State[Parser] } {
+  token_at(n) match {
+    Some(t) if t.kind == LowerName -> slice(parser().src, t.start, t.end) == kw
+    _                              -> False
+  }
+}
+
+pub fn at_contextual_kw(kw: String) -> Bool uses { State[Parser] } {
+  nth_at_contextual_kw(0, kw)
+}
+
+pub fn at_line_start() -> Bool uses { State[Parser] } {
+  token_at(0) match {
+    Some(t) -> t.line_start
+    None    -> False
+  }
+}
+
+pub fn at_doc_comment() -> Bool uses { State[Parser] } {
+  token_at(0) match {
+    Some(t) -> t.doc_before
+    None    -> False
+  }
+}
+
+## At the start of a declaration at the start of a line. `fn(` is excluded as a lambda.
+##
+## Inside an unclosed `(` newlines are continuations and no Newline arrives, so this is how
+## recovery from a broken declaration finds the next one.
+pub fn at_decl_start() -> Bool uses { State[Parser] } {
+  kind = current()
+  at_line_start() && List.any(DECL_START, |k| k == kind) && !(kind == FnKw && nth(1) == LParen)
+}
+
+## At the start of a declaration other than `fn` and `suspend`, at the start of a line. Items in
+## a declaration body start with `fn` at the start of a line, so inside a body this is the
+## recovery sync point.
+pub fn at_top_decl_start() -> Bool uses { State[Parser] } {
+  at_decl_start() && !at(FnKw) && !at(SuspendKw)
+}
+
+## The width of the leading spaces and tabs of the current token's line.
+pub fn line_indent() -> Int uses { State[Parser] } {
+  token_at(0) match {
+    None -> 0
+    Some(t) -> {
+      src = parser().src
+      indent_from(src, line_start_before(src, t.start))
+    }
+  }
+}
+
+fn line_start_before(src: Array[Int], offset: Int) -> Int {
+  if offset == 0 || Array.get(src, offset - 1) == Some(LF) {
+    offset
+  } else {
+    line_start_before(src, offset - 1)
+  }
+}
+
+fn indent_from(src: Array[Int], start: Int) -> Int {
+  Array.get(src, start) match {
+    Some(c) if c == SPACE || c == TAB -> indent_from(src, start + 1) + 1
+    _                                 -> 0
+  }
+}
+
+fn push(event: Event) -> () uses { State[Parser] } {
+  update(|p| Parser(events: [event, ..p.events], ..p))
+}
+
+pub fn bump() -> () uses { State[Parser] } {
+  update(|p| Parser(pos: p.pos + 1, events: [Bump, ..p.events], ..p))
+}
+
+pub fn eat(kind: Kind) -> Bool uses { State[Parser] } {
+  if at(kind) {
+    bump()
+    True
+  } else {
+    False
+  }
+}
+
+pub fn expect(kind: Kind) -> Bool uses { State[Parser] } {
+  if eat(kind) {
+    True
+  } else {
+    report("E0110", "expected #{describe(kind)}")
+    False
+  }
+}
+
+pub fn report(code: String, message: String) -> () uses { State[Parser] } {
+  push(Report(code, message))
+}
+
+## Reports a diagnostic, and unless the next token is in `recovery`, wraps one token in Error and
+## skips it.
+pub fn err_recover(code: String, message: String, recovery: List[Kind]) -> ()
+  uses { State[Parser] } {
+  report(code, message)
+  kind = current()
+  if !(kind == Eof || List.any(recovery, |k| k == kind) || at_decl_start()) {
+    m = start()
+    bump()
+    finish(m, Error)
+  }
+}
+
+pub fn start() -> Marker uses { State[Parser] } {
+  id = parser().next_id
+  update(|p| Parser(events: [Open(id), ..p.events], next_id: id + 1, ..p))
+  Marker(id)
+}
+
+pub fn complete(m: Marker, kind: NodeKind) -> Completed uses { State[Parser] } {
+  update(|p| Parser(kinds: Map.insert(p.kinds, m.id, kind), events: [Close, ..p.events], ..p))
+  Completed(m.id)
+}
+
+## `complete` for a node nothing wraps later.
+pub fn finish(m: Marker, kind: NodeKind) -> () uses { State[Parser] } {
+  complete(m, kind)
+  ()
+}
+
+## Wraps a completed node in a new parent. Used for bindings `pattern = expr` and binary
+## operators.
+pub fn precede(c: Completed) -> Marker uses { State[Parser] } {
+  parent = start()
+  update(|p| Parser(parents: Map.insert(p.parents, c.id, parent.id), ..p))
+  parent
+}
+
+pub fn skip_newlines() -> () uses { State[Parser] } {
+  if eat(Newline) { skip_newlines() }
+}
+
+## A comma-separated list from `open` to `close`, with an optional trailing comma. Newlines inside
+## brackets remain as separators in the token stream, so they are skipped around elements.
+##
+## `element` must only report a diagnostic when it cannot read an element, without consuming a
+## separator or the closing bracket. A missing closing bracket is reported and parsing stops
+## before it.
+pub fn delimited(open: Kind, close: Kind, element: fn() -> () uses { State[Parser] }) -> ()
+  uses { State[Parser] } {
+  if eat(open) {
+    skip_newlines()
+    delimited_elements(close, element)
+    expect(close)
+    ()
+  }
+}
+
+fn delimited_elements(close: Kind, element: fn() -> () uses { State[Parser] }) -> ()
+  uses { State[Parser] } {
+  if !at(close) && !at_eof() {
+    # A `|` inside brackets is not the end of a closure's parameter list.
+    with_closure_params(False, element)
+    skip_newlines()
+    if eat(Comma) {
+      skip_newlines()
+      delimited_elements(close, element)
+    }
+  }
+}
+
+## A literal. Interpolation contents are read with `interp`.
+pub fn literal(interp: fn() -> () uses { State[Parser] }) -> Completed uses { State[Parser] } {
+  if at(StringQuote) || at(TripleQuote) {
+    string(interp)
+  } else {
+    m = start()
+    bump()
+    complete(m, Literal)
+  }
+}
+
+## Assembles a string the lexer split into pieces. A missing closing `"` or `}` ends the string
+## silently here: the lexer reports unclosed strings and interpolations.
+fn string(interp: fn() -> () uses { State[Parser] }) -> Completed uses { State[Parser] } {
+  m = start()
+  # Close with the same kind of quote that opened it.
+  quote = current()
+  bump()
+  string_parts(interp)
+  eat(quote)
+  complete(m, String)
+}
+
+fn string_parts(interp: fn() -> () uses { State[Parser] }) -> () uses { State[Parser] } {
+  if at(StringText) {
+    bump()
+    string_parts(interp)
+  } else if at(InterpStart) {
+    i = start()
+    bump()
+    interp()
+    eat(InterpEnd)
+    finish(i, Interp)
+    string_parts(interp)
+  }
+}
+
+## Runs the grammar `root` over `tokens`, all the tokens of `src`, and returns the final state.
+pub fn run(
+  src: Array[Int],
+  tokens: List[Token],
+  root: fn() -> () uses { State[Parser] },
+) -> Parser {
+  (_, p) = State.run(new(src, tokens), root)
+  p
+}

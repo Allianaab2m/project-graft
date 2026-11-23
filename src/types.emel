@@ -1,0 +1,330 @@
+## Types (spec 17.4). Follows `grammar/types.rs` of the reference implementation.
+import Std.State.{State}
+import Parser.{
+  Parser,
+  Completed,
+  at,
+  at_contextual_kw,
+  at_eof,
+  bump,
+  complete,
+  current,
+  delimited,
+  eat,
+  err_recover,
+  report,
+  expect,
+  finish,
+  in_closure_params,
+  nth,
+  precede,
+  skip_newlines,
+  start,
+  with_closure_params,
+}
+import Syntax.{
+  Path,
+  PathType,
+  TypeArgList,
+  TypeVar,
+  SelfType,
+  UnitType,
+  TupleType,
+  ParenType,
+  FnType,
+  CapType,
+  ParamTypeList,
+  RetType,
+  FailsClause,
+  ErrorSet,
+  UsesClause,
+  EffectSet,
+}
+import Token.{
+  Kind,
+  Newline,
+  TypeName,
+  UpperName,
+  SelfTypeKw,
+  FnKw,
+  UseKw,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  Comma,
+  Dot,
+  Eq,
+  ThinArrow,
+  Pipe,
+  Plus,
+}
+
+## When a type fails to parse, stop without consuming the next token if it belongs to what
+## follows.
+const RECOVERY = [RParen, RBrack, LBrace, RBrace, Comma, Eq, ThinArrow, Pipe, Newline]
+
+pub fn type_() -> () uses { State[Parser] } {
+  current() match {
+    TypeName  -> path_type()
+    UpperName -> type_var()
+    SelfTypeKw -> {
+      m = start()
+      bump()
+      finish(m, SelfType)
+    }
+    LParen    -> paren_type()
+    FnKw      -> fn_type()
+    UseKw     -> cap_type()
+    _         -> err_recover("E0111", "expected type", RECOVERY)
+  }
+}
+
+## `type_ref [ "[" type_arg { "," type_arg } "]" ]`
+fn path_type() -> () uses { State[Parser] } {
+  m = start()
+  path()
+  type_arg_list()
+  finish(m, PathType)
+}
+
+fn type_arg_list() -> () uses { State[Parser] } {
+  if at(LBrack) {
+    args = start()
+    delimited(LBrack, RBrack, type_arg)
+    finish(args, TypeArgList)
+  }
+}
+
+## `type_arg = type | "{" [ effect_item { "," effect_item } ] "}" | error_item "|" error_item { "|" error_item }`
+##
+## A set passed as a type argument to a set type parameter of a named type
+## (`Handler[NotFound | Timeout, { Db, Log }]`, spec 9.2). A single element is read as a type.
+fn type_arg() -> () uses { State[Parser] } {
+  if at(LBrace) {
+    effect_set()
+  } else {
+    # `A | B` or `Mod.A | B`.
+    n = current() match {
+      TypeName  -> qualified_end(1)
+      UpperName -> 1
+      _         -> 0
+    }
+    if n > 0 && nth(n) == Pipe { error_set() } else { type_() }
+  }
+}
+
+fn qualified_end(n: Int) -> Int uses { State[Parser] } {
+  if nth(n) == Dot && nth(n + 1) == TypeName { qualified_end(n + 2) } else { n }
+}
+
+## Effect type arguments `[Int]` (`handler H: State[Int]`, `use State[Int]`). Becomes a
+## TypeArgList sibling of the preceding type_ref. Does nothing without `[`.
+pub fn effect_type_args() -> () uses { State[Parser] } {
+  type_arg_list()
+}
+
+## `type_ref = [ module_path "." ] type_name`. The caller checks that it is at TypeName.
+pub fn path() -> Completed uses { State[Parser] } {
+  m = start()
+  bump()
+  path_rest()
+  complete(m, Path)
+}
+
+fn path_rest() -> () uses { State[Parser] } {
+  if at(Dot) && nth(1) == TypeName {
+    bump()
+    bump()
+    path_rest()
+  }
+}
+
+fn type_var() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  finish(m, TypeVar)
+}
+
+## `()`, a parenthesized type `(T)`, or a tuple of two or more. `(T,)` gets a diagnostic and is
+## read as a tuple.
+fn paren_type() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  (count, trailing_comma) = paren_type_elements(0)
+  if count == 1 && trailing_comma {
+    report("E0112", "a tuple type needs at least two elements")
+  }
+  expect(RParen)
+  kind = if count == 0 {
+    UnitType
+  } else if count == 1 && !trailing_comma {
+    ParenType
+  } else {
+    TupleType
+  }
+  finish(m, kind)
+}
+
+fn paren_type_elements(count: Int) -> (Int, Bool) uses { State[Parser] } {
+  if at(RParen) || at_eof() {
+    (count, count > 0)
+  } else {
+    # `|f: (fn() -> A fails B | C)| ...`: inside parentheses `|` joins an error set again.
+    with_closure_params(False, type_)
+    if eat(Comma) { paren_type_elements(count + 1) } else { (count + 1, False) }
+  }
+}
+
+## `"fn" "(" [ type { "," type } ] ")" "->" type [ "fails" error_set ] [ "uses" effect_set ]`
+fn fn_type() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  has_params = at(LParen)
+  if has_params {
+    params = start()
+    delimited(LParen, RParen, type_)
+    finish(params, ParamTypeList)
+  } else {
+    expect(LParen)
+    ()
+  }
+  # Without a parameter list, do not pile a `->` diagnostic on top.
+  if at(ThinArrow) {
+    ret_type()
+  } else if has_params {
+    expect(ThinArrow)
+    ()
+  }
+  effects_and_errors()
+  finish(m, FnType)
+}
+
+## `"use" effect_item { "+" effect_item }`, the type of a capability (`[effect.use]`).
+fn cap_type() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  set_element()
+  plus_elements()
+  finish(m, CapType)
+}
+
+fn plus_elements() -> () uses { State[Parser] } {
+  if eat(Plus) {
+    set_element()
+    plus_elements()
+  }
+}
+
+## `"->" type`
+pub fn ret_type() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  type_()
+  finish(m, RetType)
+}
+
+## `[ "fails" error_set ] [ "uses" effect_set ]`
+##
+## The old clause `use effect_set` is read as a UsesClause too, and validation reports it (E0147).
+## Returns whether a uses clause was read.
+pub fn effects_and_errors() -> Bool uses { State[Parser] } {
+  if at_contextual_kw("fails") {
+    m = start()
+    bump()
+    error_set()
+    finish(m, FailsClause)
+  }
+  uses = at_contextual_kw("uses") || at(UseKw)
+  if uses { uses_clause() }
+  uses
+}
+
+## The old clause on a line of its own after a signature (`fn f() -> Int⏎  use Db {`). Called where
+## a signature can end, when it has no uses clause yet.
+pub fn old_uses_clause_on_next_line() -> () uses { State[Parser] } {
+  n = newlines_from(0)
+  next = nth(n + 1)
+  if n > 0 && nth(n) == UseKw && (next == TypeName || next == UpperName || next == LBrace) {
+    skip_newlines()
+    uses_clause()
+  }
+}
+
+fn newlines_from(n: Int) -> Int uses { State[Parser] } {
+  if nth(n) == Newline { newlines_from(n + 1) } else { n }
+}
+
+fn uses_clause() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  effect_set()
+  finish(m, UsesClause)
+}
+
+## `"{" "}" | error_item { "|" error_item }`. In the parameter list of an anonymous function, a
+## `|` outside brackets closes the list, so the set has one item there (`[grammar.expr]`).
+fn error_set() -> () uses { State[Parser] } {
+  m = start()
+  if at(LBrace) {
+    bump()
+    expect(RBrace)
+    ()
+  } else {
+    set_element()
+    pipe_elements()
+  }
+  finish(m, ErrorSet)
+}
+
+fn pipe_elements() -> () uses { State[Parser] } {
+  if !in_closure_params() && eat(Pipe) {
+    set_element()
+    pipe_elements()
+  }
+}
+
+## `"{" [ effect_item { "," effect_item } ] "}" | effect_item`
+fn effect_set() -> () uses { State[Parser] } {
+  m = start()
+  if at(LBrace) {
+    bump()
+    skip_newlines()
+    effect_set_elements()
+    expect(RBrace)
+    ()
+  } else {
+    set_element()
+  }
+  finish(m, EffectSet)
+}
+
+fn effect_set_elements() -> () uses { State[Parser] } {
+  if !at(RBrace) && !at_eof() {
+    set_element()
+    skip_newlines()
+    if eat(Comma) {
+      skip_newlines()
+      effect_set_elements()
+    }
+  }
+}
+
+## A type_ref or an uppercase name. An effect with type arguments (`State[Int]`) wraps the
+## type_ref and the TypeArgList in a PathType.
+fn set_element() -> () uses { State[Parser] } {
+  current() match {
+    TypeName -> {
+      p = path()
+      if at(LBrack) {
+        m = precede(p)
+        effect_type_args()
+        finish(m, PathType)
+      }
+    }
+    UpperName -> type_var()
+    _         -> err_recover("E0111", "expected type", RECOVERY)
+  }
+}

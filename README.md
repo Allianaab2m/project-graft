@@ -42,10 +42,23 @@ The corpus is every `.emel` file in the `emela-lang/emela` repository at the rel
 ## Usage
 
 ```console
-$ emela test                                  # unit and property tests (Brix)
-$ scripts/roundtrip.sh <emela-lang/emela checkout> # M1 on the corpus, on js and native
+$ emela test                                         # unit and property tests (Brix)
+$ scripts/roundtrip.sh <emela-lang/emela checkout>   # M1 on the corpus, on js and native
+$ scripts/compare.sh tokens <emela-lang/emela checkout>  # tokens against the reference
+$ scripts/compare.sh tree <emela-lang/emela checkout>    # syntax trees against the reference
+$ scripts/fuzz.py <emela-lang/emela checkout> <out dir> # trees of broken corpus files
+$ emela run . -- parse <file>...                     # parses the files, to time the parser
 ```
+
+`tools/oracle` is a small Rust program that prints what the reference implementation
+(`emela-syntax` at the tag of the release in `Pome.toml`) makes of a file, in the format of
+`graft tokens` and `graft tree`. `scripts/compare.sh` builds it with cargo.
 
 ## Status
 
-M1: done. All 297 files of the corpus at v0.28.2 round-trip on js and native (wasm has no `Std.FileSystem` yet).
+- M1: done. All 297 files of the corpus at v0.28.2 round-trip on js and native (wasm has no
+  `Std.FileSystem` yet).
+- M2, parser: the tokens and the syntax trees, with the parser's diagnostics, of all 297 files
+  equal the reference's. So do those of 4,394 inputs made by breaking corpus files at random.
+  Lexing and parsing the corpus (441 KB) takes 0.29 s on native.
+- M2, fmt: not started.

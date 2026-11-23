@@ -1,0 +1,1633 @@
+## Parameters, expressions and declarations (spec 17.3, 17.5). Follows `grammar.rs`,
+## `grammar/expressions.rs` and `grammar/items.rs` of the reference implementation. Expressions
+## and declarations call each other (a block holds local fns, a declaration holds blocks), and
+## modules cannot import each other, so they share this module.
+import Std.State.{State}
+import Parser.{
+  Parser,
+  Marker,
+  Completed,
+  at,
+  at_contextual_kw,
+  at_decl_start,
+  at_doc_comment,
+  at_eof,
+  at_line_start,
+  at_top_decl_start,
+  braces_balanced,
+  bump,
+  complete,
+  current,
+  delimited,
+  eat,
+  err_recover,
+  expect,
+  finish,
+  line_indent,
+  literal,
+  nth,
+  nth_at_contextual_kw,
+  position,
+  precede,
+  report,
+  skip_newlines,
+  start,
+  with_closure_params,
+}
+import Patterns.{at_pattern_start, pattern}
+import Syntax.{
+  NodeKind,
+  Root,
+  Import,
+  ImportList,
+  Annotation,
+  AnnotArgList,
+  AnnotArg,
+  AnnotPath,
+  FnDecl,
+  LocalFn,
+  TypeDecl,
+  ErrorDecl,
+  EnumDecl,
+  FieldList,
+  Field,
+  VariantList,
+  Variant,
+  TupleFieldList,
+  DeriveClause,
+  ConstDecl,
+  EffectDecl,
+  OpSig,
+  EffectLabel,
+  MemberSig,
+  HandlerDecl,
+  HandlerEffect,
+  HandlerInit,
+  HandlerRelease,
+  LayerDecl,
+  TraitDecl,
+  ImplDecl,
+  ImplType,
+  ItemList,
+  TypeParamList,
+  TypeParam,
+  NameRef,
+  PathExpr,
+  UnderscoreExpr,
+  UnitExpr,
+  ParenExpr,
+  TupleExpr,
+  ListExpr,
+  RestExpr,
+  CallExpr,
+  ArgList,
+  NamedArg,
+  SpreadArg,
+  FieldExpr,
+  PrefixExpr,
+  BinExpr,
+  UseExpr,
+  FailExpr,
+  AssertExpr,
+  BlockExpr,
+  Binding,
+  IfExpr,
+  MatchExpr,
+  MatchArmList,
+  MatchArm,
+  MatchGuard,
+  WithExpr,
+  WithBy,
+  Supply,
+  WithBind,
+  CapMember,
+  EscapeExpr,
+  LambdaExpr,
+  ParamList,
+  Param,
+  Error,
+}
+import Token.{
+  Kind,
+  describe,
+  Newline,
+  IntLit,
+  FloatLit,
+  StringQuote,
+  TripleQuote,
+  InterpEnd,
+  LowerName,
+  TypeName,
+  UpperName,
+  Underscore,
+  FnKw,
+  TypeKw,
+  EnumKw,
+  ErrorKw,
+  ConstKw,
+  TraitKw,
+  ImplKw,
+  EffectKw,
+  HandlerKw,
+  LayerKw,
+  ImportKw,
+  PubKw,
+  OpaqueKw,
+  SuspendKw,
+  IfKw,
+  ElseKw,
+  MatchKw,
+  FailKw,
+  EscapeKw,
+  UseKw,
+  WithKw,
+  AssertKw,
+  SelfKw,
+  SelfTypeKw,
+  LParen,
+  RParen,
+  LBrack,
+  RBrack,
+  LBrace,
+  RBrace,
+  Comma,
+  Dot,
+  Dot2,
+  Colon,
+  Eq,
+  ThinArrow,
+  Pipe,
+  PipeGt,
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  Percent,
+  Bang,
+  Eq2,
+  Neq,
+  Lt,
+  LtEq,
+  Gt,
+  GtEq,
+  Amp2,
+  Pipe2,
+  At,
+  Eof,
+}
+import Types.{
+  effect_type_args,
+  effects_and_errors,
+  old_uses_clause_on_next_line,
+  path,
+  ret_type,
+  type_,
+}
+
+# ---------------------------------------------------------------------------------------------
+# Shared helpers
+
+fn newlines_from(n: Int) -> Int uses { State[Parser] } {
+  if nth(n) == Newline { newlines_from(n + 1) } else { n }
+}
+
+## At a newline, `}` or the end of the input.
+fn at_line_end() -> Bool uses { State[Parser] } {
+  kind = current()
+  kind == Newline || kind == RBrace || kind == Eof
+}
+
+fn path_or_expect() -> () uses { State[Parser] } {
+  if at(TypeName) {
+    path()
+    ()
+  } else {
+    expect(TypeName)
+    ()
+  }
+}
+
+fn marker_or_start(doc: Option[Marker]) -> Marker uses { State[Parser] } {
+  doc match {
+    Some(m) -> m
+    None    -> start()
+  }
+}
+
+fn bump_error() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  finish(m, Error)
+}
+
+fn is_literal_start(kind: Kind) -> Bool {
+  kind == IntLit || kind == FloatLit || kind == StringQuote || kind == TripleQuote
+}
+
+# ---------------------------------------------------------------------------------------------
+# Parameters (`grammar.rs`)
+
+## `"(" [ param { "," param } ] ")"`. `param = "self" | lower_name [ ":" type ]`
+fn param_list() -> () uses { State[Parser] } {
+  m = start()
+  delimited(LParen, RParen, param)
+  finish(m, ParamList)
+}
+
+fn param() -> () uses { State[Parser] } {
+  m = start()
+  if eat(LowerName) {
+    if eat(Colon) { type_() }
+  } else if !eat(SelfKw) {
+    err_recover("E0110", "expected parameter name", [Comma, RParen, LBrace, Newline])
+  }
+  finish(m, Param)
+}
+
+## The parameters of the old form of an anonymous function, `fn(x) { ... }` (E0148, reported by
+## validation). It is still read so that the formatter can rewrite it (`[fmt.closure]`).
+fn old_lambda_param_list() -> () uses { State[Parser] } {
+  m = start()
+  delimited(LParen, RParen, lambda_param)
+  finish(m, ParamList)
+}
+
+## `"||" | "|" [ lambda_param { "," lambda_param } ] "|"` (`[grammar.expr]`). The list does not
+## span lines: outside brackets a newline inside it is a statement separator.
+fn closure_param_list() -> () uses { State[Parser] } {
+  m = start()
+  if !eat(Pipe2) {
+    bump()
+    with_closure_params(True, closure_params)
+    expect(Pipe)
+    ()
+  }
+  finish(m, ParamList)
+}
+
+fn closure_params() -> () uses { State[Parser] } {
+  if !at(Pipe) && !at_eof() {
+    lambda_param()
+    if eat(Comma) { closure_params() }
+  }
+}
+
+## `lambda_param = pattern [ ":" type ]`. A plain name keeps the shape of `param_list` (a
+## LowerName token directly under Param); any other pattern becomes a pattern node under Param.
+fn lambda_param() -> () uses { State[Parser] } {
+  m = start()
+  named = eat(LowerName) || eat(SelfKw)
+  if !named {
+    if at_pattern_start() {
+      pattern()
+    } else {
+      err_recover(
+        "E0110",
+        "expected parameter name or pattern",
+        [Comma, RParen, Pipe, LBrace, Newline],
+      )
+    }
+  }
+  if eat(Colon) { type_() }
+  finish(m, Param)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Expressions (`grammar/expressions.rs`)
+
+## When an expression fails to parse, stop without consuming the next token if it belongs to
+## what follows.
+const RECOVERY = [RParen, RBrack, LBrace, RBrace, Comma, Eq, Colon, ThinArrow, Newline, InterpEnd]
+
+## `"fail" expr | "assert" expr | pipe_expr { ( "escape" | "match" ) "{" { arm NL } "}" }`
+pub fn expr() -> Option[Completed] uses { State[Parser] } {
+  current() match {
+    FailKw   -> Some(keyword_expr(FailExpr))
+    AssertKw -> Some(keyword_expr(AssertExpr))
+    _ -> expr_bp(0) match {
+      None      -> None
+      Some(lhs) -> Some(arms_after(lhs))
+    }
+  }
+}
+
+fn keyword_expr(kind: NodeKind) -> Completed uses { State[Parser] } {
+  m = start()
+  bump()
+  expr()
+  complete(m, kind)
+}
+
+fn arms_after(lhs: Completed) -> Completed uses { State[Parser] } {
+  kind = current() match {
+    EscapeKw -> Some(EscapeExpr)
+    MatchKw  -> Some(MatchExpr)
+    _        -> None
+  }
+  kind match {
+    None -> lhs
+    Some(k) -> {
+      m = precede(lhs)
+      bump()
+      arm_list()
+      arms_after(complete(m, k))
+    }
+  }
+}
+
+fn interp() -> () uses { State[Parser] } {
+  expr()
+  ()
+}
+
+## `binding | expr`. `binding = pattern [ ":" type ] "=" expr`
+##
+## The left side is parsed as an expression first, and rewrapped in Binding if `:` or `=`
+## follows.
+fn stmt() -> () uses { State[Parser] } {
+  expr() match {
+    None -> ()
+    Some(lhs) -> if at(Colon) || at(Eq) {
+      m = precede(lhs)
+      if eat(Colon) { type_() }
+      expect(Eq)
+      expr()
+      finish(m, Binding)
+    }
+  }
+}
+
+## `"{" { stmt NL } "}"`. `stmt = binding | local_fn | expr`.
+##
+## When the braces of the input do not balance, a `fn` is a local fn only if its line is indented
+## deeper than the line of this block's `{`; otherwise it ends the block, so that recovery from a
+## missing `}` keeps the declarations after it at the top level.
+fn block() -> Completed uses { State[Parser] } {
+  m = start()
+  indent = line_indent()
+  bump()
+  block_items(indent)
+  expect(RBrace)
+  complete(m, BlockExpr)
+}
+
+fn block_items(indent: Int) -> () uses { State[Parser] } {
+  doc = newlines_with_doc()
+  local_fn = at_local_fn_start() && (braces_balanced() || line_indent() > indent)
+  if local_fn || !(at(RBrace) || at_eof() || at_decl_start()) {
+    before = position()
+    if local_fn { local_fn_decl(marker_or_start(doc)) } else { stmt() }
+    if position() == before {
+      # A diagnostic was reported but no token was consumed (e.g. `=` at line start).
+      bump_error()
+    } else if !at_stmt_end() {
+      report("E0122", "expected newline or `}` after statement")
+      skip_to_line_end()
+    }
+    block_items(indent)
+  }
+}
+
+## Inside an unclosed `(` newlines are continuations, so a line start also ends a statement.
+fn at_stmt_end() -> Bool uses { State[Parser] } {
+  at(Newline) || at(RBrace) || at_eof() || at_line_start()
+}
+
+## Wraps everything up to a newline, the matching outer `}` or a declaration at the start of a
+## line in Error and skips it.
+fn skip_to_line_end() -> () uses { State[Parser] } {
+  m = start()
+  skip_line(0)
+  finish(m, Error)
+}
+
+fn skip_line(depth: Int) -> () uses { State[Parser] } {
+  stop = at_eof() || at_decl_start() || depth == 0 && (at(Newline) || at(RBrace))
+  if !stop {
+    next = current() match {
+      LBrace -> depth + 1
+      RBrace -> depth - 1
+      _      -> depth
+    }
+    bump()
+    skip_line(next)
+  }
+}
+
+## `"if" expr block [ "else" ( block | if_expr ) ]`
+fn if_expr() -> () uses { State[Parser] } {
+  bump()
+  expr()
+  block_or_error()
+  if eat(ElseKw) {
+    if at(IfKw) {
+      m = start()
+      if_expr()
+      finish(m, IfExpr)
+    } else {
+      block_or_error()
+    }
+  }
+}
+
+## Without `{`, an expression on the same line is read as the body after one diagnostic.
+fn block_or_error() -> () uses { State[Parser] } {
+  if at(LBrace) {
+    block()
+    ()
+  } else {
+    expect(LBrace)
+    if !at_line_end() {
+      expr()
+      ()
+    }
+  }
+}
+
+## `"{" { arm NL } "}"`. `arm = pattern [ "if" expr ] "->" expr`
+fn arm_list() -> () uses { State[Parser] } {
+  m = start()
+  if expect(LBrace) {
+    arms()
+    expect(RBrace)
+    ()
+  }
+  finish(m, MatchArmList)
+}
+
+fn arms() -> () uses { State[Parser] } {
+  skip_newlines()
+  if !(at(RBrace) || at_eof() || at_decl_start()) {
+    before = position()
+    arm()
+    if position() == before {
+      bump_error()
+    } else if !at_stmt_end() {
+      report("E0122", "expected newline or `}` after match arm")
+      skip_to_line_end()
+    }
+    arms()
+  }
+}
+
+fn arm() -> () uses { State[Parser] } {
+  m = start()
+  pattern()
+  if at(IfKw) {
+    g = start()
+    bump()
+    expr()
+    finish(g, MatchGuard)
+  }
+  # Even without the arrow, an expression on the same line is read as the body.
+  if expect(ThinArrow) || !at_line_end() {
+    expr()
+    ()
+  }
+  finish(m, MatchArm)
+}
+
+## `"with" with_item { "," with_item } block`,
+## `with_item = [ lower_name "=" ] supply [ "by" by_right ]`
+fn with_expr() -> () uses { State[Parser] } {
+  bump()
+  with_items()
+  block_or_error()
+}
+
+fn with_items() -> () uses { State[Parser] } {
+  bind = if at(LowerName) && nth(1) == Eq {
+    m = start()
+    bump()
+    bump()
+    Some(m)
+  } else {
+    None
+  }
+  if at(LowerName) && nth(1) == Dot {
+    cap_member_supply()
+  } else if at(TypeName) {
+    target = supply()
+    # `AuditLog by HandlerA` plugs a provider into a label.
+    if at_contextual_kw("by") {
+      m = precede(target)
+      bump()
+      if at(TypeName) {
+        supply()
+        effect_type_args()
+      } else {
+        expect(TypeName)
+        ()
+      }
+      finish(m, WithBy)
+    }
+  } else {
+    expect(TypeName)
+    ()
+  }
+  bind match {
+    Some(m) -> finish(m, WithBind)
+    None    -> ()
+  }
+  if eat(Comma) { with_items() }
+}
+
+## `lower_name "." type_name "(" [ args ] ")"`: a handler member of a capability as an item of
+## `with` (`[grammar.expr]`).
+fn cap_member_supply() -> () uses { State[Parser] } {
+  m = start()
+  c = start()
+  bump()
+  bump()
+  expect(TypeName)
+  finish(c, CapMember)
+  if at(LParen) {
+    arg_list()
+  } else {
+    expect(LParen)
+    ()
+  }
+  finish(m, Supply)
+}
+
+## `supply = type_ref [ "(" [ args ] ")" ]`. With arguments, the Path and the ArgList are wrapped
+## in a Supply; without, the item is the Path itself.
+fn supply() -> Completed uses { State[Parser] } {
+  target = path()
+  if at(LParen) {
+    m = precede(target)
+    arg_list()
+    complete(m, Supply)
+  } else {
+    target
+  }
+}
+
+## Higher binds tighter; 0 is not an operator. Comparisons do not associate.
+fn infix_power(kind: Kind) -> Int {
+  kind match {
+    PipeGt  -> 1
+    Pipe2   -> 2
+    Amp2    -> 3
+    Eq2     -> 4
+    Neq     -> 4
+    Lt      -> 4
+    LtEq    -> 4
+    Gt      -> 4
+    GtEq    -> 4
+    Plus    -> 5
+    Minus   -> 5
+    Star    -> 6
+    Slash   -> 6
+    Percent -> 6
+    _       -> 0
+  }
+}
+
+## Pratt parsing of binary operators of strength `min` or more. Left-associative.
+fn expr_bp(min: Int) -> Option[Completed] uses { State[Parser] } {
+  unary() match {
+    None      -> None
+    Some(lhs) -> Some(binary_rest(lhs, min, False))
+  }
+}
+
+fn binary_rest(lhs: Completed, min: Int, after_comparison: Bool) -> Completed
+  uses { State[Parser] } {
+  power = infix_power(current())
+  if power == 0 || power < min {
+    lhs
+  } else {
+    is_comparison = power == 4
+    if is_comparison && after_comparison {
+      report("E0119", "comparison operators cannot be chained")
+    }
+    m = precede(lhs)
+    bump()
+    expr_bp(power + 1)
+    binary_rest(complete(m, BinExpr), min, is_comparison)
+  }
+}
+
+## `( "!" | "-" ) unary | "use" type_ref [ "[" type { "," type } "]" ] | lambda | postfix`
+fn unary() -> Option[Completed] uses { State[Parser] } {
+  current() match {
+    # `|` and `||` never start any other operand, so in operand position they start an anonymous
+    # function. The body is an `expr`, so it takes everything to its right.
+    Pipe  -> Some(lambda())
+    Pipe2 -> Some(lambda())
+    Bang  -> Some(prefix_expr())
+    Minus -> Some(prefix_expr())
+    UseKw -> Some(use_expr())
+    _ -> primary() match {
+      None      -> None
+      Some(lhs) -> Some(postfix_ops(lhs))
+    }
+  }
+}
+
+fn lambda() -> Completed uses { State[Parser] } {
+  m = start()
+  closure_param_list()
+  # A newline right after the list ends the statement; `expr` reports the missing body.
+  expr()
+  complete(m, LambdaExpr)
+}
+
+fn prefix_expr() -> Completed uses { State[Parser] } {
+  m = start()
+  bump()
+  unary()
+  complete(m, PrefixExpr)
+}
+
+fn use_expr() -> Completed uses { State[Parser] } {
+  m = start()
+  bump()
+  if at(TypeName) {
+    path()
+    effect_type_args()
+  } else {
+    expect(TypeName)
+    ()
+  }
+  u = complete(m, UseExpr)
+  if !at(Dot) && !at(LParen) {
+    u
+  } else {
+    # Treat it as forgotten parentheses: one diagnostic, then read the rest as a call.
+    report("E0121", "wrap `use` in parentheses to call its operations: `(use X).op()`")
+    postfix_ops(u)
+  }
+}
+
+## `{ "(" [ args ] ")" | "." lower_name }` after `primary`
+fn postfix_ops(lhs: Completed) -> Completed uses { State[Parser] } {
+  current() match {
+    LParen -> {
+      m = precede(lhs)
+      arg_list()
+      postfix_ops(complete(m, CallExpr))
+    }
+    Dot -> {
+      m = precede(lhs)
+      bump()
+      # `fs.Open(path)` opens a handler member of a capability inside an init.
+      if at(TypeName) {
+        bump()
+      } else {
+        expect(LowerName)
+        ()
+      }
+      postfix_ops(complete(m, FieldExpr))
+    }
+    _ -> lhs
+  }
+}
+
+fn token_expr(kind: NodeKind) -> Completed uses { State[Parser] } {
+  m = start()
+  bump()
+  complete(m, kind)
+}
+
+fn primary() -> Option[Completed] uses { State[Parser] } {
+  kind = current()
+  if is_literal_start(kind) {
+    Some(literal(interp))
+  } else {
+    kind match {
+      # `Self` as an expression constructs a handler in its init (`[grammar.expr]`).
+      LowerName  -> Some(token_expr(NameRef))
+      UpperName  -> Some(token_expr(NameRef))
+      SelfKw     -> Some(token_expr(NameRef))
+      SelfTypeKw -> Some(token_expr(NameRef))
+      Underscore -> Some(token_expr(UnderscoreExpr))
+      TypeName -> {
+        m = start()
+        path()
+        Some(complete(m, PathExpr))
+      }
+      LParen -> {
+        m = start()
+        node = paren_expr()
+        Some(complete(m, node))
+      }
+      LBrack -> {
+        m = start()
+        list_expr()
+        Some(complete(m, ListExpr))
+      }
+      LBrace     -> Some(block())
+      IfKw -> {
+        m = start()
+        if_expr()
+        Some(complete(m, IfExpr))
+      }
+      # Prefix `match x { ... }` is not in the grammar (spec 6.5). It is read in that shape to
+      # recover, keeping the arms for the later passes.
+      MatchKw -> {
+        m = start()
+        report("E0142", "`match` comes after the value: write `value match { ... }`")
+        bump()
+        expr()
+        arm_list()
+        Some(complete(m, MatchExpr))
+      }
+      WithKw -> {
+        m = start()
+        with_expr()
+        Some(complete(m, WithExpr))
+      }
+      # The old form `fn(params) { ... }` (E0148, reported by validation), read into the node of
+      # an anonymous function.
+      FnKw -> {
+        m = start()
+        bump()
+        if at(LParen) {
+          old_lambda_param_list()
+        } else {
+          expect(LParen)
+          ()
+        }
+        block_or_error()
+        Some(complete(m, LambdaExpr))
+      }
+      _ -> {
+        err_recover("E0118", "expected expression", RECOVERY)
+        None
+      }
+    }
+  }
+}
+
+## `()`, `(expr)`, or a tuple of two or more. `(a,)` gets a diagnostic and becomes a tuple.
+fn paren_expr() -> NodeKind uses { State[Parser] } {
+  bump()
+  (count, trailing_comma) = paren_elements(0)
+  if count == 1 && trailing_comma {
+    report("E0112", "a tuple needs at least two elements")
+  }
+  expect(RParen)
+  if count == 0 {
+    UnitExpr
+  } else if count == 1 && !trailing_comma {
+    ParenExpr
+  } else {
+    TupleExpr
+  }
+}
+
+fn paren_elements(count: Int) -> (Int, Bool) uses { State[Parser] } {
+  if at(RParen) || at_eof() {
+    (count, count > 0)
+  } else {
+    expr()
+    if eat(Comma) { paren_elements(count + 1) } else { (count + 1, False) }
+  }
+}
+
+## `"[" [ expr { "," expr } [ "," ".." expr ] ] "]"`
+fn list_expr() -> () uses { State[Parser] } {
+  bump()
+  list_elements(False, False)
+  expect(RBrack)
+  ()
+}
+
+fn list_elements(has_element: Bool, seen_rest: Bool) -> () uses { State[Parser] } {
+  if !at(RBrack) && !at_eof() {
+    if seen_rest { report("E0114", "`..` must come last") }
+    (element, rest) = if at(Dot2) {
+      if !has_element { report("E0115", "`..` needs at least one element before it") }
+      rest_expr()
+      (has_element, True)
+    } else {
+      expr()
+      (True, seen_rest)
+    }
+    if eat(Comma) { list_elements(element, rest) }
+  }
+}
+
+## `..` and the expression after it, if any.
+fn rest_expr() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  kind = current()
+  if !(kind == Comma || kind == RBrack || kind == RParen) {
+    expr()
+    ()
+  }
+  finish(m, RestExpr)
+}
+
+## `"(" [ args ] ")"`. `args = arg { "," arg } [ "," ".." expr ] | ".." expr`,
+## `arg = expr | lower_name ":" [ expr ]`
+fn arg_list() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  args(False, False)
+  expect(RParen)
+  finish(m, ArgList)
+}
+
+fn args(seen_named: Bool, seen_spread: Bool) -> () uses { State[Parser] } {
+  if !at(RParen) && !at_eof() {
+    if seen_spread { report("E0114", "`..` must come last") }
+    (named, spread) = if at(LowerName) && nth(1) == Colon {
+      a = start()
+      bump()
+      bump()
+      arg_value()
+      finish(a, NamedArg)
+      (True, seen_spread)
+    } else if at(Dot2) {
+      a = start()
+      bump()
+      arg_value()
+      finish(a, SpreadArg)
+      (seen_named, True)
+    } else {
+      if seen_named {
+        report("E0120", "positional arguments cannot follow named arguments")
+      }
+      expr()
+      (seen_named, seen_spread)
+    }
+    if eat(Comma) { args(named, spread) }
+  }
+}
+
+fn arg_value() -> () uses { State[Parser] } {
+  if !at(Comma) && !at(RParen) {
+    expr()
+    ()
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Declarations (`grammar/items.rs`)
+
+## `{ import NL } { decl NL }`. A declaration not followed by a newline gets a diagnostic, and the
+## parser skips to the next declaration.
+pub fn source_file() -> () uses { State[Parser] } {
+  root = start()
+  decls(False)
+  finish(root, Root)
+}
+
+fn decls(seen_decl: Bool) -> () uses { State[Parser] } {
+  doc = newlines_with_doc()
+  if !at_eof() {
+    m = marker_or_start(doc)
+    seen = if at(ImportKw) {
+      if seen_decl { report("E0127", "imports must come before declarations") }
+      import_decl(m)
+      seen_decl
+    } else {
+      decl(m)
+      True
+    }
+    if !at(Newline) && !at_eof() && !at_line_start() {
+      report("E0122", "expected newline after declaration")
+      skip_to_decl()
+    }
+    decls(seen)
+  }
+}
+
+## Reads separating newlines. If a doc comment is attached, returns a marker opened at its
+## position. The declaration opens with this marker, so the sink puts the comment inside it.
+fn newlines_with_doc() -> Option[Marker] uses { State[Parser] } {
+  newlines_doc(None)
+}
+
+fn newlines_doc(doc: Option[Marker]) -> Option[Marker] uses { State[Parser] } {
+  if at(Newline) {
+    next = doc match {
+      None    -> if at_doc_comment() { Some(start()) } else { None }
+      Some(_) -> doc
+    }
+    bump()
+    newlines_doc(next)
+  } else {
+    doc
+  }
+}
+
+## `"import" module_path [ "." "{" import_item { "," import_item } "}" ]`
+fn import_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  if at(TypeName) {
+    path()
+    ()
+  } else {
+    err_recover("E0110", "expected module path", [Newline])
+  }
+  if at(Dot) && nth(1) == LBrace {
+    list = start()
+    bump()
+    delimited(LBrace, RBrace, import_item)
+    finish(list, ImportList)
+  }
+  finish(m, Import)
+}
+
+fn import_item() -> () uses { State[Parser] } {
+  kind = current()
+  if kind == LowerName || kind == TypeName || kind == UpperName {
+    bump()
+  } else {
+    err_recover("E0110", "expected name to import", [Comma, RBrace, Newline])
+  }
+}
+
+## `{ annotation NL } [ "pub" [ "opaque" ] ] item | impl_decl`
+fn decl(m: Marker) -> () uses { State[Parser] } {
+  annotated = decl_annotations(False)
+  public = eat(PubKw)
+  if at(OpaqueKw) {
+    if !public {
+      report("E0131", "`opaque` must follow `pub`")
+    } else if !(nth(1) == TypeKw || nth(1) == EnumKw) {
+      report("E0131", "`opaque` can only be used on `type` and `enum`")
+    }
+    bump()
+  }
+  if at(ImplKw) && (public || annotated) {
+    report("E0133", "`impl` cannot have `pub` or annotations")
+  }
+  current() match {
+    FnKw      -> fn_decl(m)
+    SuspendKw -> fn_decl(m)
+    TypeKw    -> type_decl(m)
+    ErrorKw   -> error_decl(m)
+    EnumKw    -> enum_decl(m)
+    ConstKw   -> const_decl(m)
+    EffectKw  -> effect_decl(m)
+    HandlerKw -> handler_decl(m)
+    LayerKw   -> layer_decl(m)
+    TraitKw   -> trait_decl(m)
+    ImplKw    -> impl_decl(m)
+    _ -> {
+      report("E0126", "expected declaration")
+      if !at_eof() { skip_to_decl() }
+      finish(m, Error)
+    }
+  }
+}
+
+fn decl_annotations(annotated: Bool) -> Bool uses { State[Parser] } {
+  if at(At) {
+    named = annotation()
+    if named && !at_eof() && !eat(Newline) && !at_line_start() {
+      report("E0110", "expected newline after annotation")
+    }
+    skip_newlines()
+    decl_annotations(True)
+  } else {
+    annotated
+  }
+}
+
+## Annotations each followed by any newlines, as before a local fn or a variant.
+fn annotations() -> () uses { State[Parser] } {
+  if at(At) {
+    annotation()
+    skip_newlines()
+    annotations()
+  }
+}
+
+## `"@" lower_name [ "(" annot_arg { "," annot_arg } ")" ]`,
+## `annot_arg = lower_name | literal | lower_name ":" literal | qualified`
+##
+## Returns whether there is a name. Without one, the caller should not add more diagnostics.
+fn annotation() -> Bool uses { State[Parser] } {
+  m = start()
+  bump()
+  named = expect(LowerName)
+  if at(LParen) {
+    args = start()
+    delimited(LParen, RParen, annot_arg)
+    finish(args, AnnotArgList)
+  }
+  finish(m, Annotation)
+  named
+}
+
+fn annot_arg() -> () uses { State[Parser] } {
+  arg = start()
+  if at(LowerName) {
+    bump()
+    if eat(Colon) { annot_literal() }
+  } else if at(TypeName) {
+    annot_path()
+  } else {
+    annot_literal()
+  }
+  finish(arg, AnnotArg)
+}
+
+## `Http.Server.serve`: type names joined by `.`, then a lower name.
+fn annot_path() -> () uses { State[Parser] } {
+  m = start()
+  bump()
+  annot_path_rest()
+  finish(m, AnnotPath)
+}
+
+fn annot_path_rest() -> () uses { State[Parser] } {
+  if !at(Dot) {
+    report("E0110", "expected `.` and a function name after the module path")
+  } else {
+    bump()
+    if eat(TypeName) {
+      annot_path_rest()
+    } else {
+      expect(LowerName)
+      ()
+    }
+  }
+}
+
+fn annot_literal() -> () uses { State[Parser] } {
+  if is_literal_start(current()) {
+    literal(interp)
+    ()
+  } else {
+    err_recover("E0110", "expected name or literal", [Comma, RParen, Newline])
+  }
+}
+
+## Reads at least one token and stops before the next declaration at the start of a line, or
+## before the end of the input.
+fn skip_to_decl() -> () uses { State[Parser] } {
+  m = start()
+  skip_decl_tokens()
+  finish(m, Error)
+}
+
+fn skip_decl_tokens() -> () uses { State[Parser] } {
+  if !at_eof() {
+    bump()
+    if !at_decl_start() { skip_decl_tokens() }
+  }
+}
+
+## `effect_ref { "+" effect_ref }` after the `:` of a handler or a handler member. Each effect is
+## a HandlerEffect.
+fn handler_effects() -> () uses { State[Parser] } {
+  if at(TypeName) {
+    c = start()
+    path()
+    effect_type_args()
+    finish(c, HandlerEffect)
+    if eat(Plus) { handler_effects() }
+  } else {
+    expect(TypeName)
+    ()
+  }
+}
+
+## `[ "suspend" ] "fn" lower_name [ type_params ] "(" [ params ] ")" [ signature ] [ block ]`
+fn fn_decl(m: Marker) -> () uses { State[Parser] } {
+  fn_head_and_body()
+  finish(m, FnDecl)
+}
+
+## `local_fn = "fn" lower_name "(" [ params ] ")" [ signature ] block` (`[fn.local]`), a statement
+## of a block. The attributes, `pub`, `suspend` and type parameters of a top-level fn are read too,
+## and validation reports them (E0150). A missing body is reported here.
+fn local_fn_decl(m: Marker) -> () uses { State[Parser] } {
+  annotations()
+  eat(PubKw)
+  if !fn_head_and_body() {
+    report("E0110", "expected `{` and the body of the local function")
+  }
+  finish(m, LocalFn)
+}
+
+## At the start of a local fn: `fn` and a name, or the attributes, `pub` and `suspend` that a
+## top-level fn can have before `fn`.
+fn at_local_fn_start() -> Bool uses { State[Parser] } {
+  current() match {
+    FnKw      -> nth(1) == LowerName
+    SuspendKw -> nth(1) == FnKw
+    PubKw     -> nth(1) == FnKw || nth(1) == SuspendKw
+    At        -> True
+    _         -> False
+  }
+}
+
+## The part of a fn from `suspend` to its body, shared by top-level and local fns. Returns whether
+## there is a body.
+fn fn_head_and_body() -> Bool uses { State[Parser] } {
+  eat(SuspendKw)
+  expect(FnKw)
+  decl_name(LowerName)
+  if at(LBrack) { type_param_list() }
+  params_or_expect()
+  if at(ThinArrow) {
+    ret_type()
+  } else if at_contextual_kw("fails") {
+    report("E0110", "expected `->` before `fails`")
+  }
+  if !effects_and_errors() { old_uses_clause_on_next_line() }
+  if at(LBrace) {
+    block()
+    True
+  } else {
+    False
+  }
+}
+
+fn params_or_expect() -> () uses { State[Parser] } {
+  if at(LParen) {
+    param_list()
+  } else {
+    expect(LParen)
+    ()
+  }
+}
+
+## `"[" type_param { "," type_param } "]"`,
+## `type_param = ( upper_name | type_name ) [ ":" bound { "+" bound } ]`
+fn type_param_list() -> () uses { State[Parser] } {
+  m = start()
+  delimited(LBrack, RBrack, type_param)
+  finish(m, TypeParamList)
+}
+
+fn type_param() -> () uses { State[Parser] } {
+  m = start()
+  if !eat(UpperName) && !eat(TypeName) {
+    err_recover("E0110", "expected type parameter name", [Colon, Comma, RBrack, Newline])
+  }
+  if eat(Colon) { bounds() }
+  finish(m, TypeParam)
+}
+
+fn bounds() -> () uses { State[Parser] } {
+  path_or_expect()
+  if eat(Plus) { bounds() }
+}
+
+## `"type" type_name [ type_params ] [ "(" [ fields ] ")" ] [ derive ]`
+fn type_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if at(LBrack) { type_param_list() }
+  if at(LParen) { field_list() }
+  derive_clause()
+  finish(m, TypeDecl)
+}
+
+## `"error" type_name [ "(" [ fields ] ")" ] [ derive ]`
+fn error_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if at(LParen) { field_list() }
+  derive_clause()
+  finish(m, ErrorDecl)
+}
+
+## `"enum" type_name [ type_params ] "{" variant { sep variant } "}" [ derive ]`. `sep = "," | NL`
+fn enum_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if at(LBrack) { type_param_list() }
+  if at(LBrace) {
+    variant_list()
+  } else {
+    expect(LBrace)
+    ()
+  }
+  derive_clause()
+  finish(m, EnumDecl)
+}
+
+fn variant_list() -> () uses { State[Parser] } {
+  list = start()
+  bump()
+  separated_items("variants", variant)
+  expect(RBrace)
+  finish(list, VariantList)
+}
+
+fn variant(m: Marker) -> () uses { State[Parser] } {
+  annotations()
+  kind = current()
+  if kind == LowerName || kind == UpperName {
+    # Only the name class differs. Report it and read it as a variant.
+    report("E0110", "expected variant name (a type name)")
+    variant_rest(m)
+  } else if kind == TypeName {
+    variant_rest(m)
+  } else {
+    err_recover("E0110", "expected variant name", [Comma, RBrace, Newline])
+  }
+}
+
+fn variant_rest(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  if at(LParen) { variant_fields() }
+  finish(m, Variant)
+}
+
+## Reads elements separated by commas or newlines, from right after `{` up to before `}`.
+##
+## `item` reads each element. The marker it gets is opened at the doc comment's position, so the
+## element node is completed with it. Does not consume `}`.
+fn separated_items(what: String, item: fn(Marker) -> () uses { State[Parser] }) -> ()
+  uses { State[Parser] } {
+  doc = newlines_with_doc()
+  if !(at(RBrace) || at_eof() || (at_decl_start() && !at_annotated_variant())) {
+    m = marker_or_start(doc)
+    before = position()
+    item(m)
+    if position() == before {
+      # Not even one token was read. Skip that token to make progress.
+      bump_error()
+    } else if !(eat(Comma) || at_line_end() || at_line_start()) {
+      report("E0110", "expected `,` or newline between #{what}")
+      e = start()
+      skip_item_rest()
+      finish(e, Error)
+    }
+    separated_items(what, item)
+  }
+}
+
+fn skip_item_rest() -> () uses { State[Parser] } {
+  if !at_line_end() && !at_decl_start() {
+    bump()
+    skip_item_rest()
+  }
+}
+
+## At attributes followed, across newlines, by a type name: the start of a variant, not of the
+## next declaration. An enum missing its `}` before `@test fn` still ends there.
+fn at_annotated_variant() -> Bool uses { State[Parser] } {
+  at(At) && annotated_variant(0)
+}
+
+fn annotated_variant(n: Int) -> Bool uses { State[Parser] } {
+  if nth(n) == At {
+    if nth(n + 1) != LowerName {
+      False
+    } else {
+      after = if nth(n + 2) == LParen { after_parens(n + 2, 0) } else { n + 2 }
+      if after < 0 { False } else { annotated_variant(newlines_from(after)) }
+    }
+  } else {
+    nth(n) == TypeName
+  }
+}
+
+## The position after the `)` that closes the `(` at `n`, or -1 if a newline or the end comes
+## first.
+fn after_parens(n: Int, depth: Int) -> Int uses { State[Parser] } {
+  kind = nth(n)
+  if kind == Newline || kind == Eof {
+    -1
+  } else {
+    next = if kind == LParen { depth + 1 } else if kind == RParen { depth - 1 } else { depth }
+    if next == 0 { n + 1 } else { after_parens(n + 1, next) }
+  }
+}
+
+## FieldList if named, TupleFieldList if unnamed; mixing them is E0128. The first field decides.
+fn variant_fields() -> () uses { State[Parser] } {
+  m = start()
+  n = newlines_from(1)
+  first = nth(n)
+  named = (first == At || (first == LowerName && nth(n + 1) == Colon))
+  delimited(LParen, RParen, || {
+    is_named = at(At) || (at(LowerName) && nth(1) == Colon)
+    if is_named != named {
+      report("E0128", "a variant cannot mix named and positional fields")
+    }
+    if is_named { field() } else { type_() }
+  })
+  finish(m, if named { FieldList } else { TupleFieldList })
+}
+
+## `"(" [ field { "," field } ] ")"`
+fn field_list() -> () uses { State[Parser] } {
+  m = start()
+  delimited(LParen, RParen, field)
+  finish(m, FieldList)
+}
+
+## `{ annotation } lower_name ":" type`
+fn field() -> () uses { State[Parser] } {
+  m = start()
+  field_annotations()
+  if !at(LowerName) {
+    err_recover("E0110", "expected field name", [Comma, RParen, Newline])
+  } else {
+    bump()
+    # Read a type even without `:` if one follows.
+    if expect(Colon) || at_type_start() { type_() }
+  }
+  finish(m, Field)
+}
+
+fn field_annotations() -> () uses { State[Parser] } {
+  if at(At) {
+    annotation()
+    field_annotations()
+  }
+}
+
+## `"derive" type_ref { "," type_ref }`. May be written on the next line. A doc comment in between
+## opens the node at its position, as for declarations, so the sink puts it inside DeriveClause.
+fn derive_clause() -> () uses { State[Parser] } {
+  if nth_at_contextual_kw(newlines_from(0), "derive") {
+    m = marker_or_start(newlines_with_doc())
+    bump()
+    derive_names()
+    finish(m, DeriveClause)
+  }
+}
+
+fn derive_names() -> () uses { State[Parser] } {
+  path_or_expect()
+  if eat(Comma) { derive_names() }
+}
+
+## On a different token, reports a diagnostic and, unless the declaration continues, wraps it in
+## Error and skips it.
+fn decl_name(kind: Kind) -> () uses { State[Parser] } {
+  if !eat(kind) {
+    err_recover("E0110", "expected #{describe(kind)}", [LParen, LBrack, LBrace, Newline])
+  }
+}
+
+fn at_type_start() -> Bool uses { State[Parser] } {
+  kind = current()
+  (kind == TypeName || kind == UpperName || kind == SelfTypeKw || kind == LParen || kind == FnKw)
+}
+
+## `"const" upper_name [ ":" type ] "=" expr`
+fn const_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(UpperName)
+  if eat(Colon) { type_() }
+  if expect(Eq) || !(at(Newline) || at_eof()) {
+    expr()
+    ()
+  }
+  finish(m, ConstDecl)
+}
+
+## `"effect" type_name [ type_params ] "{" { effect_member NL } "}"`, or a label
+## `"effect" type_name "of" type_ref [ "[" type { "," type } "]" ] [ "default" ]`.
+fn effect_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if at_contextual_kw("of") {
+    c = start()
+    bump()
+    if at(TypeName) {
+      path()
+      effect_type_args()
+    } else {
+      expect(TypeName)
+      ()
+    }
+    if at_contextual_kw("default") { bump() }
+    finish(c, EffectLabel)
+  } else {
+    if at(LBrack) { type_param_list() }
+    item_list_in(True, effect_item)
+  }
+  finish(m, EffectDecl)
+}
+
+fn effect_item(m: Marker) -> () uses { State[Parser] } {
+  if at(HandlerKw) || (at(SuspendKw) && nth(1) == HandlerKw) {
+    member_sig(m)
+  } else if at(FnKw) || at(SuspendKw) {
+    op_sig(m)
+  } else {
+    item_error(m, "expected operation (`fn`) or handler member (`handler`)")
+  }
+}
+
+## `[ "suspend" ] "handler" type_name "(" [ params ] ")" ":" effect_ref { "+" effect_ref }
+## [ "fails" error_set ]`, a handler member (`[effect.decl]`).
+fn member_sig(m: Marker) -> () uses { State[Parser] } {
+  eat(SuspendKw)
+  expect(HandlerKw)
+  decl_name(TypeName)
+  params_or_expect()
+  if expect(Colon) || at(TypeName) { handler_effects() }
+  effects_and_errors()
+  finish(m, MemberSig)
+}
+
+## `[ "suspend" ] "fn" lower_name [ type_params ] "(" [ params ] ")" "->" type [ "fails" error_set ]`
+fn op_sig(m: Marker) -> () uses { State[Parser] } {
+  eat(SuspendKw)
+  expect(FnKw)
+  decl_name(LowerName)
+  if at(LBrack) { type_param_list() }
+  params_or_expect()
+  if at(ThinArrow) {
+    ret_type()
+  } else {
+    expect(ThinArrow)
+    ()
+  }
+  if !effects_and_errors() { old_uses_clause_on_next_line() }
+  finish(m, OpSig)
+}
+
+## `"handler" type_name [ "(" [ fields ] ")" ] ":" effect_ref { "+" effect_ref }
+## "{" { handler_item NL } "}"`
+fn handler_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if at(LParen) { field_list() }
+  # Without `:`, the old `implements` (E0145, reported by validation) or a following type name is
+  # still read as the effect.
+  if at(Colon) || at_contextual_kw("implements") || at(TypeName) {
+    if at_contextual_kw("implements") {
+      bump()
+    } else if !eat(Colon) {
+      report("E0110", "expected `:`")
+    }
+    handler_effects()
+  } else {
+    report("E0110", "expected `:`")
+  }
+  item_list_in(True, handler_item)
+  finish(m, HandlerDecl)
+}
+
+fn handler_item(m: Marker) -> () uses { State[Parser] } {
+  if at_contextual_kw("init") && (nth(1) == LBrace || nth(1) == LParen) {
+    handler_hook(m, HandlerInit)
+  } else if at_contextual_kw("release") && nth(1) == LBrace {
+    handler_hook(m, HandlerRelease)
+  } else if at(FnKw) || at(SuspendKw) {
+    fn_decl(m)
+  } else if at(HandlerKw) {
+    # An inner handler, which implements a handler member (`[effect.handler]`).
+    handler_decl(m)
+  } else {
+    item_error(m, "expected `init`, `release`, operation (`fn`) or inner handler (`handler`)")
+  }
+}
+
+fn handler_hook(m: Marker, kind: NodeKind) -> () uses { State[Parser] } {
+  bump()
+  if at(LParen) { param_list() }
+  block()
+  finish(m, kind)
+}
+
+## `"layer" type_name "{" supply { sep supply } "}"`
+fn layer_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  list = start()
+  if expect(LBrace) {
+    separated_items("handlers", layer_item)
+    expect(RBrace)
+    ()
+  }
+  finish(list, ItemList)
+  finish(m, LayerDecl)
+}
+
+## The marker is left uncompleted: a supply is its own node.
+fn layer_item(_m: Marker) -> () uses { State[Parser] } {
+  if at(TypeName) {
+    supply()
+    ()
+  } else {
+    err_recover("E0110", "expected handler name", [Comma, RBrace, Newline])
+  }
+}
+
+## `"trait" type_name [ ":" bound { "+" bound } ] "{" { trait_item NL } "}"`
+fn trait_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  decl_name(TypeName)
+  if eat(Colon) { bounds() }
+  item_list_in(False, trait_item)
+  finish(m, TraitDecl)
+}
+
+fn trait_item(m: Marker) -> () uses { State[Parser] } {
+  if at(FnKw) {
+    fn_decl(m)
+  } else if at_contextual_kw("derive") {
+    # The syntax of derive rules is undecided (spec 18.1 #3). Report it and skip the whole thing.
+    report("E0129", "derive rules in traits are not supported yet")
+    skip_braced_line(0)
+    finish(m, Error)
+  } else {
+    item_error(m, "expected method (`fn`)")
+  }
+}
+
+## `"impl" type_ref [ type_params ] ":" type_ref "{" { impl_item NL } "}"`
+##
+## The old forms (`impl Show for User`, `impl[A: Eq] Box[A]: Eq`) are read without a diagnostic
+## into the tree the rewritten head would give; validation reports E0144.
+fn impl_decl(m: Marker) -> () uses { State[Parser] } {
+  bump()
+  if at(LBrack) { type_param_list() }
+  head = start()
+  path_or_expect()
+  if at_contextual_kw("for") {
+    # The old `impl Show for User`: the first name is the trait and the type follows `for`.
+    bump()
+    impl_type()
+  } else {
+    if at(LBrack) { type_param_list() }
+    finish(head, ImplType)
+    # Even without `:`, a following type name is read as the trait.
+    if expect(Colon) || at(TypeName) { path_or_expect() }
+  }
+  item_list_in(False, impl_item)
+  finish(m, ImplDecl)
+}
+
+fn impl_item(m: Marker) -> () uses { State[Parser] } {
+  if at(FnKw) { fn_decl(m) } else { item_error(m, "expected method (`fn`)") }
+}
+
+## The type of an impl with its type parameters: `type_ref [ type_params ]`.
+fn impl_type() -> () uses { State[Parser] } {
+  m = start()
+  path_or_expect()
+  if at(LBrack) { type_param_list() }
+  finish(m, ImplType)
+}
+
+## A declaration body `"{" { item NL } "}"`. With `handlers`, `handler` at the start of a line is
+## an item of the body (a handler member of an effect, or an inner handler of a handler), not a
+## new declaration.
+fn item_list_in(handlers: Bool, item: fn(Marker) -> () uses { State[Parser] }) -> ()
+  uses { State[Parser] } {
+  list = start()
+  if expect(LBrace) {
+    items(handlers, item)
+    expect(RBrace)
+    ()
+  }
+  finish(list, ItemList)
+}
+
+fn items(handlers: Bool, item: fn(Marker) -> () uses { State[Parser] }) -> ()
+  uses { State[Parser] } {
+  doc = newlines_with_doc()
+  stop = at(RBrace) || at_eof() || (at_top_decl_start() && !(handlers && at(HandlerKw)))
+  if !stop {
+    m = marker_or_start(doc)
+    before = position()
+    item(m)
+    if position() == before {
+      bump_error()
+    } else if !at_line_end() && !at_line_start() {
+      report("E0122", "expected newline or `}` after item")
+      e = start()
+      skip_item_rest()
+      finish(e, Error)
+    }
+    items(handlers, item)
+  }
+}
+
+## Reads up to a newline or the matching outer `}`. Inner `{ }` are read whole.
+fn skip_braced_line(depth: Int) -> () uses { State[Parser] } {
+  if !at_eof() {
+    kind = current()
+    if !((kind == Newline || kind == RBrace) && depth == 0) {
+      next = if kind == LBrace { depth + 1 } else if kind == RBrace { depth - 1 } else { depth }
+      bump()
+      skip_braced_line(next)
+    }
+  }
+}
+
+## An unreadable item in a body. Reports a diagnostic and wraps everything up to the end of the
+## line or before `}` in Error.
+fn item_error(m: Marker, message: String) -> () uses { State[Parser] } {
+  report("E0110", message)
+  skip_item_line()
+  finish(m, Error)
+}
+
+fn skip_item_line() -> () uses { State[Parser] } {
+  if !at_line_end() && !at_top_decl_start() {
+    bump()
+    skip_item_line()
+  }
+}

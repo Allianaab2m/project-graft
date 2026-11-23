@@ -4,6 +4,8 @@ pub enum Kind {
   # Trivia
   Whitespace
   Newline
+  ## A newline that continues the previous line (`[lex.continuation]`).
+  NewlineCont
   Comment
   DocComment
 
@@ -78,7 +80,6 @@ pub enum Kind {
   Neq
   Lt
   LtEq
-  LeftArrow
   Gt
   GtEq
   Amp2
@@ -87,8 +88,102 @@ pub enum Kind {
 
   ## A character or a chunk the lexer did not recognize.
   ErrorToken
+  ## The end of the input. Only the parser's lookahead returns it; the lexer never makes one.
+  Eof
 } derive Eq, Show
+
+## Whitespace, comments and newlines that continue a line. A Newline is not trivia: it ends a
+## statement.
+pub fn is_trivia(kind: Kind) -> Bool {
+  kind match {
+    Whitespace  -> True
+    NewlineCont -> True
+    Comment     -> True
+    DocComment  -> True
+    _           -> False
+  }
+}
 
 ## A token over the code points `start` (inclusive) to `end` (exclusive) of the source.
 pub type Token(kind: Kind, start: Int, end: Int)
   derive Eq, Show
+
+## The name of a kind in diagnostics: punctuation and reserved words in backquotes as written, the
+## name of the class otherwise.
+pub fn describe(kind: Kind) -> String {
+  kind match {
+    Whitespace  -> "whitespace"
+    Newline     -> "newline"
+    NewlineCont -> "newline"
+    Comment     -> "comment"
+    DocComment  -> "doc comment"
+    IntLit      -> "integer literal"
+    FloatLit    -> "float literal"
+    StringQuote -> "`\"`"
+    TripleQuote -> "`\"\"\"`"
+    StringText  -> "string text"
+    InterpStart -> "`\#{`"
+    InterpEnd   -> "`}`"
+    LowerName   -> "lower name"
+    TypeName    -> "type name"
+    UpperName   -> "upper name"
+    Underscore  -> "`_`"
+    FnKw        -> "`fn`"
+    TypeKw      -> "`type`"
+    EnumKw      -> "`enum`"
+    ErrorKw     -> "`error`"
+    ConstKw     -> "`const`"
+    TraitKw     -> "`trait`"
+    ImplKw      -> "`impl`"
+    EffectKw    -> "`effect`"
+    HandlerKw   -> "`handler`"
+    LayerKw     -> "`layer`"
+    ImportKw    -> "`import`"
+    PubKw       -> "`pub`"
+    OpaqueKw    -> "`opaque`"
+    SuspendKw   -> "`suspend`"
+    IfKw        -> "`if`"
+    ElseKw      -> "`else`"
+    MatchKw     -> "`match`"
+    FailKw      -> "`fail`"
+    EscapeKw    -> "`escape`"
+    UseKw       -> "`use`"
+    WithKw      -> "`with`"
+    AssertKw    -> "`assert`"
+    SelfKw      -> "`self`"
+    SelfTypeKw  -> "`Self`"
+    AsKw        -> "`as`"
+    ReservedKw  -> "reserved word"
+    LParen      -> "`(`"
+    RParen      -> "`)`"
+    LBrack      -> "`[`"
+    RBrack      -> "`]`"
+    LBrace      -> "`{`"
+    RBrace      -> "`}`"
+    Comma       -> "`,`"
+    Dot         -> "`.`"
+    Dot2        -> "`..`"
+    Colon       -> "`:`"
+    Eq          -> "`=`"
+    ThinArrow   -> "`->`"
+    Pipe        -> "`|`"
+    PipeGt      -> "`|>`"
+    Plus        -> "`+`"
+    Minus       -> "`-`"
+    Star        -> "`*`"
+    Slash       -> "`/`"
+    Percent     -> "`%`"
+    Bang        -> "`!`"
+    Eq2         -> "`==`"
+    Neq         -> "`!=`"
+    Lt          -> "`<`"
+    LtEq        -> "`<=`"
+    Gt          -> "`>`"
+    GtEq        -> "`>=`"
+    Amp2        -> "`&&`"
+    Pipe2       -> "`||`"
+    At          -> "`@`"
+    ErrorToken  -> "invalid token"
+    Eof         -> "end of file"
+  }
+}
