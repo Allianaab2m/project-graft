@@ -257,6 +257,8 @@ error: internal error: cannot format this file: the output has a syntax error: e
 
 行き先: 本体 issue（未提出）．Graft は reference に合わせて同じ出力を作り、同じく internal error にしている．
 
+その後、Graft 自身の `src/validation.emel` で踏んだ．`if kind == UnderscoreExpr || kind == PathExpr || kind == UnitExpr || kind == Literal {` がちょうどこの長さで、CI の `emela fmt --check` が internal error で落ちた．手元では `emela fmt .` の出力を捨てていて気づかなかった．条件を `[UnderscoreExpr, PathExpr, UnitExpr, Literal].any(|k| k == kind)` に書き換えて避けた．
+
 ### T4. native で `String.chars` と `String.length` が使えない
 
 起きたこと: 行末の `\r` を落とすのに `String.concat(s.chars().take(s.length() - 1))` と書いたら、native だけ「`String.chars` needs the Unicode grapheme cluster tables, which target `native` does not support yet」でビルドが止まった．js と wasm は通る．

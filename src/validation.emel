@@ -89,13 +89,17 @@ pub fn validate(src: Array[Int], root: Node) -> List[Diagnostic] {
   walk(src, root, []).reverse()
 }
 
-fn report(found: List[Diagnostic], start: Int, end: Int, code: String, message: String)
-  -> List[Diagnostic] {
+fn report(
+  found: List[Diagnostic],
+  start: Int,
+  end: Int,
+  code: String,
+  message: String,
+) -> List[Diagnostic] {
   [Diagnostic(code, start, end, message), ..found]
 }
 
-fn at_node(found: List[Diagnostic], node: Node, code: String, message: String)
-  -> List[Diagnostic] {
+fn at_node(found: List[Diagnostic], node: Node, code: String, message: String) -> List[Diagnostic] {
   report(found, node.start, node.end, code, message)
 }
 
@@ -114,7 +118,11 @@ fn walk(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnostic
   } else if kind == LocalFn {
     # An attribute is already reported as one; what it would say on a top-level fn (E0146 for
     # `@export`) is not added.
-    walk_children(src, children(node).filter(|c| c.kind != Annotation), local_fn_modifiers(node, found))
+    walk_children(
+      src,
+      children(node).filter(|c| c.kind != Annotation),
+      local_fn_modifiers(node, found),
+    )
   } else {
     walk_children(src, children(node), check(src, node, found))
   }
@@ -129,19 +137,18 @@ fn check(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnosti
     export(src, node, found)
   } else if kind == TypeDecl {
     # A built-in type of the bundled sources (`Bytes`) has no fields either.
-    missing = if (
-      child_kind(node, FieldList).is_none()
-        && !has_annotation(src, node, "external")
-        && !has_annotation(src, node, "intrinsic")
-    ) {
+    missing = if (child_kind(node, FieldList).is_none()
+      && !has_annotation(src, node, "external")
+      && !has_annotation(src, node, "intrinsic")) {
       name_or(found, node, "E0130", "a type without fields must be `@external`")
     } else {
       found
     }
     # The annotation on `@external type` takes no arguments (spec 12.3).
-    annotations(src, node, "external")
-      .filter_map(|a| child_kind(a, AnnotArgList))
-      .fold(missing, |acc, list| at_node(acc, list, "E0141", "`@external` on a type takes no arguments"))
+    annotations(src, node, "external").filter_map(|a| child_kind(a, AnnotArgList)).fold(
+      missing,
+      |acc, list| at_node(acc, list, "E0141", "`@external` on a type takes no arguments"),
+    )
   } else if kind == OpSig || kind == MemberSig {
     child_kind(node, UsesClause) match {
       Some(clause) -> {
@@ -166,8 +173,14 @@ fn check(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnosti
     }
   } else if kind == ImplDecl {
     old_impl_head(src, node) match {
-      Some((start, end)) -> report(found, start, end, "E0144", "write the head as `impl Type: Trait`")
-      None               -> found
+      Some((start, end)) -> report(
+        found,
+        start,
+        end,
+        "E0144",
+        "write the head as `impl Type: Trait`",
+      )
+      None -> found
     }
   } else if kind == HandlerDecl {
     old_handler_head(src, node) match {
@@ -176,8 +189,14 @@ fn check(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Diagnosti
     }
   } else if kind == LambdaExpr {
     old_lambda_head(node) match {
-      Some(end) -> report(found, node.start, end, "E0148", "anonymous functions are written `|x| body`")
-      None      -> found
+      Some(end) -> report(
+        found,
+        node.start,
+        end,
+        "E0148",
+        "anonymous functions are written `|x| body`",
+      )
+      None -> found
     }
   } else if kind == BlockExpr {
     unused_local_fn(src, node, unused_lambdas(node, found))
@@ -230,11 +249,19 @@ fn unused_local_fn(src: Array[Int], block: Node, found: List[Diagnostic]) -> Lis
 fn local_fn_modifiers(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
   children_with_tokens(node).fold(found, |acc, element| {
     message = element match {
-      NodeElement(n) if n.kind == Annotation    -> Some(("a local function cannot have attributes", n.start, n.end))
-      NodeElement(n) if n.kind == TypeParamList -> Some(("a local function cannot have type parameters", n.start, n.end))
-      TokenElement(t) if t.kind == PubKw        -> Some(("a local function cannot be `pub`", t.start, t.end))
-      TokenElement(t) if t.kind == SuspendKw    -> Some(("a local function cannot be `suspend`", t.start, t.end))
-      _                                         -> None
+      NodeElement(n) if n.kind == Annotation -> Some(
+        ("a local function cannot have attributes", n.start, n.end),
+      )
+      NodeElement(n) if n.kind == TypeParamList -> Some(
+        ("a local function cannot have type parameters", n.start, n.end),
+      )
+      TokenElement(t) if t.kind == PubKw -> Some(
+        ("a local function cannot be `pub`", t.start, t.end),
+      )
+      TokenElement(t) if t.kind == SuspendKw -> Some(
+        ("a local function cannot be `suspend`", t.start, t.end),
+      )
+      _ -> None
     }
     message match {
       Some((text, start, end)) -> report(acc, start, end, "E0150", text)
@@ -246,7 +273,9 @@ fn local_fn_modifiers(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
 ## Accepts only the expression shapes that correspond to spec 17.6 patterns.
 fn binding_target(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
   kind = node.kind
-  (ok, inner) = if kind == UnderscoreExpr || kind == PathExpr || kind == UnitExpr || kind == Literal {
+  # Not a chain of `||`: at this length `emela fmt` 0.28.2 breaks it into an output that does not
+  # parse (FRICTION.md T3).
+  (ok, inner) = if [UnderscoreExpr, PathExpr, UnitExpr, Literal].any(|k| k == kind) {
     (True, found)
   } else if kind == NameRef {
     # `self` and `Self` are not patterns (`[effect.handler]`).
@@ -265,7 +294,7 @@ fn binding_target(node: Node, found: List[Diagnostic]) -> List[Diagnostic] {
   } else if kind == RestExpr {
     # Only a name may follow `..`.
     ok = children(node) match {
-      []     -> True
+      []      -> True
       [c, ..] -> c.kind == NameRef && has_token(c, LowerName)
     }
     (ok, found)
@@ -383,9 +412,19 @@ fn fn_externals(src: Array[Int], node: Node, found: List[Diagnostic]) -> List[Di
             }
             strings = rest.fold(checked, |a, arg| {
               annot_string(arg) match {
-                Some(True)  -> a
-                Some(False) -> at_node(a, arg, "E0138", "string interpolation is not allowed in `@external`")
-                None        -> at_node(a, arg, "E0138", "arguments after the language of `@external` must be strings")
+                Some(True) -> a
+                Some(False) -> at_node(
+                  a,
+                  arg,
+                  "E0138",
+                  "string interpolation is not allowed in `@external`",
+                )
+                None -> at_node(
+                  a,
+                  arg,
+                  "E0138",
+                  "arguments after the language of `@external` must be strings",
+                )
               }
             })
             n = rest.length()
@@ -453,9 +492,12 @@ fn export_args(
   }
   (checked, strings) = rest.fold((known, True), |(acc, ok), arg| {
     annot_string(arg) match {
-      Some(True)  -> (acc, ok)
-      Some(False) -> (at_node(acc, arg, "E0146", "string interpolation is not allowed in `@export`"), False)
-      None        -> (at_node(acc, arg, "E0146", malformed), False)
+      Some(True) -> (acc, ok)
+      Some(False) -> (
+        at_node(acc, arg, "E0146", "string interpolation is not allowed in `@export`"),
+        False,
+      )
+      None       -> (at_node(acc, arg, "E0146", malformed), False)
     }
   })
   n = rest.length()
@@ -501,7 +543,7 @@ fn old_handler_head(src: Array[Int], node: Node) -> Option[Token] {
     t.kind == LowerName && slice(src, t.start, t.end) == "implements"
   })
   implements match {
-    None    -> None
+    None -> None
     Some(t) -> {
       # The name, or the field list after it.
       before = children_with_tokens(node).any(|e| {
@@ -553,9 +595,10 @@ fn has_annotation(src: Array[Int], node: Node, name: String) -> Bool {
 
 fn annotations(src: Array[Int], node: Node, name: String) -> List[Node] {
   children(node).filter(|c| {
-    c.kind == Annotation && tokens_of(c).any(|t| {
-      t.kind == LowerName && slice(src, t.start, t.end) == name
-    })
+    c.kind == Annotation
+      && tokens_of(c).any(|t| {
+        t.kind == LowerName && slice(src, t.start, t.end) == name
+      })
   })
 }
 
