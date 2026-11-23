@@ -191,6 +191,24 @@ M3 の `src/check.emel` でも、`Modules.CORE`（core モジュールの表）�
 
 行き先: proposal．同じ名前を持つ2つのモジュールを1つのモジュールで使う場面は、HIR と構文木のように層を分けたプログラムで必ず起きる．
 
+### L11. `a && x match { ... }` が `(a && x) match { ... }` と読まれる
+
+やりたかったこと: 型検査の `groups.emel` で、「型引数でない」かつ「定義したモジュールが自分のモジュール」を1つの式で書く．
+
+```emel
+TPath(ResDef(d), _) -> def_of(program, d).kind != TypeParamKind
+  && def_of(program, def).module match {
+    SourceModule(m) -> defining_module(program, d) == Some(m)
+    _               -> False
+  }
+```
+
+起きたこと: `expected Bool, found DefModule` が arm のパターンに出た．match は最も弱い優先順位（6.6 の表の 9 位）なので、`&&` の式全体が match の対象になる．仕様どおりだが、エラーは arm を指すので、優先順位の問題だと気づくまで時間がかかった．match の結果を変数に取ってから `&&` でつないで直した．
+
+本来の形: 書き方は今のままでよい．診断が「match の対象が `&&` の式全体になっている」と分かるようにしてほしい．例えば対象が二項演算子の式のときに help で括弧を勧める．
+
+行き先: 本体 issue（診断の改善）．
+
 ## std
 
 ### S1. String を位置で読めない
