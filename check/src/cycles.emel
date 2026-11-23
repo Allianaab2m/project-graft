@@ -1,0 +1,188 @@
+## Consts whose values refer to each other (E0231, spec 5.6). Follows `const_cycle.rs` of the
+## reference type checker.
+##
+## A const's value is evaluated once, so a const cannot need its own value. References inside
+## lambdas, local fns, the branches of `if` and `match` and the right side of `&&` and `||` are
+## not evaluated with the value and do not count.
+import Std.Map.{Map}
+import Hir.{
+  Program,
+  Block,
+  SLet,
+  SLocalFn,
+  SExpr,
+  SInterp,
+  OpAnd,
+  OpOr,
+  ResDef,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  EField,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  ETuple,
+  EList,
+  EBlock,
+  EIf,
+  EMatch,
+  EEscape,
+  EFail,
+  EAssert,
+  EUpdate,
+  EUse,
+  EWith,
+  ELambda,
+  IConst,
+}
+import Groups.{item_args, strongly_connected}
+import Tylower.{TyDiag, def_of}
+
+## Reports each cycle once, at the const of the cycle defined first, with the shortest path back.
+pub fn check(program: Program) -> List[TyDiag] {
+  consts = program.items.to_list().filter_map(|(def, item)| {
+    item match {
+      IConst(_) -> Some(def)
+      _         -> None
+    }
+  })
+  edges = consts.fold(Map.empty(), |m, def| {
+    refs = program.items.get(def) match {
+      Some(IConst(c)) -> dedup(eager_refs(program, c.value, []).reverse())
+      _               -> []
+    }
+    m.insert(def, refs)
+  })
+  groups = strongly_connected(consts, edges).sort_by(
+    |a, b| Ord.compare(a.head().or(0), b.head().or(0)),
+  )
+  groups.filter_map(|group| {
+    group.head().and_then(|start| {
+      shortest_cycle(start, group, edges).map(|cycle| {
+        names = String.join(cycle.map(|d| def_of(program, d).name), " -> ")
+        TyDiag(
+          def_of(program, start).span,
+          "E0231",
+          "constants refer to each other: #{names}",
+          False,
+        )
+      })
+    })
+  })
+}
+
+fn dedup(xs: List[Int]) -> List[Int] {
+  xs.fold([], |acc, x| {
+    acc match {
+      [y, ..] if y == x -> acc
+      _                 -> [x, ..acc]
+    }
+  }).reverse()
+}
+
+## Breadth first from `start` within the group, back to `start`.
+fn shortest_cycle(start: Int, group: List[Int], edges: Map[Int, List[Int]]) -> Option[List[Int]] {
+  bfs(start, group, edges, [start], Map.empty())
+}
+
+fn bfs(
+  start: Int,
+  group: List[Int],
+  edges: Map[Int, List[Int]],
+  queue: List[Int],
+  prev: Map[Int, Int],
+) -> Option[List[Int]] {
+  queue match {
+    [] -> None
+    [def, ..rest] -> {
+      nexts = edges.get(def).or([])
+      if nexts.any(|n| n == start) {
+        Some(path_back(start, def, prev, [start, def]))
+      } else {
+        (q, p) = nexts.fold((rest, prev), |(q, p), n| {
+          if group.any(|g| g == n) && !p.contains(n) && n != start {
+            (q.append([n]), p.insert(n, def))
+          } else {
+            (q, p)
+          }
+        })
+        bfs(start, group, edges, q, p)
+      }
+    }
+  }
+}
+
+## Walks `prev` back from `at` to the start; `path` holds the start, then the consts from the last
+## one backwards. The result runs from the start round to it again.
+fn path_back(start: Int, at: Int, prev: Map[Int, Int], path: List[Int]) -> List[Int] {
+  if at == start {
+    path.reverse()
+  } else {
+    prev.get(at) match {
+      Some(p) -> path_back(start, p, prev, path.append([p]))
+      None    -> path.reverse()
+    }
+  }
+}
+
+## The consts the value refers to when evaluated, newest first.
+fn eager_refs(program: Program, expr: Int, out: List[Int]) -> List[Int] {
+  go = |e: Int, o: List[Int]| eager_refs(program, e, o)
+  all = |es: List[Int], o: List[Int]| es.fold(o, |acc, e| eager_refs(program, e, acc))
+  program.exprs.get(expr).map(|e| e.kind) match {
+    None -> out
+    Some(kind) -> kind match {
+      EPath(ResDef(d)) -> program.items.get(d) match {
+        Some(IConst(_)) -> [d, ..out]
+        _               -> out
+      }
+      EMissing            -> out
+      ELit(_)             -> out
+      EPath(_)            -> out
+      EUnit               -> out
+      EUse(_, _)          -> out
+      ELambda(_, _)       -> out
+      EInterpolated(parts) -> parts.fold(out, |acc, p| {
+        p match {
+          SInterp(x) -> go(x, acc)
+          _          -> acc
+        }
+      })
+      EField(base, _)     -> go(base, out)
+      ECall(callee, args) -> all(args.map(|a| a.value), go(callee, out))
+      EUnary(_, operand)  -> go(operand, out)
+      EBinary(op, lhs, rhs) -> if op == OpAnd || op == OpOr {
+        go(lhs, out)
+      } else {
+        go(rhs, go(lhs, out))
+      }
+      ETuple(elems)       -> all(elems, out)
+      EList(elems, rest) -> {
+        o = all(elems, out)
+        rest.map(|r| go(r, o)).or(o)
+      }
+      EBlock(block)       -> block_refs(program, block, out)
+      EIf(c, _, _)        -> go(c, out)
+      EMatch(s, _)        -> go(s, out)
+      EEscape(s, _)       -> go(s, out)
+      EFail(x)            -> go(x, out)
+      EAssert(x)          -> go(x, out)
+      EUpdate(ctor, fields, base) -> go(base, all(fields.map(|f| f.value), go(ctor, out)))
+      EWith(items, body)  -> go(body, all(items.flat_map(item_args), out))
+    }
+  }
+}
+
+fn block_refs(program: Program, block: Block, out: List[Int]) -> List[Int] {
+  o = block.stmts.fold(out, |acc, stmt| {
+    stmt match {
+      SLet(_, _, value) -> eager_refs(program, value, acc)
+      SLocalFn(_)       -> acc
+      SExpr(e)          -> eager_refs(program, e, acc)
+    }
+  })
+  block.tail.map(|t| eager_refs(program, t, o)).or(o)
+}

@@ -5,19 +5,23 @@ import Std.Map.{Map}
 import Std.State.{State}
 import Hir.{Program}
 import Body
+import Cycles
 import Groups
 import Signature.{Signatures, insert_sig}
 import Traits
-import Tylower.{TyDiag, TyLower, new_lower, new_table}
+import Tylower.{TyDiag, TyLower, TyTable, con_def, def_of, new_lower, new_table}
+import Hir.{SourceModule, FnKind, IFn}
+import Ty.{TyFn, TyPrim, TyNever, TyError, TyBound, TyVar, TyNamed}
 
 ## The diagnostics of type checking, sorted by module and start position (stable), as the
 ## reference reports them. Those without a location come first.
-pub fn check(program: Program) -> List[TyDiag] {
+## `entry` is the module whose `main` is the program's entry, if there is one.
+pub fn check(program: Program, entry: Option[Int]) -> List[TyDiag] {
   table = new_table(program)
   (declared, sig_diags) = Signature.collect(program, table)
   (traits, sigs, trait_diags, collect_used) = Traits.collect(program, table, declared)
   groups = Groups.groups(program, sigs)
-  ((_, used), lowered) = State.run(new_lower(program, table, []), || {
+  (inferred, lowered) = State.run(new_lower(program, table, []), || {
     groups.fold(
       (sigs, collect_used.fold(Map.empty(), |m, k| m.insert(k, True))),
       |(known, used), group| {
@@ -27,8 +31,11 @@ pub fn check(program: Program) -> List[TyDiag] {
       },
     )
   })
-  diags = sig_diags.append(trait_diags).append(lowered.diags.reverse()).append(
-    Traits.unused_derives(program, traits, used),
+  (final_sigs, used) = inferred
+  diags = sig_diags.append(trait_diags).append(Cycles.check(program)).append(
+    lowered.diags.reverse(),
+  ).append(Traits.unused_derives(program, traits, used)).append(
+    main_value(program, table, final_sigs, entry),
   )
   diags.sort_by(|a, b| Ord.compare(position(a), position(b)))
 }
@@ -37,5 +44,67 @@ fn position(d: TyDiag) -> (Int, Int, Int) {
   d.span match {
     Some(s) -> (1, s.module, s.start)
     None    -> (0, 0, 0)
+  }
+}
+
+## W0304: the entry's `main` returns a type other than `()`, `ExitCode` of `Std.Process` and Never,
+## whose value would be discarded. Reported at the written return type, or at `main`.
+fn main_value(
+  program: Program,
+  table: TyTable,
+  sigs: Signatures,
+  entry: Option[Int],
+) -> List[TyDiag] {
+  main = entry.and_then(|m| program.modules.get(m)).and_then(|items| {
+    items.items.find(|d| def_of(program, d).name == "main" && def_of(program, d).kind == FnKind)
+  })
+  main.and_then(|def| {
+    Signature.get(sigs, def).map(|s| s.scheme.ty).and_then(|ty| {
+      ty match {
+        TyFn(f) -> {
+          ignored = f.ret match {
+            TyPrim(Ty.PUnit) -> True
+            TyNever          -> True
+            TyError          -> True
+            TyBound(_)       -> True
+            TyVar(_)         -> True
+            r                -> is_exit_code(program, table, r)
+          }
+          if ignored {
+            None
+          } else {
+            written = program.items.get(def) match {
+              Some(IFn(item)) -> item.sig.ret.and_then(|t| program.types.get(t)).and_then(
+                |r| r.span,
+              )
+              _ -> None
+            }
+            span = written match {
+              Some(s) -> Some(s)
+              None    -> def_of(program, def).span
+            }
+            Some(TyDiag(span, "W0304", "the value `main` returns is discarded", True))
+          }
+        }
+        _ -> None
+      }
+    })
+  }).map(|d| [d]).or([])
+}
+
+## Whether `ty` is `ExitCode` of the bundled `Std.Process`.
+fn is_exit_code(program: Program, table: TyTable, ty: Ty.Ty) -> Bool {
+  ty match {
+    TyNamed(con, args) -> {
+      data = def_of(program, con_def(table, con))
+      std_process = data.module match {
+        SourceModule(m) -> program.modules.get(m).map(|items| items.name == ["Std", "Process"]).or(
+          False,
+        )
+        _ -> False
+      }
+      args.is_empty() && data.name == "ExitCode" && std_process
+    }
+    _ -> False
   }
 }

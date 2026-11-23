@@ -33,7 +33,8 @@ pub type Checked(severity: String, code: String, file: String, range: Option[(In
 ## An import of a module: the path's segments and the range of the path.
 type ImportOf(path: List[String], start: Int, end: Int)
 
-type Input(root: String, entry: Option[String], single_file: Bool)
+## `library_only` for a project checked whole whose entry is `src/lib.emel`: it has no `main`.
+type Input(root: String, entry: Option[String], single_file: Bool, library_only: Bool)
 
 ## Why a path cannot be checked (`Input::resolve`), with its code.
 enum Resolved {
@@ -66,9 +67,10 @@ fn input(path: String) -> Resolved uses { FileSystem } {
       } else {
         None
       }
-      if inside { Resolved(Input(root, entry, False)) } else { Rejected("E0208") }
+      library_only = !is_file && entry == Some(Path.join(root, "lib.emel"))
+      if inside { Resolved(Input(root, entry, False, library_only)) } else { Rejected("E0208") }
     }
-    None -> Resolved(Input(start, Some(path), True))
+    None -> Resolved(Input(start, Some(path), True, False))
   }
 }
 
@@ -177,7 +179,8 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
       Checked(if d.warning { "warning" } else { "error" }, d.code, file, Some((d.start, d.end)))
     })
     # Type checking runs on the program even when name resolution reported errors.
-    type_diagnostics = Typeck.check(resolved.program).map(|d| {
+    main_module = if inp.library_only { None } else { entry }
+    type_diagnostics = Typeck.check(resolved.program, main_module).map(|d| {
       severity = if d.warning { "warning" } else { "error" }
       d.span match {
         Some(s) -> Checked(
