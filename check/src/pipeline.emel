@@ -120,16 +120,30 @@ fn read(map: ModuleMap, index: Int, core_lib: String) -> Option[String] uses { F
 
 type Read(index: Int, src: Array[Int], parsed: Sink.Built)
 
-## Every diagnostic of `emela check <path>` up to the import graph, in the reference's order.
+## Every diagnostic of `emela check <path>`, in the reference's order.
 pub fn check(path: String, core_lib: String) -> List[Checked] uses { FileSystem } {
+  analyze(path, core_lib).diagnostics
+}
+
+## What checking a path gives: the diagnostics, and when type checking ran, its results, the
+## entry module and the file of each module.
+pub type Analysis(
+  diagnostics: List[Checked],
+  typed: Option[Typeck.Checked],
+  entry: Option[Int],
+  library_only: Bool,
+  files: Map[Int, String],
+)
+
+pub fn analyze(path: String, core_lib: String) -> Analysis uses { FileSystem } {
   given = normalize(path)
   input(given) match {
-    Rejected(code) -> [Checked("error", code, "-", None)]
+    Rejected(code) -> Analysis([Checked("error", code, "-", None)], None, None, False, Map.empty())
     Resolved(inp)  -> check_input(inp, core_lib)
   }
 }
 
-fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem } {
+fn check_input(inp: Input, core_lib: String) -> Analysis uses { FileSystem } {
   (collected, collect_diagnostics) = Modules.collect(inp.root, inp.single_file)
   (map, shadowed) = Modules.add_core(collected)
   entry = inp.entry.and_then(|e| {
@@ -171,8 +185,8 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
   imports = reads.map_values(|r| imports_of(r.src, r.parsed))
   graph_diagnostics = graph(map, imports)
   # With an import cycle there is no order to check the modules in, so checking stops here.
-  checked = if graph_diagnostics.any(|d| d.code == "E0206") {
-    []
+  (checked, typed) = if graph_diagnostics.any(|d| d.code == "E0206") {
+    ([], None)
   } else {
     resolved = Resolve.resolve(map, reads.map_values(|r| (r.src, r.parsed.tree)))
     resolve_diagnostics = resolved.diagnostics.map(|d| {
@@ -188,9 +202,8 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
         None    -> (0, 0, 0)
       }
     }
-    sorted = Typeck.check(resolved.program, entry, inp.library_only).sort_by(
-      |a, b| Ord.compare(rank(a), rank(b)),
-    )
+    result = Typeck.check_program(resolved.program, entry, inp.library_only)
+    sorted = result.diags.sort_by(|a, b| Ord.compare(rank(a), rank(b)))
     type_diagnostics = sorted.map(|d| {
       severity = if d.warning { "warning" } else { "error" }
       d.span match {
@@ -203,9 +216,15 @@ fn check_input(inp: Input, core_lib: String) -> List[Checked] uses { FileSystem 
         None -> Checked(severity, d.code, "-", None)
       }
     })
-    resolve_diagnostics.append(type_diagnostics)
+    (resolve_diagnostics.append(type_diagnostics), Some(result))
   }
-  first.append(per_module).append(not_module).append(graph_diagnostics).append(checked)
+  diagnostics = first.append(per_module).append(not_module).append(graph_diagnostics).append(
+    checked,
+  )
+  files = List.range(0, count).fold(Map.empty(), |m, i| {
+    get(map, i).map(|d| m.insert(i, d.file)).or(m)
+  })
+  Analysis(diagnostics, typed, entry, inp.library_only, files)
 }
 
 fn normalize(path: String) -> String {

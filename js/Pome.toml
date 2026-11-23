@@ -1,0 +1,15 @@
+[pome]
+name = "github.com/Allianaab2m/project-graft/js"
+version = "0.1.0"
+emela = "0.28.2"
+module = "Js"
+
+[dependencies]
+"github.com/Allianaab2m/project-graft/syntax" = "v0.1.0"
+"github.com/Allianaab2m/project-graft/check" = "v0.1.0"
+"github.com/Allianaab2m/project-graft/core" = "v0.1.0"
+
+[replace]
+"github.com/Allianaab2m/project-graft/syntax" = { path = "../syntax" }
+"github.com/Allianaab2m/project-graft/check" = { path = "../check" }
+"github.com/Allianaab2m/project-graft/core" = { path = "../core" }

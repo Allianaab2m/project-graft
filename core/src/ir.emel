@@ -1,0 +1,240 @@
+## The Core IR: the typed tree after desugaring, which backends see. Follows `ir.rs` of
+## emela-core.
+##
+## Functions, enums, locals and effects are referred to by index into the module. A local is
+## bound at most once in the whole module, so rewrites never have to think about shadowing.
+## Unlike the reference, types are trees rather than indices into a hash-consed table.
+import Std.Map.{Map}
+
+pub type Module(
+  enums: Map[Int, EnumDef],
+  functions: Map[Int, Function],
+  locals: Map[Int, LocalData],
+  effects: Map[Int, EffectDef],
+  ## Prelude's `Option`, if added.
+  option: Option[Int],
+)
+
+pub fn empty_module() -> Module {
+  Module(Map.empty(), Map.empty(), Map.empty(), Map.empty(), None)
+}
+
+pub type LocalData(hint: String, ty: Type)
+
+pub type Function(
+  ## Unique in the module.
+  name: String,
+  ## A root of the output: the entry's `main`, an exported fn or a test.
+  exported: Bool,
+  ## The evidence table, if taken, is last.
+  params: List[Int],
+  ret: Type,
+  ## The number of type parameters (`CParam(i)`), set parameters included.
+  type_params: Int,
+  ## Whether a call may fail: the declared E is not empty.
+  fails: Bool,
+  body: Expr,
+  ## For an external function, the host function; `body` is then unused.
+  external: Option[External],
+  ## Whether it may suspend.
+  suspends: Bool,
+  ## The value of a const: evaluated once, on the first call.
+  constant: Bool,
+)
+
+## The host function of an external function: the per-target `@external` arguments.
+pub type External(bindings: List[ExternalBinding])
+
+pub type ExternalBinding(target: String, host: HostRef)
+
+pub enum HostRef {
+  ## `@external(js, "console.log")`: a name the host resolves.
+  HostGlobal(name: String)
+  ## `@external(js, "./clock.mjs", "now")`: `name` exported by `module`.
+  HostImport(module: HostModule, name: String)
+}
+
+pub enum HostModule {
+  ## A module the host finds by name (`node:fs`).
+  ModNamed(name: String)
+  ## A file next to a project source, as an absolute path.
+  ModFile(path: String)
+  ## A file bundled with the compiler, relative to `lib/` (`std/clock.mjs`).
+  ModBundled(path: String)
+}
+
+## An effect. One per instantiation of an effect with type arguments.
+pub type EffectDef(name: String, ops: List[OpDef])
+
+## An operation of an effect: its name, type, and whether it suspends.
+pub type OpDef(name: String, ty: FnType, suspends: Bool)
+
+## An enum. A `type` is an enum with one constructor.
+pub type EnumDef(
+  name: String,
+  ## The number of type parameters; `CParam(i)` in field types refers to the `i`th.
+  params: Int,
+  variants: List[VariantDef],
+  ## An error declaration: one constructor, no type parameters.
+  is_error: Bool,
+  ## An `@external type`: an opaque host value without constructors.
+  is_external: Bool,
+)
+
+pub type VariantDef(name: String, fields: VariantFields, tys: List[Type])
+
+pub enum VariantFields {
+  FieldsUnit
+  FieldsPositional(count: Int)
+  FieldsNamed(names: List[String])
+} derive Eq
+
+## The index of `Some` and of `None` in Prelude's `Option`.
+pub const OPTION_SOME: Int = 0
+pub const OPTION_NONE: Int = 1
+
+## The type of an IR value. No type variables: one left undetermined becomes `()`.
+pub enum Type {
+  CInt
+  CInt64
+  CFloat
+  CBool
+  CString
+  CBytes
+  CArray(elem: Type)
+  CUnit
+  CNever
+  ## Two or more elements.
+  CTuple(elems: List[Type])
+  CList(elem: Type)
+  CEnum(id: Int, args: List[Type])
+  ## The `i`th type parameter of the enclosing definition.
+  CParam(index: Int)
+  CFn(f: FnType)
+  ## A capability value: the handler value of the effect.
+  CHandler(eff: Int)
+  ## An evidence table.
+  CEvidence
+  ## A mutable cell.
+  CCell(content: Type)
+  ## The run-time scope of a fiber scope.
+  CFiberScope
+  ## A value whose type is not tracked.
+  CAny
+  ## What decides calling conventions about an error or effect set.
+  CSet(summary: SetSummary)
+} derive Eq
+
+## An error or effect set reduced to what decides how a function with it is called.
+pub type SetSummary(fails: Bool, suspends: Bool, ev: Bool, params: List[Type]) derive Eq
+
+## A function type, with what decides how a value of it is called.
+pub type FnType(
+  params: List[Type],
+  ret: Type,
+  ## Whether a call may fail.
+  fails: Bool,
+  ## Whether a call may suspend.
+  suspends: Bool,
+  ## Whether the function takes the evidence table as its last argument.
+  ev: Bool,
+) derive Eq
+
+pub fn pure_fn(params: List[Type], ret: Type) -> FnType {
+  FnType(params, ret, False, False, False)
+}
+
+pub type CtorRef(enum_id: Int, variant: Int) derive Eq
+
+pub enum Lit {
+  VInt(value: Int)
+  VInt64(text: String)
+  VFloat(value: Float)
+  VBool(value: Bool)
+  VString(value: String)
+  VUnit
+}
+
+pub enum Expr {
+  XLit(lit: Lit)
+  XVar(local: Int)
+  ## A reference to a function as a value, with its type arguments.
+  XFn(f: Int, ty_args: List[Type])
+  XLet(bound: Int, value: Expr, body: Expr)
+  XCall(callee: Callee, args: List[Expr], fails: Bool, suspends: Bool)
+  XBuiltin(op: String, ty_args: List[Type], args: List[Expr])
+  XCtor(ctor: CtorRef, ty_args: List[Type], args: List[Expr])
+  XField(base: Expr, ctor: CtorRef, index: Int)
+  XTuple(elems: List[Expr])
+  XList(elem: Type, elems: List[Expr], tail: Option[Expr])
+  XIf(cond: Expr, then_branch: Expr, else_branch: Expr)
+  XMatch(scrutinee: Expr, arms: List[Arm])
+  XBinary(op: BinOp, ty: OpTy, lhs: Expr, rhs: Expr)
+  XUnary(op: UnOp, ty: OpTy, operand: Expr)
+  XLambda(params: List[Int], ty: Type, body: Expr, suspends: Bool)
+  XConcat(parts: List[StrPart])
+  ## A loop over `vars`, first bound to `inits`; `XRecur` in the body goes round again.
+  XLoop(vars: List[Int], inits: List[Expr], body: Expr)
+  XRecur(args: List[Expr])
+  XFail(err: Expr)
+  XEscape(body: Expr, arms: List[Arm])
+  ## Seq of statements whose values are dropped, then a value.
+  XSeq(first: Expr, rest: Expr)
+}
+
+pub enum Callee {
+  ## A known function with its type arguments.
+  Direct(f: Int, ty_args: List[Type])
+  ## A function value.
+  Indirect(value: Expr)
+}
+
+pub type Arm(pat: Pat, guard: Option[Expr], body: Expr)
+
+pub enum Pat {
+  QWild
+  QBind(local: Int)
+  QLit(lit: Lit)
+  QCtor(ctor: CtorRef, args: List[Pat])
+  QTuple(elems: List[Pat])
+  ## `[a, b, ..rest]`: the elements, and the pattern of the rest if written.
+  QList(elems: List[Pat], rest: Option[Pat])
+}
+
+pub enum StrPart {
+  SLit(text: String)
+  ## A value shown with the show of its type.
+  SValue(value: Expr, ty: Type)
+}
+
+pub enum BinOp {
+  BAdd
+  BSub
+  BMul
+  BDiv
+  BRem
+  BEq
+  BNe
+  BLt
+  BLe
+  BGt
+  BGe
+  BAnd
+  BOr
+} derive Eq
+
+pub enum UnOp {
+  UNot
+  UNeg
+} derive Eq
+
+## The type an operator works on.
+pub enum OpTy {
+  OpInt
+  OpInt64
+  OpFloat
+  OpBool
+  OpString
+  ## A comparison through the structure of the values (`==` on records, lists, ...).
+  OpStructural
+} derive Eq

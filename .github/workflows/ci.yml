@@ -28,10 +28,11 @@ jobs:
       - uses: bytecodealliance/actions/wasmtime/setup@v1
         with:
           version: 49.0.3
-      # The Pomes of this repository: syntax, fmt and check, and the root with the command line.
+      # The Pomes of this repository: syntax, fmt, check, core and js, and the root with the
+      # command line.
       - name: Install, format and check each Pome
         run: |
-          for pome in syntax fmt check .; do
+          for pome in syntax fmt check core js .; do
             (cd "$pome" && emela pome install && emela fmt --check && emela check)
           done
       - name: Test each Pome on js, native and wasm

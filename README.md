@@ -48,9 +48,12 @@ The repository holds four Pomes. Each is used from its directory (`[replace]` in
 | `syntax/` | `Syntax` | Lexer, parser, syntax tree (`Tree`), validation and navigation (`Cst`) |
 | `fmt/` | `Fmt` | The formatter: documents (`Doc`), the printer and `Format` |
 | `check/` | `Check` | Modules, HIR, name resolution and types (`Pipeline` runs them) |
+| `core/` | `Core` | The Core IR and lowering from the typed HIR |
+| `js/` | `Js` | The JS output of the Core IR |
 | `.` | | The command line, `src/main.emel` |
 
-`fmt` and `check` depend on `syntax`; the root depends on all three. Tests live in the Pome they
+`fmt` and `check` depend on `syntax`, `core` on `check`, `js` on `core`; the root depends on all
+of them. Tests live in the Pome they
 test.
 
 ## Usage

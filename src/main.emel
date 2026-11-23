@@ -18,6 +18,9 @@ import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
 import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
 import Check.Pipeline
+import Core.Lower
+import Core.Lower.{LoweredModule, LowerErrors}
+import Js.Emit
 import Fmt.Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
 import Syntax.Lexer
 import Syntax.Parse
@@ -29,17 +32,18 @@ fn main() -> ExitCode {
     args = use Args
     console = use Console
     args.list() match {
-      ["roundtrip", ..files] -> roundtrip(files)
-      ["tokens", path]       -> tokens(path)
-      ["check", path, core]  -> check(path, core)
-      ["fmt", path]          -> fmt(path, DEFAULT_WIDTH)
+      ["roundtrip", ..files]              -> roundtrip(files)
+      ["tokens", path]                    -> tokens(path)
+      ["check", path, core]               -> check(path, core)
+      ["build", path, core, runtime, out] -> build_js(path, core, runtime, out)
+      ["fmt", path]                       -> fmt(path, DEFAULT_WIDTH)
       ["fmt", path, width] -> Some(Int.parse(width)) escape { _ -> None } match {
         Some(w) -> fmt(path, w)
         None    -> usage()
       }
-      ["parse", ..files]     -> parse(files)
-      ["tree", path]         -> tree(path)
-      _                      -> usage()
+      ["parse", ..files]                  -> parse(files)
+      ["tree", path]                      -> tree(path)
+      _                                   -> usage()
     }
   }
 }
@@ -142,6 +146,38 @@ fn fmt(path: String, width: Int) -> ExitCode uses { Console, FileSystem, Stdout 
       }
       (use Stdout).print(out)
       EXIT_SUCCESS
+    }
+  }
+}
+
+## Checks the program, lowers it and writes `main.mjs` with the runtime next to it in `out`.
+fn build_js(path: String, core: String, runtime: String, out: String) -> ExitCode
+  uses { Console, FileSystem } {
+  console = use Console
+  analysis = Pipeline.analyze(path, core)
+  errors = analysis.diagnostics.filter(|d| d.severity == "error")
+  (errors, analysis.typed) match {
+    ([], Some(typed)) -> Lower.lower(typed, analysis.entry) match {
+      LoweredModule(module) -> {
+        fs = use FileSystem
+        fs.create_directory(out) escape { _ -> () }
+        fs.write_text("#{out}/main.mjs", Emit.emit(module))
+        fs.write_text("#{out}/emela_runtime.mjs", fs.read_text(runtime))
+        EXIT_SUCCESS
+      } escape {
+        _ -> {
+          console.print_error_line("cannot write to #{out}")
+          EXIT_FAILURE
+        }
+      }
+      LowerErrors(messages) -> {
+        messages.each(|m| console.print_error_line("not lowered yet: #{m}"))
+        EXIT_FAILURE
+      }
+    }
+    _ -> {
+      errors.each(|d| console.print_error_line("error[#{d.code}] #{d.file}"))
+      EXIT_FAILURE
     }
   }
 }

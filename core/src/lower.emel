@@ -1,0 +1,425 @@
+## Lowering from the typed HIR to the Core IR. Follows `lower.rs` of emela-core.
+##
+## Only the fns reachable from the roots (the entry's `main`) are lowered: a work list of
+## definitions starts at the roots, and each reference to a fn adds it. A fn is lowered once, with
+## the definition's index as its index in the module.
+##
+## Not lowered yet: generic definitions (monomorphization), traits, errors, effects, suspension.
+## What cannot be lowered is reported as an error, and the build stops.
+import Std.Map.{Map}
+import Std.State.{State}
+import Check.Hir.{
+  Program,
+  Res,
+  ResDef,
+  ResLocal,
+  Literal,
+  LInt,
+  LFloat,
+  LString,
+  BinaryOp,
+  OpAdd,
+  OpSub,
+  OpMul,
+  OpDiv,
+  OpRem,
+  OpEq,
+  OpNe,
+  OpLt,
+  OpLe,
+  OpGt,
+  OpGe,
+  OpAnd,
+  OpOr,
+  UnaryOp,
+  OpNot,
+  OpNeg,
+  SText,
+  SInterp,
+  EMissing,
+  ELit,
+  EInterpolated,
+  EPath,
+  ECall,
+  EUnary,
+  EBinary,
+  EUnit,
+  EBlock,
+  EIf,
+  SLet,
+  SLocalFn,
+  SExpr,
+  PBind,
+  PWild,
+  IFn,
+  FnKind,
+  ParamLocal,
+}
+import Check.Ty.{
+  Ty,
+  TyPrim,
+  TyNever,
+  TyTuple,
+  TyList,
+  TyFn,
+  TyError,
+  PInt,
+  PInt64,
+  PFloat,
+  PBool,
+  PString,
+}
+import Check.Typeck
+import Check.Hir
+import Check.Ty
+import Check.Tylower.{def_of}
+import Ir.{
+  Module,
+  Function,
+  LocalData,
+  Type,
+  CInt,
+  CInt64,
+  CFloat,
+  CBool,
+  CString,
+  CUnit,
+  CNever,
+  CTuple,
+  CList,
+  CFn,
+  FnType,
+  Lit,
+  VInt,
+  VFloat,
+  VBool,
+  VString,
+  VUnit,
+  Expr,
+  XLit,
+  XVar,
+  XFn,
+  XLet,
+  XCall,
+  XTuple,
+  XIf,
+  XBinary,
+  XUnary,
+  XConcat,
+  XSeq,
+  Direct,
+  Indirect,
+  StrPart,
+  SLit,
+  SValue,
+  BinOp,
+  BAdd,
+  BSub,
+  BMul,
+  BDiv,
+  BRem,
+  BEq,
+  BNe,
+  BLt,
+  BLe,
+  BGt,
+  BGe,
+  BAnd,
+  BOr,
+  UNot,
+  UNeg,
+  OpTy,
+  OpInt,
+  OpInt64,
+  OpFloat,
+  OpBool,
+  OpString,
+  OpStructural,
+  empty_module,
+  pure_fn,
+}
+
+## The lowered module, or what could not be lowered.
+pub enum Lowered {
+  LoweredModule(module: Module)
+  LowerErrors(messages: List[String])
+}
+
+type Lowering(
+  program: Program,
+  checked: Typeck.Checked,
+  module: Module,
+  ## Definitions to lower, newest first.
+  queue: List[Int],
+  ## Definitions queued or lowered.
+  seen: Map[Int, Bool],
+  ## HIR locals → IR locals.
+  locals: Map[Int, Int],
+  next_local: Int,
+  ## Newest first.
+  errors: List[String],
+)
+
+fn st() -> Lowering uses { State[Lowering] } {
+  (use State[Lowering]).get()
+}
+
+fn upd(f: fn(Lowering) -> Lowering) -> () uses { State[Lowering] } {
+  s = use State[Lowering]
+  s.set(f(s.get()))
+}
+
+fn unsupported(what: String) -> Expr uses { State[Lowering] } {
+  upd(|l| Lowering(errors: [what, ..l.errors], ..l))
+  XLit(VUnit)
+}
+
+## Lowers the fns reachable from the entry's `main`.
+pub fn lower(checked: Typeck.Checked, entry: Option[Int]) -> Lowered {
+  program = checked.program
+  main = entry.and_then(|m| program.modules.get(m)).and_then(|items| {
+    items.items.find(|d| def_of(program, d).name == "main" && def_of(program, d).kind == FnKind)
+  })
+  main match {
+    None -> LowerErrors(["the entry has no `main`"])
+    Some(root) -> {
+      start = Lowering(
+        program,
+        checked,
+        empty_module(),
+        [root],
+        Map.empty().insert(root, True),
+        Map.empty(),
+        0,
+        [],
+      )
+      (_, done) = State.run(start, || drain(root))
+      if done.errors.is_empty() {
+        LoweredModule(done.module)
+      } else {
+        LowerErrors(done.errors.reverse())
+      }
+    }
+  }
+}
+
+fn drain(root: Int) -> () uses { State[Lowering] } {
+  st().queue match {
+    [] -> ()
+    [def, ..rest] -> {
+      upd(|l| Lowering(queue: rest, ..l))
+      lower_fn(def, def == root)
+      drain(root)
+    }
+  }
+}
+
+## The name of a definition in the output: its module's path and its name (`Std_Process_exit`).
+fn fn_name(def: Int) -> String {
+  program = st().program
+  data = def_of(program, def)
+  module = data.module match {
+    Hir.SourceModule(m) -> program.modules.get(m).map(|items| items.name).or([])
+    _                   -> []
+  }
+  String.join(module.append([data.name]), "_")
+}
+
+fn lower_fn(def: Int, exported: Bool) -> () uses { State[Lowering] } {
+  program = st().program
+  program.items.get(def) match {
+    Some(IFn(f)) -> f.body match {
+      Some(body) -> {
+        upd(|l| Lowering(locals: Map.empty(), ..l))
+        params = f.sig.params.map(|p| new_local(p.local))
+        ret = expr_type(body)
+        lowered = lower_expr(body)
+        name = if exported { def_of(program, def).name } else { fn_name(def) }
+        fun = Function(name, exported, params, ret, 0, False, lowered, None, False, False)
+        upd(
+          |l| Lowering(
+            module: Module(functions: l.module.functions.insert(def, fun), ..l.module),
+            ..l,
+          ),
+        )
+      }
+      None -> {
+        unsupported("a fn without a body: #{def_of(program, def).name}")
+        ()
+      }
+    }
+    _ -> {
+      unsupported("a reference to #{def_of(program, def).name}")
+      ()
+    }
+  }
+}
+
+## Allocates the IR local for a HIR local.
+fn new_local(local: Int) -> Int uses { State[Lowering] } {
+  l = st()
+  id = l.next_local
+  hint = l.program.locals.get(local).map(|d| d.name).or("v")
+  ty = l.checked.types.locals.get(local).map(lower_type).or(CUnit)
+  upd(
+    |x| Lowering(
+      next_local: id + 1,
+      locals: x.locals.insert(local, id),
+      module: Module(locals: x.module.locals.insert(id, LocalData(hint, ty)), ..x.module),
+      ..x,
+    ),
+  )
+  id
+}
+
+fn queue_fn(def: Int) -> () uses { State[Lowering] } {
+  if !st().seen.contains(def) {
+    upd(|l| Lowering(queue: l.queue.append([def]), seen: l.seen.insert(def, True), ..l))
+  }
+}
+
+fn expr_type(expr: Int) -> Type uses { State[Lowering] } {
+  st().checked.types.exprs.get(expr).map(lower_type).or(CUnit)
+}
+
+## The IR type of a checked type. A type variable left undetermined becomes `()`.
+fn lower_type(ty: Ty) -> Type {
+  ty match {
+    TyPrim(PInt)     -> CInt
+    TyPrim(PInt64)   -> CInt64
+    TyPrim(PFloat)   -> CFloat
+    TyPrim(PBool)    -> CBool
+    TyPrim(PString)  -> CString
+    TyPrim(Ty.PUnit) -> CUnit
+    TyNever          -> CNever
+    TyTuple(elems)   -> CTuple(elems.map(lower_type))
+    TyList(elem)     -> CList(lower_type(elem))
+    TyFn(f)          -> CFn(pure_fn(f.params.map(lower_type), lower_type(f.ret)))
+    _                -> CUnit
+  }
+}
+
+fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
+  program = st().program
+  program.exprs.get(expr) match {
+    None -> unsupported("a missing expression")
+    Some(e) -> e.kind match {
+      ELit(lit)             -> lower_lit(lit, expr_type(expr))
+      EUnit                 -> XLit(VUnit)
+      EPath(ResLocal(local)) -> st().locals.get(local).map(XVar).or(XLit(VUnit))
+      EPath(ResDef(def)) -> bool_value(def) match {
+        Some(b) -> XLit(VBool(b))
+        None -> {
+          queue_fn(def)
+          XFn(def, [])
+        }
+      }
+      EInterpolated(parts) -> XConcat(
+        parts.map(|p| {
+          p match {
+            SText(text) -> SLit(text)
+            SInterp(x)  -> SValue(lower_expr(x), expr_type(x))
+          }
+        }),
+      )
+      ECall(callee, args) -> {
+        values = args.map(|a| lower_expr(a.value))
+        program.exprs.get(callee).map(|c| c.kind) match {
+          Some(EPath(ResDef(def))) -> {
+            queue_fn(def)
+            XCall(Direct(def, []), values, False, False)
+          }
+          _ -> XCall(Indirect(lower_expr(callee)), values, False, False)
+        }
+      }
+      EBinary(op, lhs, rhs) -> lower_binary(op, lhs, rhs)
+      EUnary(OpNot, operand) -> XUnary(UNot, OpBool, lower_expr(operand))
+      EUnary(OpNeg, operand) -> XUnary(UNeg, op_ty(expr_type(operand)), lower_expr(operand))
+      EIf(c, t, el)         -> XIf(lower_expr(c), lower_expr(t), el.map(lower_expr).or(XLit(VUnit)))
+      EBlock(block)         -> lower_block(block.stmts, block.tail)
+      _                     -> unsupported("this kind of expression")
+    }
+  }
+}
+
+## `True` and `False` of the Prelude's Bool, which is the primitive Bool.
+fn bool_value(def: Int) -> Option[Bool] uses { State[Lowering] } {
+  l = st()
+  data = def_of(l.program, def)
+  if data.kind == Hir.CtorKind && data.parent.is_some() && data.parent == l.checked.table.bool_def {
+    Some(data.name == "True")
+  } else {
+    None
+  }
+}
+
+fn lower_lit(lit: Literal, ty: Type) -> Expr uses { State[Lowering] } {
+  lit match {
+    LInt(text) -> ty match {
+      CInt64 -> XLit(Ir.VInt64(text))
+      _      -> XLit(VInt(Int.parse(text) escape { _ -> 0 }))
+    }
+    LFloat(text)  -> XLit(VFloat(Float.parse(text) escape { _ -> 0.0 }))
+    LString(text) -> XLit(VString(text))
+  }
+}
+
+fn op_ty(ty: Type) -> OpTy {
+  ty match {
+    CInt    -> OpInt
+    CInt64  -> OpInt64
+    CFloat  -> OpFloat
+    CBool   -> OpBool
+    CString -> OpString
+    _       -> OpStructural
+  }
+}
+
+fn lower_binary(op: BinaryOp, lhs: Int, rhs: Int) -> Expr uses { State[Lowering] } {
+  ty = op_ty(expr_type(lhs))
+  bin = op match {
+    OpAdd -> Some(BAdd)
+    OpSub -> Some(BSub)
+    OpMul -> Some(BMul)
+    OpDiv -> Some(BDiv)
+    OpRem -> Some(BRem)
+    OpEq  -> Some(BEq)
+    OpNe  -> Some(BNe)
+    OpLt  -> Some(BLt)
+    OpLe  -> Some(BLe)
+    OpGt  -> Some(BGt)
+    OpGe  -> Some(BGe)
+    OpAnd -> Some(BAnd)
+    OpOr  -> Some(BOr)
+    _     -> None
+  }
+  bin match {
+    Some(b) -> XBinary(b, ty, lower_expr(lhs), lower_expr(rhs))
+    None    -> unsupported("this operator")
+  }
+}
+
+## Statements become nested `XLet` and `XSeq`; a block without a value is `()`.
+fn lower_block(stmts: List[Hir.Stmt], tail: Option[Int]) -> Expr uses { State[Lowering] } {
+  stmts match {
+    [] -> tail.map(lower_expr).or(XLit(VUnit))
+    [stmt, ..rest] -> stmt match {
+      SExpr(x) -> {
+        first = lower_expr(x)
+        XSeq(first, lower_block(rest, tail))
+      }
+      SLet(pat, _, value) -> {
+        v = lower_expr(value)
+        st().program.pats.get(pat).map(|p| p.kind) match {
+          Some(PBind(local)) -> {
+            bound = new_local(local)
+            XLet(bound, v, lower_block(rest, tail))
+          }
+          Some(PWild) -> XSeq(v, lower_block(rest, tail))
+          _           -> unsupported("a binding with a pattern")
+        }
+      }
+      SLocalFn(_) -> unsupported("a local fn")
+    }
+  }
+}
