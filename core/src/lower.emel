@@ -102,7 +102,7 @@ import Check.Numbers
 import Check.Signature
 import Check.Tylower
 import Check.Tylower.{def_of, con_def}
-import Check.Groups.{impl_fn}
+import Check.Groups.{impl_fn, flatten_layer}
 import Ir.{
   Module,
   Function,
@@ -201,7 +201,9 @@ pub enum Lowered {
 }
 
 ## A function instance to lower: its index in the module, the definition and the type arguments.
-type Instance(id: Int, def: Int, args: List[Type])
+## `role` is 0 for a fn or const, and for a handler 1 for its init, 2 for the function making its
+## handler value from its `self`, 3 for its release.
+type Instance(id: Int, def: Int, args: List[Type], role: Int)
 
 type Lowering(
   program: Program,
@@ -221,6 +223,8 @@ type Lowering(
   sources: Map[Int, Array[Int]],
   ## The built-in Bytes and Array types → their definitions.
   intrinsic_types: Map[String, Int],
+  ## The local holding the evidence table where the expression being lowered runs.
+  ev: Int,
 )
 
 fn st() -> Lowering uses { State[Lowering] } {
@@ -266,6 +270,7 @@ pub fn lower(
         [],
         sources,
         Map.empty(),
+        -1,
       )
       (_, done) = State.run(start, || {
         instance(root, [])
@@ -296,7 +301,11 @@ fn drain() -> () uses { State[Lowering] } {
 
 ## The function index of `def` instantiated with `args`, queued for lowering the first time.
 fn instance(def: Int, args: List[Type]) -> Int uses { State[Lowering] } {
-  key = "#{def}#{String.concat(args.map(|a| "/#{type_key(a)}"))}"
+  instance_of(def, args, 0)
+}
+
+fn instance_of(def: Int, args: List[Type], role: Int) -> Int uses { State[Lowering] } {
+  key = "#{role}:#{def}#{String.concat(args.map(|a| "/#{type_key(a)}"))}"
   st().instances.get(key) match {
     Some(id) -> id
     None -> {
@@ -304,7 +313,7 @@ fn instance(def: Int, args: List[Type]) -> Int uses { State[Lowering] } {
       upd(
         |l| Lowering(
           instances: l.instances.insert(key, id),
-          queue: l.queue.append([Instance(id, def, args)]),
+          queue: l.queue.append([Instance(id, def, args, role)]),
           ..l,
         ),
       )
@@ -325,6 +334,35 @@ fn def_name(def: Int) -> String {
 }
 
 fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
+  if inst.role != 0 {
+    lower_handler_part(inst)
+  } else {
+    lower_plain_fn(inst)
+  }
+}
+
+## Every function and lambda takes the evidence table as its last parameter (the reference passes
+## it only to those whose R needs it); calls pass the caller's.
+fn fresh_ev() -> Int uses { State[Lowering] } {
+  ev = fresh_local("ev", Ir.CEvidence, None)
+  upd(|l| Lowering(ev:, ..l))
+  ev
+}
+
+## Runs `f` for the body of a closure, which takes its own evidence table. Returns its local.
+fn in_closure[A](f: fn() -> A uses { State[Lowering] }) -> (Int, A) uses { State[Lowering] } {
+  outer = st().ev
+  ev = fresh_ev()
+  out = f()
+  upd(|l| Lowering(ev: outer, ..l))
+  (ev, out)
+}
+
+fn ev_var() -> Expr uses { State[Lowering] } {
+  XVar(st().ev)
+}
+
+fn lower_plain_fn(inst: Instance) -> () uses { State[Lowering] } {
   program = st().program
   def = inst.def
   parts = program.items.get(def) match {
@@ -365,15 +403,19 @@ fn lower_fn(inst: Instance) -> () uses { State[Lowering] } {
     }
     (Some((params, Some(body))), None) -> {
       upd(|l| Lowering(locals: Map.empty(), subst: inst.args, ..l))
-      locals = params.map(|p| new_local(p.local))
-      ret = expr_type(body)
-      lowered = lower_expr(body)
       main = def_of(program, def).name == "main" && inst.id == 0
+      constant = def_of(program, def).kind == Hir.ConstKind
+      plain = params.map(|p| new_local(p.local))
+      ev = fresh_ev()
+      # The launcher calls `main`, and a const is called, without an evidence table.
+      locals = if main || constant { plain } else { plain.append([ev]) }
+      ret = expr_type(body)
+      body0 = lower_expr(body)
+      lowered = if main || constant { XLet(ev, Ir.XProvide(None, []), body0) } else { body0 }
       name = if main { "main" } else { "#{def_name(def)}$#{inst.id}" }
       # The exit code `main` returns is set by `exit_with` of Std.Process.
       exit_with = if main { exit_code_setter(ret) } else { None }
-      value = exit_with.map(|f| XCall(Direct(f, []), [lowered], False, False)).or(lowered)
-      constant = def_of(program, def).kind == Hir.ConstKind
+      value = exit_with.map(|f| XCall(Direct(f, []), [lowered, ev_var()], False, False)).or(lowered)
       display = def_of(program, def).name
       fun = Function(name, main, locals, ret, 0, False, value, None, False, constant, display)
       set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
@@ -595,7 +637,7 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
   written match {
     Some((f, head)) -> {
       id = instance(f, impl_args(head, self_ty).append(targs.drop(1)))
-      XCall(Direct(id, []), args, False, False)
+      XCall(Direct(id, []), args.append([ev_var()]), False, False)
     }
     None -> {
       trait_name = def_of(program, trait_def).name
@@ -605,7 +647,7 @@ fn trait_call(def: Int, targs: List[Type], args: List[Expr]) -> Expr uses { Stat
         _                     -> False
       }
       if default && !prelude {
-        XCall(Direct(instance(def, targs), []), args, False, False)
+        XCall(Direct(instance(def, targs), []), args.append([ev_var()]), False, False)
       } else {
         builtin_trait_call(trait_name, name, self_ty, args)
       }
@@ -641,10 +683,11 @@ fn enum_def(def: Int) -> () uses { State[Lowering] } {
     placeholder = EnumDef(def_name(def), 0, [], False, False, False)
     set_module(|m| Module(enums: m.enums.insert(def, placeholder), ..m))
     (params, ctors, is_error) = program.items.get(def) match {
-      Some(IType(t))      -> (t.type_params.length(), t.ctor.map(|c| [c]).or([]), False)
-      Some(IEnum(e))      -> (e.type_params.length(), e.variants, False)
-      Some(Hir.IError(_)) -> (0, [def], True)
-      _                   -> (0, [], False)
+      Some(IType(t))        -> (t.type_params.length(), t.ctor.map(|c| [c]).or([]), False)
+      Some(IEnum(e))        -> (e.type_params.length(), e.variants, False)
+      Some(Hir.IError(_))   -> (0, [def], True)
+      Some(Hir.IHandler(h)) -> (0, h.ctor.map(|c| [c]).or([]), False)
+      _                     -> (0, [], False)
     }
     variants = ctors.map(variant_def)
     name = if def == option_def() { "Option" } else { def_name(def) }
@@ -759,7 +802,8 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
       }
       ELambda(params, body) -> {
         locals = params.map(|p| new_local(p.local))
-        XLambda(locals, expr_type(expr), lower_expr(body), False)
+        (ev, lowered) = in_closure(|| lower_expr(body))
+        XLambda(locals.append([ev]), expr_type(expr), lowered, False)
       }
       Hir.EUpdate(ctor, _, base) -> lower_update(expr, ctor, base)
       Hir.EAssert(cond)     -> lower_assert(cond)
@@ -774,8 +818,15 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
           }),
         )
       }
-      Hir.EUse(_, _)        -> unsupported("use")
-      Hir.EWith(_, _)       -> unsupported("with")
+      Hir.EUse(_, _) -> st().checked.types.exprs.get(expr) match {
+        Some(Ty.TyCap(tags)) -> tags.head() match {
+          Some(t) -> Ir.XUse(ev_var(), effect_key(t))
+          None    -> unsupported("use")
+        }
+        Some(t) -> unsupported("use of #{type_key(lower_type(t))}")
+        None    -> unsupported("use without a type")
+      }
+      Hir.EWith(items, body) -> lower_with(items, body)
       _                     -> unsupported("this kind of expression")
     }
   }
@@ -875,7 +926,8 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
           _      -> []
         }
         locals = ptys.map(|t| fresh_local("x", t, None))
-        XLambda(locals, fn_ty, XCtor(ref, enum_args(expr), locals.map(XVar)), False)
+        ev = fresh_local("ev", Ir.CEvidence, None)
+        XLambda(locals.append([ev]), fn_ty, XCtor(ref, enum_args(expr), locals.map(XVar)), False)
       }
     } else {
       callable(expr, def) match {
@@ -889,14 +941,17 @@ fn def_value(expr: Int, def: Int) -> Expr uses { State[Lowering] } {
             _      -> []
           }
           locals = ptys.map(|t| fresh_local("x", t, None))
-          builtin_call(expr, def, locals.map(XVar)) match {
-            Some(b) -> XLambda(locals, fn_ty, b, False)
-            None if data.kind == Hir.TraitFnKind -> XLambda(
-              locals,
-              fn_ty,
-              trait_call(def, type_args(expr), locals.map(XVar)),
-              False,
-            )
+          (ev, made) = in_closure(|| {
+            builtin_call(expr, def, locals.map(XVar)) match {
+              Some(b) -> Some(b)
+              None if data.kind == Hir.TraitFnKind -> Some(
+                trait_call(def, type_args(expr), locals.map(XVar)),
+              )
+              None    -> None
+            }
+          })
+          made match {
+            Some(b) -> XLambda(locals.append([ev]), fn_ty, b, False)
             None    -> unsupported("a reference to #{def_name(def)}")
           }
         }
@@ -954,6 +1009,25 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
     Some(EField(_, _))       -> types.methods.get(callee)
     _                        -> None
   }
+  # An operation of a capability: `c.next()`.
+  op = types.ops.get(callee).and_then(|o| {
+    callee_kind match {
+      Some(EField(base, _)) -> Some((o, base))
+      _                     -> None
+    }
+  })
+  op match {
+    Some((o, base)) -> {
+      h = lower_expr(base)
+      Ir.XOp(h, def_of(program, o).name, args, may_fail(callee))
+    }
+    None -> plain_call(expr, callee, target, args)
+  }
+}
+
+fn plain_call(expr: Int, callee: Int, target: Option[Int], args: List[Expr]) -> Expr
+  uses { State[Lowering] } {
+  program = st().program
   target match {
     Some(def) -> {
       data = def_of(program, def)
@@ -964,7 +1038,7 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
           Some(b)                              -> b
           None if data.kind == Hir.TraitFnKind -> trait_call(def, type_args(callee), args)
           None -> callable(callee, def) match {
-            Some(f) -> XCall(Direct(f, []), args, may_fail(callee), False)
+            Some(f) -> XCall(Direct(f, []), args.append([ev_var()]), may_fail(callee), False)
             None    -> unsupported("a call of #{def_name(def)}")
           }
         }
@@ -972,7 +1046,7 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
     }
     None -> {
       value = lower_expr(callee)
-      XCall(Indirect(value), args, may_fail(callee), False)
+      XCall(Indirect(value), args.append([ev_var()]), may_fail(callee), False)
     }
   }
 }
@@ -1017,9 +1091,10 @@ fn field_value(expr: Int, base: Int) -> Expr uses { State[Lowering] } {
         Some(TyNamed(con, _)) -> {
           def = con_def(st().checked.table, con)
           st().program.items.get(def) match {
-            Some(IType(t))      -> t.ctor.map(ctor_ref)
-            Some(Hir.IError(_)) -> Some(ctor_ref(def))
-            _                   -> None
+            Some(IType(t))        -> t.ctor.map(ctor_ref)
+            Some(Hir.IError(_))   -> Some(ctor_ref(def))
+            Some(Hir.IHandler(h)) -> h.ctor.map(ctor_ref)
+            _                     -> None
           }
         }
         _ -> None
@@ -1139,7 +1214,8 @@ fn lower_block(stmts: List[Hir.Stmt], tail: Option[Int]) -> Expr uses { State[Lo
         bound = new_local(f.local)
         params = f.sig.params.map(|p| new_local(p.local))
         ty = st().checked.types.locals.get(f.local).map(lower_type).or(CUnit)
-        value = XLambda(params, ty, lower_expr(f.body), False)
+        (ev, lowered) = in_closure(|| lower_expr(f.body))
+        value = XLambda(params.append([ev]), ty, lowered, False)
         XLet(bound, value, lower_block(rest, tail))
       }
     }
@@ -1180,5 +1256,169 @@ fn ctor_pat(pat: Int, def: Int) -> Pat uses { State[Lowering] } {
       args = slots.map(|s| s.map(lower_pat).or(QWild))
       QCtor(ctor_ref(def), args)
     }
+  }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Effects
+
+## The key of an effect in the evidence table: its name, with its type arguments.
+fn effect_key(tag: Ty.Tag) -> String uses { State[Lowering] } {
+  args = tag.args.map(|a| type_key(lower_type(a)))
+  if args.is_empty() {
+    def_name(tag.def)
+  } else {
+    "#{def_name(tag.def)}[#{String.join(args, ",")}]"
+  }
+}
+
+## The parts of a handler: its init (1), the function making its handler value from its `self`
+## (2), and its release (3).
+fn lower_handler_part(inst: Instance) -> () uses { State[Lowering] } {
+  program = st().program
+  def = inst.def
+  upd(|l| Lowering(locals: Map.empty(), subst: inst.args, ..l))
+  handler_ty = named_type(def, [])
+  name = "#{def_name(def)}$#{inst.role}$#{inst.id}"
+  item = program.items.get(def) match {
+    Some(Hir.IHandler(h)) -> Some(h)
+    _                     -> None
+  }
+  made = item.map(|h| {
+    inst.role match {
+      1 -> {
+        params = h.init_params.map(|p| new_local(p.local))
+        ev = fresh_ev()
+        body = h.init.map(lower_expr).or(h.ctor.map(|c| XCtor(ctor_ref(c), [], [])).or(XLit(VUnit)))
+        (params.append([ev]), body)
+      }
+      2 -> {
+        me = fresh_local("self", handler_ty, None)
+        ev = fresh_ev()
+        ops = h.ops.filter_map(|hop| {
+          hop.body.map(|body| {
+            op_name = hop.name.name
+            params = hop.params.map(|p| new_local(p.local))
+            self_local = new_local(hop.self_local)
+            if hop.is_suspend {
+              unsupported("a suspend fn implementation")
+              ()
+            }
+            lowered = lower_expr(body)
+            (op_name, XLambda(params, CUnit, XLet(self_local, XVar(me), lowered), False))
+          })
+        })
+        ([me, ev], Ir.XHandler(ops))
+      }
+      _ -> {
+        me = fresh_local("self", handler_ty, None)
+        ev = fresh_ev()
+        body = h.release.map(|(self_local, b)| {
+          bound = new_local(self_local)
+          XLet(bound, XVar(me), lower_expr(b))
+        }).or(XLit(VUnit))
+        ([me, ev], body)
+      }
+    }
+  })
+  when_some(made, |(params, body)| {
+    fun = Function(name, False, params, CUnit, 0, False, body, None, False, False, name)
+    set_module(|m| Module(functions: m.functions.insert(inst.id, fun), ..m))
+  })
+}
+
+## A handler listed in a `with`, with the arguments of its init and the name it is bound to.
+type Listed(hdl: Int, args: List[Hir.Arg], bind: Option[Int])
+
+## `with H1, ..., Hn { body }`: each handler's init and handler value, in order, each seeing the
+## evidence of the handlers before it; the body with all of them provided; then the releases in
+## reverse order, however the body ends.
+fn lower_with(items: List[Hir.WithItem], body: Int) -> Expr uses { State[Lowering] } {
+  program = st().program
+  listed = items.flat_map(|item| {
+    item.res match {
+      ResDef(d) -> program.items.get(d) match {
+        Some(Hir.IHandler(_)) if item.by.is_none() -> [
+          Listed(d, item.args.map(|a| a.args).or([]), item.bind),
+        ]
+        Some(Hir.ILayer(_)) -> flatten_layer(program, d).map(|h| {
+          Listed(h, layer_args(d, h), None)
+        })
+        _ -> {
+          unsupported("this item of `with`")
+          []
+        }
+      }
+      _ -> []
+    }
+  })
+  outer = st().ev
+  # (self local, handler local, evidence after it, the init call, the handler value) per handler.
+  (steps, last_ev) = listed.fold(([], outer), |(acc, ev), l| {
+    upd(|x| Lowering(ev:, ..x))
+    args = init_args(l.hdl, l.args)
+    init = instance_of(l.hdl, [], 1)
+    maker = instance_of(l.hdl, [], 2)
+    handler_ty = named_type(l.hdl, [])
+    me = fresh_local("self", handler_ty, None)
+    h = fresh_local("h", CUnit, None)
+    next = fresh_local("ev", Ir.CEvidence, None)
+    keys = Signature.effects_of_handler(st().checked.sigs, l.hdl).map(effect_key)
+    init_call = XCall(Direct(init, []), args.append([XVar(ev)]), True, False)
+    made = XCall(Direct(maker, []), [XVar(me), XVar(ev)], False, False)
+    provide = Ir.XProvide(Some(XVar(ev)), keys.map(|k| (k, XVar(h))))
+    (acc.append([(l, me, h, next, init_call, made, provide)]), next)
+  })
+  upd(|x| Lowering(ev: last_ev, ..x))
+  inner = lower_expr(body)
+  upd(|x| Lowering(ev: outer, ..x))
+  # Each handler is released, then retired, however the body ends; the last one first.
+  guarded = steps.reverse().fold(inner, |acc, (l, me, h, _, _, _, _)| {
+    has_release = program.items.get(l.hdl) match {
+      Some(Hir.IHandler(item)) -> item.release.is_some()
+      _                        -> False
+    }
+    release = if has_release {
+      XCall(Direct(instance_of(l.hdl, [], 3), []), [XVar(me), XVar(outer)], False, False)
+    } else {
+      XLit(VUnit)
+    }
+    Ir.XFinally(acc, release, XVar(h), def_of(program, l.hdl).name)
+  })
+  # The binding names hold the handler values.
+  bound = steps.reverse().fold(guarded, |acc, (l, _, h, _, _, _, _)| {
+    l.bind.map(|b| XLet(new_local(b), XVar(h), acc)).or(acc)
+  })
+  steps.reverse().fold(bound, |acc, (_, me, h, next, init_call, made, provide)| {
+    XLet(me, init_call, XLet(h, made, XLet(next, provide, acc)))
+  })
+}
+
+## The arguments of a handler's init written on an item, by parameter: by label, or in order.
+fn init_args(hdl: Int, written: List[Hir.Arg]) -> List[Expr] uses { State[Lowering] } {
+  program = st().program
+  names = program.items.get(hdl) match {
+    Some(Hir.IHandler(h)) -> h.init_params.map(
+      |p| program.locals.get(p.local).map(|d| d.name).or(""),
+    )
+    _ -> []
+  }
+  names.enumerate().map(|(i, n)| {
+    by_label = written.find(|a| a.label.map(|l| l.name == n).or(False))
+    found = by_label match {
+      Some(a) -> Some(a)
+      None    -> written.get(i)
+    }
+    found.map(|a| lower_expr(a.value)).or(XLit(VUnit))
+  })
+}
+
+## The arguments a layer writes for one of its handlers.
+fn layer_args(lay: Int, hdl: Int) -> List[Hir.Arg] uses { State[Lowering] } {
+  st().program.items.get(lay) match {
+    Some(Hir.ILayer(item)) -> item.members.find(|m| m.res == ResDef(hdl)).and_then(|m| m.args).map(
+      |a| a.args,
+    ).or([])
+    _ -> []
   }
 }

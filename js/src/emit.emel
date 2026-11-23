@@ -187,6 +187,8 @@ const RUNTIME: List[String] = [
   "$Fail",
   "$assertFail",
   "$assertCmp",
+  "$releaseDefect",
+  "$retire",
 ]
 
 ## The comparison of derived and built-in Ord impls: by `<` on primitive values, element by
@@ -281,7 +283,7 @@ fn unit_variants(id: Int, def: EnumDef) -> List[String] {
     []
   } else {
     def.variants.enumerate().filter_map(|(k, v)| {
-      if v.fields == FieldsUnit {
+      if v.tys.is_empty() {
         tag_js = if def.is_error { "$err$#{sanitize(def.name)}" } else { "#{k}" }
         Some("const #{sanitize(def.name)}$#{v.name} = Object.freeze({ $tag: #{tag_js} });")
       } else {
@@ -388,17 +390,27 @@ fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) 
 
 ## A function whose self calls in tail position become a loop: its index and the names of its
 ## parameters' variables.
+## `f` is the function's index, or for a local fn `-(local + 1)` of the local naming it.
 type Tail(f: Int, temps: List[String])
+
+## Whether calling `callee` calls the function `f` itself.
+fn is_self(callee: Ir.Callee, f: Int) -> Bool {
+  callee match {
+    Direct(g, _)      -> g == f
+    Indirect(XVar(l)) -> f == 0 - (l + 1)
+    _                 -> False
+  }
+}
 
 ## Whether `expr`, in tail position, calls the function `f` itself.
 fn self_tail(expr: Expr, f: Int) -> Bool {
   expr match {
-    XCall(Direct(g, _), _, _, _) -> g == f
-    XLet(_, _, body)             -> self_tail(body, f)
-    XSeq(_, rest)                -> self_tail(rest, f)
-    XIf(_, t, e)                 -> self_tail(t, f) || self_tail(e, f)
-    XMatch(_, arms)              -> arms.any(|arm| self_tail(arm.body, f))
-    _                            -> False
+    XCall(callee, _, _, _) -> is_self(callee, f)
+    XLet(_, _, body)       -> self_tail(body, f)
+    XSeq(_, rest)          -> self_tail(rest, f)
+    XIf(_, t, e)           -> self_tail(t, f) || self_tail(e, f)
+    XMatch(_, arms)        -> arms.any(|arm| self_tail(arm.body, f))
+    _                      -> False
   }
 }
 
@@ -514,7 +526,7 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
   module = mdl()
   expr match {
     XLet(bound, value, body) -> {
-      v = value_of(value)
+      v = bound_value(bound, value)
       line("const #{local_name(module, bound)} = #{v};")
       stmt(body, dest)
     }
@@ -535,6 +547,29 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
     XFail(e) -> {
       v = value_of(e)
       propagate("new $Fail(#{v})")
+    }
+    Ir.XFinally(body, cleanup, hv, name) -> {
+      h = value_of(hv)
+      thrown = tmp()
+      line("let #{thrown};")
+      line("try {")
+      indented(|| stmt(body, dest))
+      line("} catch ($e) {")
+      indented(|| {
+        line("#{thrown} = $e;")
+        line("throw $e;")
+      })
+      line("} finally {")
+      indented(|| {
+        line("try {")
+        indented(|| discard(cleanup))
+        line("} catch ($e) {")
+        indented(|| line("throw $releaseDefect(#{thrown}, $e, #{quote(name)});"))
+        line("} finally {")
+        indented(|| line("$retire(#{h}, #{quote(name)});"))
+        line("}")
+      })
+      line("}")
     }
     Ir.XAssertBool(cond, text) -> {
       c = value_of(cond)
@@ -567,7 +602,8 @@ fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
       line("}")
       deliver(dest, "undefined")
     }
-    XCall(Direct(g, _), args, _, _) if dest == DReturn && em().tail.map(|t| t.f == g).or(False) -> {
+    XCall(callee, args, _, _) if dest == DReturn
+      && em().tail.map(|t| is_self(callee, t.f)).or(False) -> {
       temps = em().tail.map(|t| t.temps).or([])
       vs = values_in_order(args)
       news = vs.map(|v| {
@@ -605,6 +641,7 @@ fn needs_statements(expr: Expr) -> Bool {
     XMatch(_, _)                    -> True
     XEscape(_, _)                   -> True
     XFail(_)                        -> True
+    Ir.XFinally(_, _, _, _)         -> True
     Ir.XAssertBool(_, _)            -> True
     Ir.XAssertCmp(_, _, _, _, _, _) -> True
     _                               -> False
@@ -734,28 +771,34 @@ fn escape_stmt(body: Expr, arms: List[Arm], dest: Dest) -> () uses { State[Em] }
 ## Whether `expr` can be emitted as an expression without statements before it.
 fn is_simple(expr: Expr) -> Bool {
   expr match {
-    XLit(_)                         -> True
-    XVar(_)                         -> True
-    XFn(_, _)                       -> True
-    XLambda(_, _, _, _)             -> True
-    XCall(_, _, True, _)            -> False
+    XLit(_)               -> True
+    XVar(_)               -> True
+    XFn(_, _)             -> True
+    XLambda(_, _, _, _)   -> True
+    XCall(_, _, True, _)  -> False
     XCall(Direct(_, _), args, _, _) -> args.all(is_simple)
-    XCall(Indirect(c), args, _, _)  -> is_simple(c) && args.all(is_simple)
-    XBuiltin(_, _, args)            -> args.all(is_simple)
-    XCtor(_, _, args)               -> args.all(is_simple)
-    XTuple(args)                    -> args.all(is_simple)
-    XField(base, _, _)              -> is_simple(base)
-    XList(_, elems, tail)           -> elems.all(is_simple) && tail.map(is_simple).or(True)
-    XBinary(_, _, a, b)             -> is_simple(a) && is_simple(b)
-    XUnary(_, _, a)                 -> is_simple(a)
-    XIf(c, t, e)                    -> is_simple(c) && is_simple(t) && is_simple(e)
+    XCall(Indirect(c), args, _, _) -> is_simple(c) && args.all(is_simple)
+    XBuiltin(_, _, args)  -> args.all(is_simple)
+    XCtor(_, _, args)     -> args.all(is_simple)
+    XTuple(args)          -> args.all(is_simple)
+    Ir.XUse(ev, _)        -> is_simple(ev)
+    Ir.XProvide(base, bindings) -> base.map(is_simple).or(True)
+      && bindings.all(|(_, h)| is_simple(h))
+    Ir.XHandler(ops)      -> ops.all(|(_, f)| is_simple(f))
+    Ir.XOp(_, _, _, True) -> False
+    Ir.XOp(t, _, args, _) -> is_simple(t) && args.all(is_simple)
+    XField(base, _, _)    -> is_simple(base)
+    XList(_, elems, tail) -> elems.all(is_simple) && tail.map(is_simple).or(True)
+    XBinary(_, _, a, b)   -> is_simple(a) && is_simple(b)
+    XUnary(_, _, a)       -> is_simple(a)
+    XIf(c, t, e)          -> is_simple(c) && is_simple(t) && is_simple(e)
     XConcat(parts) -> parts.all(|p| {
       p match {
         SLit(_)      -> True
         SValue(v, _) -> is_simple(v)
       }
     })
-    _                               -> False
+    _                     -> False
   }
 }
 
@@ -801,7 +844,7 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
     XVar(local)                     -> local_name(module, local)
     XFn(f, _)                       -> fn_name(module, f)
     XLet(bound, value, body) -> {
-      v = value_of(value)
+      v = bound_value(bound, value)
       line("const #{local_name(module, bound)} = #{v};")
       value_of(body)
     }
@@ -858,6 +901,28 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
       "#{b}.#{field_key(variant_fields(module, ctor), index)}"
     }
     XTuple(elems)                   -> "[#{String.join(values_in_order(elems), ", ")}]"
+    Ir.XUse(ev, key)                -> "#{value_of(ev)}[#{quote(key)}]"
+    Ir.XProvide(base, bindings) -> {
+      vs = values_in_order(base.map(|b| [b]).or([]).append(bindings.map(|(_, h)| h)))
+      (proto, hs) = base match {
+        Some(_) -> (vs.head().or("null"), vs.drop(1))
+        None    -> ("null", vs)
+      }
+      entries = bindings.zip(hs).map(|((k, _), h)| ", #{quote(k)}: #{h}")
+      "{ __proto__: #{proto}#{String.concat(entries)} }"
+    }
+    Ir.XHandler(ops) -> {
+      vs = values_in_order(ops.map(|(_, f)| f))
+      entries = ops.zip(vs).map(|((name, _), v)| "#{quote(name)}: #{v}")
+      "{ #{String.join(entries, ", ")} }"
+    }
+    Ir.XOp(target, name, args, fails) -> values_in_order([target, ..args]) match {
+      [h, ..rest] -> {
+        call = "#{h}[#{quote(name)}](#{String.join(rest, ", ")})"
+        if fails { checked(call) } else { call }
+      }
+      [] -> "undefined"
+    }
     XList(_, elems, tail) -> {
       vs = values_in_order(elems.append(tail.map(|t| [t]).or([])))
       tail match {
@@ -877,15 +942,7 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
     }
     XUnary(UNot, _, operand)        -> "(!#{value_of(operand)})"
     XUnary(UNeg, ty, operand)       -> wrap(ty, "(-#{value_of(operand)})")
-    XLambda(params, _, body, _) -> {
-      ps = String.join(params.map(|p| local_name(module, p)), ", ")
-      outer = em()
-      inner = body_lines(module, body, None).map(
-        |l| "#{String.concat(List.range(0, outer.indent).map(|_| "  "))}#{l}",
-      )
-      close = "#{String.concat(List.range(0, outer.indent).map(|_| "  "))}})"
-      "((#{ps}) => {\n#{String.join(inner, "\n")}\n#{close}"
-    }
+    XLambda(params, _, body, _)     -> lambda_js(params, body, None)
     XConcat(parts) -> {
       values = values_in_order(
         parts.filter_map(|p| {
@@ -913,6 +970,36 @@ fn value_of(expr: Expr) -> String uses { State[Em] } {
     }
     _                               -> via_tmp(expr)
   }
+}
+
+## The value bound to `bound`: a local fn whose self calls in tail position go round a loop.
+fn bound_value(bound: Int, value: Expr) -> String uses { State[Em] } {
+  value match {
+    XLambda(params, _, body, _) -> lambda_js(params, body, Some(0 - (bound + 1)))
+    _                           -> value_of(value)
+  }
+}
+
+## A closure. With `self` (the local fn's id in `Tail`), self tail calls become a loop.
+fn lambda_js(params: List[Int], body: Expr, me: Option[Int]) -> String uses { State[Em] } {
+  module = mdl()
+  pad = String.concat(List.range(0, em().indent).map(|_| "  "))
+  looped = me.and_then(|f| if self_tail(body, f) { Some(f) } else { None })
+  (ps, inner) = looped match {
+    Some(f) -> {
+      temps = params.enumerate().map(|(i, _)| "$p#{i}")
+      binds = params.zip(temps).map(|(p, t)| "    const #{local_name(module, p)} = #{t};")
+      lines = ["  $L: for (;;) {"].append(binds).append(
+        body_lines(module, body, Some(Tail(f, temps))).map(|l| "  #{l}"),
+      ).append(["  }"])
+      (String.join(temps, ", "), lines)
+    }
+    None -> (
+      String.join(params.map(|p| local_name(module, p)), ", "),
+      body_lines(module, body, None),
+    )
+  }
+  "((#{ps}) => {\n#{String.join(inner.map(|l| "#{pad}#{l}"), "\n")}\n#{pad}})"
 }
 
 ## `a && b` and `a || b`. When the right side needs statements, it is evaluated only if the left

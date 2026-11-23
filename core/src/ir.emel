@@ -194,6 +194,18 @@ pub enum Expr {
   XAssertBool(cond: Expr, text: String)
   ## `assert lhs op rhs` on values of type `ty`, which shows both sides if false.
   XAssertCmp(op: BinOp, op_ty: OpTy, ty: Type, lhs: Expr, rhs: Expr, text: String)
+  ## The handler of the effect `key` in the evidence table `ev` (`use E`).
+  XUse(ev: Expr, key: String)
+  ## An evidence table: `base` (or none) with the effects of `bindings` provided by the handlers.
+  XProvide(base: Option[Expr], bindings: List[(String, Expr)])
+  ## A handler value: its operations by name.
+  XHandler(ops: List[(String, Expr)])
+  ## A call of the operation `name` of the handler value `handler`.
+  XOp(target: Expr, name: String, args: List[Expr], fails: Bool)
+  ## `body`, then `cleanup` however `body` ends: the release of the handler value `retired` (named
+  ## `name`) of a `with`, which is retired afterwards. A defect of the release notes a defect of
+  ## the body.
+  XFinally(body: Expr, cleanup: Expr, retired: Expr, name: String)
 }
 
 pub enum Callee {
