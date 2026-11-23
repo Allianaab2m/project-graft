@@ -43,7 +43,7 @@ The corpus is every `.emel` file in the `emela-lang/emela` repository at the rel
 
 ```console
 $ emela test                                  # unit and property tests (Brix)
-$ scripts/roundtrip.sh ../../emela-lang/emela # M1 on the corpus, on js and native
+$ scripts/roundtrip.sh <emela-lang/emela checkout> # M1 on the corpus, on js and native
 ```
 
 ## Status

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read the emela version from Pome.toml
+        run: echo "emela=$(sed -n 's/^emela = "\(.*\)"$/\1/p' Pome.toml)" >> "$GITHUB_OUTPUT"
+      - uses: emela-lang/setup-emela@v1
+        with:
+          version: ${{ steps.version.outputs.emela }}
+      # The js target runs on node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # The wasm target runs the WASI 0.3 component with wasmtime 49 or newer.
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+        with:
+          version: 49.0.3
+      - name: Install
+        run: emela pome install
+      - name: Format
+        run: emela fmt --check
+      - name: Check
+        run: emela check
+      - name: Test on js, native and wasm
+        run: |
+          for target in js native wasm; do
+            out="$(emela test --target "$target")"
+            echo "$out"
+            # A compiler that does not read `test/` would pass with no tests.
+            if echo "$out" | grep -q '^running 0 tests'; then
+              echo "::error::no tests ran on $target"
+              exit 1
+            fi
+          done
+
+  # M1: every .emel of emela-lang/emela, at the tag of the release Graft is built with, lexes into
+  # tokens that concatenate back to the file.
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read the emela version from Pome.toml
+        run: echo "emela=$(sed -n 's/^emela = "\(.*\)"$/\1/p' Pome.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: emela-lang/emela
+          ref: v${{ steps.version.outputs.emela }}
+          path: corpus/emela
+      - uses: emela-lang/setup-emela@v1
+        with:
+          version: ${{ steps.version.outputs.emela }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install
+        run: emela pome install
+      - name: Round-trip the corpus
+        run: scripts/roundtrip.sh corpus/emela
