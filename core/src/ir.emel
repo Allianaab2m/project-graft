@@ -81,6 +81,9 @@ pub type EnumDef(
   is_error: Bool,
   ## An `@external type`: an opaque host value without constructors.
   is_external: Bool,
+  ## For an error: shown by its structure when it reaches the entry (it derives Show), or else
+  ## by its name.
+  show_structure: Bool,
 )
 
 pub type VariantDef(name: String, fields: VariantFields, tys: List[Type])

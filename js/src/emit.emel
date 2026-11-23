@@ -16,6 +16,7 @@
 ##
 ## The output is an ES module that exports `main` for the launcher.
 import Std.Map.{Map}
+import Std.State.{State}
 import Core.Ir
 import Core.Ir.{
   Module,
@@ -66,6 +67,8 @@ import Core.Ir.{
   XLambda,
   XConcat,
   XSeq,
+  XFail,
+  XEscape,
   Direct,
   Indirect,
   Arm,
@@ -181,12 +184,25 @@ const RUNTIME: List[String] = [
   "$arrayConcat",
   "$foreign",
   "$constant",
+  "$Fail",
 ]
 
 ## The JS module of `module`.
 pub fn emit(module: Module) -> String {
   imports = "import { #{String.join(RUNTIME, ", ")} } from \"./emela_runtime.mjs\";"
-  units = module.enums.fold([], |acc, id, def| acc.append(unit_variants(id, def)))
+  descriptors = module.enums.fold([], |acc, id, def| {
+    if def.is_error {
+      name = sanitize(def.name)
+      variant = def.variants.head().map(|v| v.name).or(def.name)
+      show = if def.show_structure { "(v) => $show$#{name}(v)" } else { "() => #{quote(variant)}" }
+      acc.append(["const $err$#{name} = Object.freeze({ show: #{show} });"])
+    } else {
+      acc
+    }
+  })
+  units = descriptors.append(
+    module.enums.fold([], |acc, id, def| acc.append(unit_variants(id, def))),
+  )
   shows = module.enums.fold([], |acc, id, def| acc.append(show_enum_fn(module, id, def)))
   hosts = host_imports(module)
   host_lines = hosts.enumerate().map(|(i, (path, name))| {
@@ -227,7 +243,8 @@ fn unit_variants(id: Int, def: EnumDef) -> List[String] {
   } else {
     def.variants.enumerate().filter_map(|(k, v)| {
       if v.fields == FieldsUnit {
-        Some("const #{sanitize(def.name)}$#{v.name} = Object.freeze({ $tag: #{k} });")
+        tag_js = if def.is_error { "$err$#{sanitize(def.name)}" } else { "#{k}" }
+        Some("const #{sanitize(def.name)}$#{v.name} = Object.freeze({ $tag: #{tag_js} });")
       } else {
         None
       }
@@ -286,7 +303,7 @@ fn host_path(host: Ir.HostModule) -> String {
 
 fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) -> List[String] {
   params = String.join(f.params.map(|p| local_name(module, p)), ", ")
-  body = f.external match {
+  f.external match {
     Some(_) -> {
       target = js_binding(f) match {
         Some(Ir.HostGlobal(name)) -> name
@@ -314,25 +331,20 @@ fn emit_fn(module: Module, hosts: List[(String, String)], id: Int, f: Function) 
       "}",
       "",
       "function #{f.name}$init() {",
-    ].append(returning(module, f.body, "  ")).append(["}"])
+    ].append(body_lines(module, f.body, None)).append(["}"])
     None -> if self_tail(f.body, id) {
       # Self tail calls go round a loop: the parameters are `$p0`, `$p1`, ..., bound afresh to
       # the parameters' locals on each round, so closures keep the values of their round.
       temps = f.params.enumerate().map(|(i, _)| "$p#{i}")
       binds = f.params.zip(temps).map(|(p, t)| "    const #{local_name(module, p)} = #{t};")
-      tail = Some(Tail(id, temps))
-      looped = ["  $L: for (;;) {"].append(binds).append(
-        returning_in(module, f.body, "    ", tail),
-      ).append(["  }"])
-      return_lines = ["function #{f.name}(#{String.join(temps, ", ")}) {"].append(looped).append(
-        ["}"],
-      )
-      return_lines
+      body = body_lines(module, f.body, Some(Tail(id, temps))).map(|l| "  #{l}")
+      ["function #{f.name}(#{String.join(temps, ", ")}) {", "  $L: for (;;) {"].append(
+        binds,
+      ).append(body).append(["  }", "}"])
     } else {
-      ["function #{f.name}(#{params}) {"].append(returning(module, f.body, "  ")).append(["}"])
+      ["function #{f.name}(#{params}) {"].append(body_lines(module, f.body, None)).append(["}"])
     }
   }
-  body
 }
 
 ## A function whose self calls in tail position become a loop: its index and the names of its
@@ -360,62 +372,495 @@ fn fn_name(module: Module, f: Int) -> String {
   module.functions.get(f).map(|x| sanitize(x.name)).or("$missing")
 }
 
-## The statements that compute `expr` and return it.
-fn returning(module: Module, expr: Expr, indent: String) -> List[String] {
-  returning_in(module, expr, indent, None)
-}
+# ---------------------------------------------------------------------------------------------
+# Statements and values
+#
+# Expressions are emitted in two ways, as in the reference: `value` returns a JS expression and
+# may emit statements before it; `stmt` emits statements that pass the value to a destination.
+# Expressions that need statements are assigned to a temporary. Emitting statements first would
+# move the evaluation of the arguments to their left after them, so those are bound to
+# temporaries first (`values_in_order`).
 
-## Inside a looped function (`tail`), a self call in tail position sets the parameters and goes
-## round again. The arguments are computed before any parameter changes.
-fn returning_in(module: Module, expr: Expr, indent: String, tail: Option[Tail]) -> List[String] {
-  r = |x: Expr, i: String| returning_in(module, x, i, tail)
-  expr match {
-    XLet(bound, value, body) -> [
-      "#{indent}const #{local_name(module, bound)} = #{emit_expr(module, value)};",
-    ].append(r(body, indent))
-    XSeq(first, rest) -> statement(module, first, indent).append(r(rest, indent))
-    XIf(c, t, e) -> ["#{indent}if (#{emit_expr(module, c)}) {"].append(r(t, "#{indent}  ")).append(
-      ["#{indent}} else {"],
-    ).append(r(e, "#{indent}  ")).append(["#{indent}}"])
-    XMatch(scrutinee, arms) -> {
-      s = "$s#{indent.code_points().length()}"
-      ["#{indent}const #{s} = #{emit_expr(module, scrutinee)};"].append(
-        arms.flat_map(|arm| emit_arm(module, arm, s, indent, tail)),
-      ).append(["#{indent}return $unreachable();"])
-    }
-    XCall(Direct(g, _), args, _, _) if tail.map(|t| t.f == g).or(False) -> {
-      temps = tail.map(|t| t.temps).or([])
-      values = args.enumerate().map(|(i, a)| "#{indent}const $n#{i} = #{emit_expr(module, a)};")
-      sets = temps.enumerate().map(|(i, t)| "#{indent}#{t} = $n#{i};")
-      ["#{indent}{"].append(values.map(|v| "  #{v}")).append(sets.map(|v| "  #{v}")).append(
-        ["#{indent}  continue $L;", "#{indent}}"],
-      )
-    }
-    _ -> ["#{indent}return #{emit_expr(module, expr)};"]
-  }
-}
+## Where `stmt` puts a value.
+enum Dest {
+  DReturn
+  DAssign(name: String)
+} derive Eq
 
-## An arm: if the pattern matches (and the guard holds), bind and return the body.
-fn emit_arm(
+## The state of emitting one function body.
+type Em(
   module: Module,
-  arm: Arm,
-  s: String,
-  indent: String,
+  ## Newest first, with their indentation.
+  lines: List[String],
+  indent: Int,
+  next_tmp: Int,
+  ## Failure targets, innermost first: the label of the escape's block and the cell for the
+  ## failure. None means the caller (`return`).
+  fail_targets: List[(String, String)],
   tail: Option[Tail],
-) -> List[String] {
-  tests = pat_tests(module, arm.pat, s)
-  inner = "#{indent}  "
-  binds = pat_binds(module, arm.pat, s).map(
-    |(l, v)| "#{inner}const #{local_name(module, l)} = #{v};",
+)
+
+fn em() -> Em uses { State[Em] } {
+  (use State[Em]).get()
+}
+
+fn emu(f: fn(Em) -> Em) -> () uses { State[Em] } {
+  s = use State[Em]
+  s.set(f(s.get()))
+}
+
+fn line(text: String) -> () uses { State[Em] } {
+  emu(
+    |e| Em(
+      lines: ["#{String.concat(List.range(0, e.indent).map(|_| "  "))}#{text}", ..e.lines],
+      ..e,
+    ),
   )
-  body = arm.guard match {
-    Some(g) -> ["#{inner}if (#{emit_expr(module, g)}) {"].append(
-      returning_in(module, arm.body, "#{inner}  ", tail),
-    ).append(["#{inner}}"])
-    None -> returning_in(module, arm.body, inner, tail)
+}
+
+fn indented(f: fn() -> () uses { State[Em] }) -> () uses { State[Em] } {
+  emu(|e| Em(indent: e.indent + 1, ..e))
+  f()
+  emu(|e| Em(indent: e.indent - 1, ..e))
+}
+
+fn tmp() -> String uses { State[Em] } {
+  n = em().next_tmp
+  emu(|e| Em(next_tmp: n + 1, ..e))
+  "$t#{n}"
+}
+
+fn mdl() -> Module uses { State[Em] } {
+  em().module
+}
+
+## The lines of a function body that returns `expr`, indented by one.
+fn body_lines(module: Module, expr: Expr, tail: Option[Tail]) -> List[String] {
+  (_, done) = State.run(Em(module, [], 1, 0, [], tail), || stmt(expr, DReturn))
+  done.lines.reverse()
+}
+
+## Passes the failure `v` to the innermost escape, or returns it to the caller.
+fn propagate(v: String) -> () uses { State[Em] } {
+  em().fail_targets match {
+    [(label, cell), ..] -> line("{ #{cell} = #{v}; break #{label}; }")
+    []                  -> line("return #{v};")
   }
-  cond = if tests.is_empty() { "true" } else { String.join(tests, " && ") }
-  ["#{indent}if (#{cond}) {"].append(binds).append(body).append(["#{indent}}"])
+}
+
+## Binds the result of a fallible call to a temporary and passes a failure on.
+fn checked(call: String) -> String uses { State[Em] } {
+  t = tmp()
+  line("const #{t} = #{call};")
+  line("if (#{t} instanceof $Fail) #{propagate_text(t)}")
+  t
+}
+
+fn propagate_text(v: String) -> String uses { State[Em] } {
+  em().fail_targets match {
+    [(label, cell), ..] -> "{ #{cell} = #{v}; break #{label}; }"
+    []                  -> "return #{v};"
+  }
+}
+
+fn deliver(dest: Dest, v: String) -> () uses { State[Em] } {
+  dest match {
+    DReturn    -> line("return #{v};")
+    DAssign(t) -> line("#{t} = #{v};")
+  }
+}
+
+## Statements that pass the value of `expr` to `dest`.
+fn stmt(expr: Expr, dest: Dest) -> () uses { State[Em] } {
+  module = mdl()
+  expr match {
+    XLet(bound, value, body) -> {
+      v = value_of(value)
+      line("const #{local_name(module, bound)} = #{v};")
+      stmt(body, dest)
+    }
+    XSeq(first, rest) -> {
+      discard(first)
+      stmt(rest, dest)
+    }
+    XIf(c, t, e) -> {
+      cv = value_of(c)
+      line("if (#{cv}) {")
+      indented(|| stmt(t, dest))
+      line("} else {")
+      indented(|| stmt(e, dest))
+      line("}")
+    }
+    XMatch(scrutinee, arms) -> match_stmt(scrutinee, arms, dest)
+    XEscape(body, arms)     -> escape_stmt(body, arms, dest)
+    XFail(e) -> {
+      v = value_of(e)
+      propagate("new $Fail(#{v})")
+    }
+    XCall(Direct(g, _), args, _, _) if dest == DReturn && em().tail.map(|t| t.f == g).or(False) -> {
+      temps = em().tail.map(|t| t.temps).or([])
+      vs = values_in_order(args)
+      news = vs.map(|v| {
+        n = tmp()
+        line("const #{n} = #{v};")
+        n
+      })
+      temps.zip(news).each(|(t, n)| line("#{t} = #{n};"))
+      line("continue $L;")
+    }
+    _                       -> deliver(dest, value_of(expr))
+  }
+}
+
+## Evaluates `expr` for its effects.
+fn discard(expr: Expr) -> () uses { State[Em] } {
+  expr match {
+    XLit(_)   -> ()
+    XVar(_)   -> ()
+    XFn(_, _) -> ()
+    _ if !is_simple(expr) && needs_statements(expr) -> {
+      t = tmp()
+      line("let #{t};")
+      stmt(expr, DAssign(t))
+    }
+    _         -> line("#{value_of(expr)};")
+  }
+}
+
+fn needs_statements(expr: Expr) -> Bool {
+  expr match {
+    XLet(_, _, _) -> True
+    XSeq(_, _)    -> True
+    XIf(_, _, _)  -> True
+    XMatch(_, _)  -> True
+    XEscape(_, _) -> True
+    XFail(_)      -> True
+    _             -> False
+  }
+}
+
+## A match: the arms in order; the first whose pattern matches (and guard holds) gives the value.
+fn match_stmt(scrutinee: Expr, arms: List[Arm], dest: Dest) -> () uses { State[Em] } {
+  module = mdl()
+  sv = value_of(scrutinee)
+  s = tmp()
+  line("const #{s} = #{sv};")
+  done = "#{s}$done"
+  line("#{done}: {")
+  indented(|| {
+    arms.each(|arm| {
+      tests = pat_tests(module, arm.pat, s)
+      cond = if tests.is_empty() { "true" } else { String.join(tests, " && ") }
+      line("if (#{cond}) {")
+      indented(|| {
+        pat_binds(module, arm.pat, s).each(|(l, v)| line("const #{local_name(module, l)} = #{v};"))
+        arm.guard match {
+          Some(g) -> {
+            gv = value_of(g)
+            line("if (#{gv}) {")
+            indented(|| {
+              stmt(arm.body, dest)
+              line("break #{done};")
+            })
+            line("}")
+          }
+          None -> {
+            stmt(arm.body, dest)
+            line("break #{done};")
+          }
+        }
+      })
+      line("}")
+    })
+    line("$unreachable();")
+  })
+  line("}")
+}
+
+## `body escape { arms }`: two nested labeled blocks. A failure in the body is stored in a cell and
+## breaks out of the inner block; the arms look at its error, and one no arm catches propagates.
+fn escape_stmt(body: Expr, arms: List[Arm], dest: Dest) -> () uses { State[Em] } {
+  module = mdl()
+  result = dest match {
+    DAssign(t) -> t
+    DReturn -> {
+      t = tmp()
+      line("let #{t};")
+      t
+    }
+  }
+  cell = tmp()
+  line("let #{cell};")
+  done = "#{cell}$x"
+  caught = "#{cell}$e"
+  line("#{done}: {")
+  indented(|| {
+    line("#{caught}: {")
+    indented(|| {
+      outer = em().fail_targets
+      emu(|e| Em(fail_targets: [(caught, cell), ..outer], ..e))
+      stmt(body, DAssign(result))
+      emu(|e| Em(fail_targets: outer, ..e))
+      line("break #{done};")
+    })
+    line("}")
+    err_v = tmp()
+    line("const #{err_v} = #{cell}.error;")
+    wildcard = arms.fold(False, |stopped, arm| {
+      if stopped {
+        stopped
+      } else {
+        arm.pat match {
+          QWild if arm.guard.is_none() -> {
+            stmt(arm.body, DAssign(result))
+            line("break #{done};")
+            True
+          }
+          QCtor(ctor, _) -> {
+            tests = ["#{err_v}.$tag === #{error_descriptor(module, ctor.enum_id)}"].append(
+              pat_tests(module, arm.pat, err_v),
+            )
+            line("if (#{String.join(tests, " && ")}) {")
+            indented(|| {
+              pat_binds(module, arm.pat, err_v).each(|(l, v)| {
+                line("const #{local_name(module, l)} = #{v};")
+              })
+              arm.guard match {
+                Some(g) -> {
+                  gv = value_of(g)
+                  line("if (#{gv}) {")
+                  indented(|| {
+                    stmt(arm.body, DAssign(result))
+                    line("break #{done};")
+                  })
+                  line("}")
+                }
+                None -> {
+                  stmt(arm.body, DAssign(result))
+                  line("break #{done};")
+                }
+              }
+            })
+            line("}")
+            False
+          }
+          _ -> False
+        }
+      }
+    })
+    # A failure no arm caught propagates outward.
+    if !wildcard {
+      propagate(cell)
+    }
+  })
+  line("}")
+  if dest == DReturn {
+    line("return #{result};")
+  }
+}
+
+## Whether `expr` can be emitted as an expression without statements before it.
+fn is_simple(expr: Expr) -> Bool {
+  expr match {
+    XLit(_)                         -> True
+    XVar(_)                         -> True
+    XFn(_, _)                       -> True
+    XLambda(_, _, _, _)             -> True
+    XCall(_, _, True, _)            -> False
+    XCall(Direct(_, _), args, _, _) -> args.all(is_simple)
+    XCall(Indirect(c), args, _, _)  -> is_simple(c) && args.all(is_simple)
+    XBuiltin(_, _, args)            -> args.all(is_simple)
+    XCtor(_, _, args)               -> args.all(is_simple)
+    XTuple(args)                    -> args.all(is_simple)
+    XField(base, _, _)              -> is_simple(base)
+    XList(_, elems, tail)           -> elems.all(is_simple) && tail.map(is_simple).or(True)
+    XBinary(_, _, a, b)             -> is_simple(a) && is_simple(b)
+    XUnary(_, _, a)                 -> is_simple(a)
+    XIf(c, t, e)                    -> is_simple(c) && is_simple(t) && is_simple(e)
+    XConcat(parts) -> parts.all(|p| {
+      p match {
+        SLit(_)      -> True
+        SValue(v, _) -> is_simple(v)
+      }
+    })
+    _                               -> False
+  }
+}
+
+fn is_atom(expr: Expr) -> Bool {
+  expr match {
+    XLit(_)             -> True
+    XVar(_)             -> True
+    XFn(_, _)           -> True
+    XLambda(_, _, _, _) -> True
+    _                   -> False
+  }
+}
+
+## The values of `exprs` evaluated left to right: those before the last one that needs statements
+## are bound to temporaries.
+fn values_in_order(exprs: List[Expr]) -> List[String] uses { State[Em] } {
+  last_complex = exprs.enumerate().fold(-1, |acc, (i, x)| if is_simple(x) { acc } else { i })
+  exprs.enumerate().map(|(i, x)| {
+    v = value_of(x)
+    if i < last_complex && !is_atom(x) {
+      t = tmp()
+      line("const #{t} = #{v};")
+      t
+    } else {
+      v
+    }
+  })
+}
+
+## Binds an expression that needs statements to a temporary and returns its name.
+fn via_tmp(expr: Expr) -> String uses { State[Em] } {
+  t = tmp()
+  line("let #{t};")
+  stmt(expr, DAssign(t))
+  t
+}
+
+## `expr` as a JS expression, after the statements it needs.
+fn value_of(expr: Expr) -> String uses { State[Em] } {
+  module = mdl()
+  expr match {
+    XLit(lit)                       -> emit_lit(lit)
+    XVar(local)                     -> local_name(module, local)
+    XFn(f, _)                       -> fn_name(module, f)
+    XLet(bound, value, body) -> {
+      v = value_of(value)
+      line("const #{local_name(module, bound)} = #{v};")
+      value_of(body)
+    }
+    XSeq(first, rest) -> {
+      discard(first)
+      value_of(rest)
+    }
+    XCall(callee, args, fails, _) -> {
+      (head, vs) = callee match {
+        Direct(f, _) -> (fn_name(module, f), values_in_order(args))
+        Indirect(c) -> values_in_order([c, ..args]) match {
+          [cv, ..rest] -> ("(#{cv})", rest)
+          []           -> ("undefined", [])
+        }
+      }
+      call = "#{head}(#{String.join(vs, ", ")})"
+      if fails { checked(call) } else { call }
+    }
+    XBuiltin("$showNested", targs, args) -> {
+      vs = values_in_order(args)
+      show_call(module, targs.head().or(CUnit), String.join(vs, ", "))
+    }
+    XBuiltin(name, targs, args) -> {
+      vs = values_in_order(args)
+      shown = if name == "$dbg" || name == "$inspect" {
+        [show_fn(module, targs.head().or(CUnit))]
+      } else {
+        []
+      }
+      "#{name}(#{String.join(vs.append(shown), ", ")})"
+    }
+    XCtor(ctor, _, args) -> {
+      vs = values_in_order(args)
+      if vs.is_empty() {
+        unit_value(module, ctor)
+      } else {
+        fields = variant_fields(module, ctor)
+        parts = vs.enumerate().map(|(i, v)| "#{field_key(fields, i)}: #{v}")
+        "{ $tag: #{tag(module, ctor)}, #{String.join(parts, ", ")} }"
+      }
+    }
+    XField(base, ctor, index) -> {
+      b = value_of(base)
+      "#{b}.#{field_key(variant_fields(module, ctor), index)}"
+    }
+    XTuple(elems)                   -> "[#{String.join(values_in_order(elems), ", ")}]"
+    XList(_, elems, tail) -> {
+      vs = values_in_order(elems.append(tail.map(|t| [t]).or([])))
+      tail match {
+        Some(_) -> {
+          n = vs.length() - 1
+          "$list([#{String.join(vs.take(n), ", ")}], #{vs.get(n).or("null")})"
+        }
+        None -> if vs.is_empty() { "null" } else { "$list([#{String.join(vs, ", ")}])" }
+      }
+    }
+    XIf(c, t, e) if is_simple(expr) -> "(#{value_of(c)} ? #{value_of(t)} : #{value_of(e)})"
+    XBinary(BAnd, _, lhs, rhs)      -> logical(True, lhs, rhs)
+    XBinary(BOr, _, lhs, rhs)       -> logical(False, lhs, rhs)
+    XBinary(op, ty, lhs, rhs) -> values_in_order([lhs, rhs]) match {
+      [a, b] -> binary(op, ty, a, b)
+      _      -> "undefined"
+    }
+    XUnary(UNot, _, operand)        -> "(!#{value_of(operand)})"
+    XUnary(UNeg, ty, operand)       -> wrap(ty, "(-#{value_of(operand)})")
+    XLambda(params, _, body, _) -> {
+      ps = String.join(params.map(|p| local_name(module, p)), ", ")
+      outer = em()
+      inner = body_lines(module, body, None).map(
+        |l| "#{String.concat(List.range(0, outer.indent).map(|_| "  "))}#{l}",
+      )
+      close = "#{String.concat(List.range(0, outer.indent).map(|_| "  "))}})"
+      "((#{ps}) => {\n#{String.join(inner, "\n")}\n#{close}"
+    }
+    XConcat(parts) -> {
+      values = values_in_order(
+        parts.filter_map(|p| {
+          p match {
+            SValue(v, _) -> Some(v)
+            _            -> None
+          }
+        }),
+      )
+      (pieces, _) = parts.fold(([], values), |(acc, vs), p| {
+        p match {
+          SLit(text) -> (acc.append([escape_template(text)]), vs)
+          SValue(_, ty) -> {
+            v = vs.head().or("undefined")
+            shown = ty match {
+              CString -> v
+              CInt    -> v
+              _       -> show_call(module, ty, v)
+            }
+            (acc.append(["${#{shown}}"]), vs.drop(1))
+          }
+        }
+      })
+      "`#{String.concat(pieces)}`"
+    }
+    _                               -> via_tmp(expr)
+  }
+}
+
+## `a && b` and `a || b`. When the right side needs statements, it is evaluated only if the left
+## side does not decide.
+fn logical(is_and: Bool, lhs: Expr, rhs: Expr) -> String uses { State[Em] } {
+  js_op = if is_and { "&&" } else { "||" }
+  a = value_of(lhs)
+  if is_simple(rhs) {
+    "(#{a} #{js_op} #{value_of(rhs)})"
+  } else {
+    t = tmp()
+    line("let #{t} = #{a};")
+    line(if is_and { "if (#{t}) {" } else { "if (!#{t}) {" })
+    indented(|| stmt(rhs, DAssign(t)))
+    line("}")
+    t
+  }
+}
+
+## The `$tag` of a value: the descriptor for an error, the variant index otherwise.
+fn tag(module: Module, ctor: CtorRef) -> String {
+  if module.enums.get(ctor.enum_id).map(|d| d.is_error).or(False) {
+    error_descriptor(module, ctor.enum_id)
+  } else {
+    "#{ctor.variant}"
+  }
+}
+
+fn error_descriptor(module: Module, id: Int) -> String {
+  "$err$#{enum_name(module, id)}"
 }
 
 ## The conditions under which the value `v` matches the pattern.
@@ -426,24 +871,22 @@ fn pat_tests(module: Module, pat: Pat, v: String) -> List[String] {
     QLit(lit)     -> ["#{v} === #{emit_lit(lit)}"]
     QCtor(ctor, args) -> {
       count = module.enums.get(ctor.enum_id).map(|d| d.variants.length()).or(1)
-      tag = if count > 1 { ["#{v}.$tag === #{ctor.variant}"] } else { [] }
+      test = if count > 1 { ["#{v}.$tag === #{ctor.variant}"] } else { [] }
       fields = variant_fields(module, ctor)
-      tag.append(
+      test.append(
         args.enumerate().flat_map(|(i, p)| pat_tests(module, p, "#{v}.#{field_key(fields, i)}")),
       )
     }
     QTuple(elems) -> elems.enumerate().flat_map(|(i, p)| pat_tests(module, p, "#{v}[#{i}]"))
     QList(elems, rest) -> {
       n = elems.length()
-      cells = List.range(0, n).map(|i| "#{v}#{String.concat(List.range(0, i).map(|_| ".t"))}")
-      not_null = cells.map(|c| "#{c} !== null")
+      at = |i: Int| "#{v}#{String.concat(List.range(0, i).map(|_| ".t"))}"
+      not_null = List.range(0, n).map(|i| "#{at(i)} !== null")
       end = rest match {
         Some(_) -> []
-        None    -> ["#{v}#{String.concat(List.range(0, n).map(|_| ".t"))} === null"]
+        None    -> ["#{at(n)} === null"]
       }
-      heads = elems.enumerate().flat_map(|(i, p)| {
-        pat_tests(module, p, "#{cells.get(i).or(v)}.h")
-      })
+      heads = elems.enumerate().flat_map(|(i, p)| pat_tests(module, p, "#{at(i)}.h"))
       not_null.append(end).append(heads)
     }
   }
@@ -465,77 +908,6 @@ fn pat_binds(module: Module, pat: Pat, v: String) -> List[(Int, String)] {
       heads.append(rest.map(|r| pat_binds(module, r, at(n))).or([]))
     }
     _             -> []
-  }
-}
-
-## The statements that evaluate `expr` for its effects.
-fn statement(module: Module, expr: Expr, indent: String) -> List[String] {
-  expr match {
-    XLit(_) -> []
-    XVar(_) -> []
-    _       -> ["#{indent}#{emit_expr(module, expr)};"]
-  }
-}
-
-## `expr` as a JS expression.
-fn emit_expr(module: Module, expr: Expr) -> String {
-  e = |x: Expr| emit_expr(module, x)
-  args = |xs: List[Expr]| String.join(xs.map(e), ", ")
-  expr match {
-    XLit(lit)                     -> emit_lit(lit)
-    XVar(local)                   -> local_name(module, local)
-    XFn(f, _)                     -> fn_name(module, f)
-    XCall(Direct(f, _), xs, _, _) -> "#{fn_name(module, f)}(#{args(xs)})"
-    XCall(Indirect(value), xs, _, _) -> "(#{e(value)})(#{args(xs)})"
-    XBuiltin("$showNested", targs, xs) -> show_call(module, targs.head().or(CUnit), args(xs))
-    XBuiltin(name, targs, xs) -> {
-      shown = if name == "$dbg" || name == "$inspect" {
-        [show_fn(module, targs.head().or(CUnit))]
-      } else {
-        []
-      }
-      "#{name}(#{String.join(xs.map(e).append(shown), ", ")})"
-    }
-    XCtor(ctor, _, xs) -> if xs.is_empty() {
-      unit_value(module, ctor)
-    } else {
-      fields = variant_fields(module, ctor)
-      parts = xs.enumerate().map(|(i, x)| "#{field_key(fields, i)}: #{e(x)}")
-      "{ $tag: #{ctor.variant}, #{String.join(parts, ", ")} }"
-    }
-    XField(base, ctor, index)     -> "#{e(base)}.#{field_key(variant_fields(module, ctor), index)}"
-    XTuple(elems)                 -> "[#{args(elems)}]"
-    XList(_, elems, tail) -> tail match {
-      Some(t) -> "$list([#{args(elems)}], #{e(t)})"
-      None    -> if elems.is_empty() { "null" } else { "$list([#{args(elems)}])" }
-    }
-    XIf(c, t, f)                  -> "(#{e(c)} ? #{e(t)} : #{e(f)})"
-    XBinary(op, ty, lhs, rhs)     -> binary(op, ty, e(lhs), e(rhs))
-    XUnary(UNot, _, operand)      -> "(!#{e(operand)})"
-    XUnary(UNeg, ty, operand)     -> wrap(ty, "(-#{e(operand)})")
-    XLambda(params, _, body, _) -> {
-      ps = String.join(params.map(|p| local_name(module, p)), ", ")
-      lines = String.join(returning(module, body, "  "), "\n")
-      "((#{ps}) => {\n#{lines}\n})"
-    }
-    XConcat(parts) -> {
-      inner = String.concat(
-        parts.map(|p| {
-          p match {
-            SLit(text)         -> escape_template(text)
-            SValue(v, CString) -> "${#{e(v)}}"
-            SValue(v, CInt)    -> "${#{e(v)}}"
-            SValue(v, ty)      -> "${#{show_call(module, ty, e(v))}}"
-          }
-        }),
-      )
-      "`#{inner}`"
-    }
-    # Bindings, sequences and matches inside an expression become a function called at once.
-    _ -> {
-      body = String.join(returning(module, expr, "  "), "\n")
-      "(() => {\n#{body}\n})()"
-    }
   }
 }
 
@@ -588,12 +960,18 @@ fn show_enum_fn(module: Module, id: Int, def: EnumDef) -> List[String] {
       "#{if i == 0 { "(" } else { ", " }}#{escape_template(label)}${#{show_call(module, t, access)}}"
     })
     close = if variant.tys.is_empty() { "" } else { ")" }
-    "case #{k}: return `#{escape_template(variant.name)}#{String.concat(pieces)}#{close}`;"
+    (k, "return `#{escape_template(variant.name)}#{String.concat(pieces)}#{close}`;")
   })
-  [
-    "function $show$#{enum_name(module, id)}(#{String.join(params, ", ")}) {",
-    "  switch (v.$tag) {",
-  ].append(cases.map(|c| "    #{c}")).append(["  }", "  return $unreachable();", "}", ""])
+  head = "function $show$#{enum_name(module, id)}(#{String.join(params, ", ")}) {"
+  # With one constructor (an error's `$tag` is its descriptor) there is nothing to switch on.
+  body = if cases.length() == 1 {
+    cases.map(|(_, c)| "  #{c}")
+  } else {
+    ["  switch (v.$tag) {"].append(cases.map(|(k, c)| "    case #{k}: #{c}")).append(
+      ["  }", "  return $unreachable();"],
+    )
+  }
+  [head].append(body).append(["}", ""])
 }
 
 # ---------------------------------------------------------------------------------------------

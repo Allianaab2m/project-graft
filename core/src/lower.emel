@@ -151,6 +151,7 @@ import Ir.{
   XLambda,
   XConcat,
   XSeq,
+  XFail,
   Direct,
   Indirect,
   Arm,
@@ -500,7 +501,7 @@ fn enum_def(def: Int) -> () uses { State[Lowering] } {
   if !st().module.enums.contains(def) {
     program = st().program
     # Registered first, so recursive types end.
-    placeholder = EnumDef(def_name(def), 0, [], False, False)
+    placeholder = EnumDef(def_name(def), 0, [], False, False, False)
     set_module(|m| Module(enums: m.enums.insert(def, placeholder), ..m))
     (params, ctors, is_error) = program.items.get(def) match {
       Some(IType(t))      -> (t.type_params.length(), t.ctor.map(|c| [c]).or([]), False)
@@ -514,7 +515,12 @@ fn enum_def(def: Int) -> () uses { State[Lowering] } {
       Some(IType(t)) -> t.ctor.is_none()
       _              -> False
     }
-    done = EnumDef(name, params, variants, is_error, external)
+    show_def = Tylower.prelude_def(program, "Show")
+    shown = program.items.get(def) match {
+      Some(Hir.IError(e)) -> e.derives.any(|(r, _)| Some(r) == show_def.map(ResDef))
+      _                   -> False
+    }
+    done = EnumDef(name, params, variants, is_error, external, shown)
     set_module(|m| Module(enums: m.enums.insert(def, done), ..m))
   }
 }
@@ -620,8 +626,17 @@ fn lower_expr(expr: Int) -> Expr uses { State[Lowering] } {
       }
       Hir.EUpdate(_, _, _)  -> unsupported("a record update")
       Hir.EAssert(_)        -> unsupported("assert")
-      Hir.EFail(_)          -> unsupported("fail")
-      Hir.EEscape(_, _)     -> unsupported("escape")
+      Hir.EFail(inner)      -> XFail(lower_expr(inner))
+      Hir.EEscape(inner, arms) -> {
+        body = lower_expr(inner)
+        Ir.XEscape(
+          body,
+          arms.map(|arm| {
+            pat = lower_pat(arm.pat)
+            Arm(pat, arm.guard.map(lower_expr), lower_expr(arm.body))
+          }),
+        )
+      }
       Hir.EUse(_, _)        -> unsupported("use")
       Hir.EWith(_, _)       -> unsupported("with")
       _                     -> unsupported("this kind of expression")
@@ -718,13 +733,25 @@ fn lower_call(expr: Int, callee: Int, written: List[Int]) -> Expr uses { State[L
         builtin_call(callee, def, args) match {
           Some(b) -> b
           None -> callable(callee, def) match {
-            Some(f) -> XCall(Direct(f, []), args, False, False)
+            Some(f) -> XCall(Direct(f, []), args, may_fail(callee), False)
             None    -> unsupported("a call of #{def_name(def)}")
           }
         }
       }
     }
-    None -> XCall(Indirect(lower_expr(callee)), args, False, False)
+    None -> {
+      value = lower_expr(callee)
+      XCall(Indirect(value), args, may_fail(callee), False)
+    }
+  }
+}
+
+## Whether a call of `callee` may fail: the E of its type is not empty. A set type parameter
+## counts as not empty; checking a result that is not a failure costs only the check.
+fn may_fail(callee: Int) -> Bool uses { State[Lowering] } {
+  st().checked.types.exprs.get(callee) match {
+    Some(TyFn(f)) -> !f.fails.elems.is_empty()
+    _             -> False
   }
 }
 
