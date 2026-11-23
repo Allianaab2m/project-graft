@@ -125,16 +125,16 @@ enum Mode {
 type Step(tokens: List[Token], next: Int, modes: List[Mode])
 
 pub fn lex(text: String) -> List[Token] {
-  tokens(Array.from_list(String.code_points(text)))
+  tokens(Array.from_list(text.code_points()))
 }
 
 pub fn tokens(src: Array[Int]) -> List[Token] {
-  raw = Array.from_list(List.reverse(run(src, 0, [Code], [])))
+  raw = Array.from_list(run(src, 0, [Code], []).reverse())
   Continuation.mark(src, raw)
 }
 
 fn run(src: Array[Int], pos: Int, modes: List[Mode], acc: List[Token]) -> List[Token] {
-  if pos >= Array.size(src) {
+  if pos >= src.size() {
     acc
   } else {
     step = modes match {
@@ -142,13 +142,13 @@ fn run(src: Array[Int], pos: Int, modes: List[Mode], acc: List[Token]) -> List[T
       [MultiStr, ..] -> multi_string_step(src, pos, modes)
       _              -> code_step(src, pos, modes)
     }
-    run(src, step.next, step.modes, List.append(List.reverse(step.tokens), acc))
+    run(src, step.next, step.modes, step.tokens.reverse().append(acc))
   }
 }
 
 ## The code point at `i`, or -1 past the end.
 fn at(src: Array[Int], i: Int) -> Int {
-  Array.get(src, i) match {
+  src.get(i) match {
     Some(c) -> c
     None    -> -1
   }
@@ -165,7 +165,7 @@ fn one(kind: Kind, start: Int, end: Int, modes: List[Mode]) -> Step {
 }
 
 fn pop(modes: List[Mode]) -> List[Mode] {
-  List.tail(modes)
+  modes.tail()
 }
 
 # Code
@@ -359,7 +359,7 @@ fn classify_word(word: String) -> Kind {
     "macro"   -> ReservedKw
     "mod"     -> ReservedKw
     "_"       -> Underscore
-    _         -> classify_name(String.code_points(word))
+    _         -> classify_name(word.code_points())
   }
 }
 
@@ -367,9 +367,9 @@ fn classify_name(cs: List[Int]) -> Kind {
   cs match {
     [c, ..] if is_lower(c) || c == UNDERSCORE -> LowerName
     [c, ..] if is_upper(c) -> {
-      if List.all(cs, |d| is_upper(d) || is_digit(d) || d == UNDERSCORE) {
+      if cs.all(|d| is_upper(d) || is_digit(d) || d == UNDERSCORE) {
         UpperName
-      } else if List.all(cs, |d| is_letter(d) || is_digit(d)) {
+      } else if cs.all(|d| is_letter(d) || is_digit(d)) {
         TypeName
       } else {
         ErrorToken
@@ -442,7 +442,7 @@ fn scan_multiline_text(src: Array[Int], i: Int) -> Int {
     }
   } else if c == BACKSLASH {
     # A `\` before a newline does not end the body.
-    scan_multiline_text(src, Option.or(escape_end(src, i), i + 1))
+    scan_multiline_text(src, escape_end(src, i).or(i + 1))
   } else {
     scan_multiline_text(src, i + 1)
   }

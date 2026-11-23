@@ -11,19 +11,19 @@ import Token.{Token}
 ## The tree and the diagnostics of `src` as `graft tree` prints them, one line per element.
 fn tree(src: String) -> List[String] {
   built = build(src)
-  errors = List.map(built.diagnostics, |d| "error[#{d.code}]@#{d.start}..#{d.end}")
-  List.append(List.map(dump(built.tree), trim_newline), errors)
+  errors = built.diagnostics.map(|d| "error[#{d.code}]@#{d.start}..#{d.end}")
+  dump(built.tree).map(trim_newline).append(errors)
 }
 
 fn build(src: String) -> Sink.Built {
-  code_points = Array.from_list(String.code_points(src))
+  code_points = Array.from_list(src.code_points())
   tokens = Lexer.tokens(code_points)
   p = Parser.run(code_points, tokens, Grammar.source_file)
   Sink.build(code_points, Array.from_list(tokens), p)
 }
 
 fn trim_newline(line: String) -> String {
-  String.code_points(line)
+  line.code_points()
     |> List.filter(|c| c != 0x0A)
     |> List.filter_map(String.from_code_point)
     |> String.concat
@@ -151,13 +151,13 @@ const PIECES = [
 
 fn source_of(indices: List[Int]) -> String {
   pieces = Array.from_list(PIECES)
-  indices |> List.filter_map(|i| Array.get(pieces, i)) |> String.concat
+  indices |> List.filter_map(|i| pieces.get(i)) |> String.concat
 }
 
 fn leaves(tree: Tree, acc: List[Token]) -> List[Token] {
   tree match {
     Leaf(t)                   -> [t, ..acc]
-    Branch(_, _, _, children) -> List.fold(children, acc, |a, c| leaves(c, a))
+    Branch(_, _, _, children) -> children.fold(acc, |a, c| leaves(c, a))
   }
 }
 
@@ -166,7 +166,7 @@ fn spans(tree: Tree) -> Bool {
   tree match {
     Leaf(_) -> True
     Branch(_, start, end, children) -> {
-      last = List.fold(children, start, |pos, c| {
+      last = children.fold(start, |pos, c| {
         c match {
           Leaf(t)            -> if t.start == pos { t.end } else { -1 }
           Branch(_, s, e, _) -> if s == pos && spans(c) { e } else { -1 }
@@ -182,7 +182,7 @@ fn the_tree_holds_every_token_in_order() {
   gen = Gen.list(Gen.int_between(0, List.length(PIECES) - 1)) |> Gen.map(source_of)
   Property.check(gen, |src| {
     built = build(src)
-    assert List.reverse(leaves(built.tree, [])) == Lexer.lex(src)
+    assert leaves(built.tree, []).reverse() == Lexer.lex(src)
     assert spans(built.tree)
   })
 }

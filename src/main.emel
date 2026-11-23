@@ -49,12 +49,10 @@ fn usage() -> ExitCode uses { Console } {
 
 fn roundtrip(files: List[String]) -> ExitCode uses { Console, FileSystem } {
   console = use Console
-  failed = List.filter(files, |path| !roundtrips(path))
-  List.each(failed, |path| console.print_line("FAILED #{path}"))
-  console.print_line(
-    "#{List.length(files) - List.length(failed)}/#{List.length(files)} files round-trip",
-  )
-  if List.is_empty(failed) { EXIT_SUCCESS } else { EXIT_FAILURE }
+  failed = files.filter(|path| !roundtrips(path))
+  failed.each(|path| console.print_line("FAILED #{path}"))
+  console.print_line("#{files.length() - failed.length()}/#{files.length()} files round-trip")
+  if failed.is_empty() { EXIT_SUCCESS } else { EXIT_FAILURE }
 }
 
 fn roundtrips(path: String) -> Bool uses { FileSystem } {
@@ -62,10 +60,10 @@ fn roundtrips(path: String) -> Bool uses { FileSystem } {
   Some(fs.read_text(path)) escape { _ -> None } match {
     None -> False
     Some(text) -> {
-      src = Array.from_list(String.code_points(text))
+      src = Array.from_list(text.code_points())
       tokens = Lexer.tokens(src)
-      end = List.fold(tokens, 0, |pos, t| if t.start == pos && t.end > pos { t.end } else { -1 })
-      end == Array.size(src)
+      end = tokens.fold(0, |pos, t| if t.start == pos && t.end > pos { t.end } else { -1 })
+      end == src.size()
     }
   }
 }
@@ -79,7 +77,7 @@ fn tokens(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
       EXIT_FAILURE
     }
     Some(text) -> {
-      lines = Lexer.lex(text) |> List.map(|t| "#{t.kind}@#{t.start}..#{t.end}\n")
+      lines = Lexer.lex(text).map(|t| "#{t.kind}@#{t.start}..#{t.end}\n")
       (use Stdout).print(String.concat(lines))
       EXIT_SUCCESS
     }
@@ -89,22 +87,22 @@ fn tokens(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
 fn parse(files: List[String]) -> ExitCode uses { Console, FileSystem } {
   console = use Console
   fs = use FileSystem
-  counts = List.map(files, |path| {
+  counts = files.map(|path| {
     Some(fs.read_text(path)) escape { _ -> None } match {
       None       -> -1
-      Some(text) -> List.length(build(text).diagnostics)
+      Some(text) -> build(text).diagnostics.length()
     }
   })
-  unread = List.length(List.filter(counts, |n| n < 0))
-  diagnostics = List.fold(counts, 0, |sum, n| if n > 0 { sum + n } else { sum })
+  unread = counts.filter(|n| n < 0).length()
+  diagnostics = counts.fold(0, |sum, n| if n > 0 { sum + n } else { sum })
   console.print_line(
-    "#{List.length(files) - unread} files parsed, #{diagnostics} diagnostics, #{unread} unreadable",
+    "#{files.length() - unread} files parsed, #{diagnostics} diagnostics, #{unread} unreadable",
   )
   if unread == 0 { EXIT_SUCCESS } else { EXIT_FAILURE }
 }
 
 fn build(text: String) -> Sink.Built {
-  src = Array.from_list(String.code_points(text))
+  src = Array.from_list(text.code_points())
   tokens = Lexer.tokens(src)
   p = Parser.run(src, tokens, Grammar.source_file)
   Sink.build(src, Array.from_list(tokens), p)
@@ -120,7 +118,7 @@ fn tree(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
     }
     Some(text) -> {
       built = build(text)
-      errors = List.map(built.diagnostics, |d| "error[#{d.code}]@#{d.start}..#{d.end}\n")
+      errors = built.diagnostics.map(|d| "error[#{d.code}]@#{d.start}..#{d.end}\n")
       (use Stdout).print(String.concat(List.append(Syntax.dump(built.tree), errors)))
       EXIT_SUCCESS
     }

@@ -51,7 +51,7 @@ fn kinds(src: String) -> List[Kind] {
 
 ## The text of each token.
 fn texts(src: String) -> List[String] {
-  code_points = Array.from_list(String.code_points(src))
+  code_points = Array.from_list(src.code_points())
   List.map(Lexer.lex(src), |t| Source.slice(code_points, t.start, t.end))
 }
 
@@ -165,7 +165,7 @@ fn a_number_followed_by_letters_is_one_error() {
     "0x1.5",
     "0b1.0",
   ]
-  List.each(bad, |src| assert kinds(src) == [ErrorToken])
+  bad.each(|src| assert kinds(src) == [ErrorToken])
   # A missing exponent digit makes everything up to the sign an error.
   assert kinds("1.0e+") == [ErrorToken, Plus]
 }
@@ -257,7 +257,7 @@ const PIECES = [
 
 fn source_of(indices: List[Int]) -> String {
   pieces = Array.from_list(PIECES)
-  indices |> List.filter_map(|i| Array.get(pieces, i)) |> String.concat
+  indices |> List.filter_map(|i| pieces.get(i)) |> String.concat
 }
 
 @test
@@ -267,6 +267,6 @@ fn tokens_concatenate_back_to_the_source() {
     assert String.concat(texts(src)) == src
     # No gaps and no overlaps.
     end = List.fold(Lexer.lex(src), 0, |pos, t| if t.start == pos { t.end } else { -1 })
-    assert end == List.length(String.code_points(src))
+    assert end == src.code_points().length()
   })
 }

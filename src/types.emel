@@ -16,6 +16,7 @@ import Parser.{
   expect,
   finish,
   in_closure_params,
+  newlines_from,
   nth,
   precede,
   skip_newlines,
@@ -251,10 +252,6 @@ pub fn old_uses_clause_on_next_line() -> () uses { State[Parser] } {
     skip_newlines()
     uses_clause()
   }
-}
-
-fn newlines_from(n: Int) -> Int uses { State[Parser] } {
-  if nth(n) == Newline { newlines_from(n + 1) } else { n }
 }
 
 fn uses_clause() -> () uses { State[Parser] } {

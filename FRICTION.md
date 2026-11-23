@@ -129,7 +129,9 @@ fn paren_elements(count: Int) -> (Int, Bool) uses { State[Parser] } {
 }
 ```
 
-行き先: 我慢．ループを持たないのは言語の判断で、末尾呼び出しは保証されている．補助関数がモジュールの別の場所に散るのが読みにくさの主因なので、次はローカル fn（`[fn.local]`）で呼び出し元の中に置く書き方を試す．
+行き先: 我慢．ループを持たないのは言語の判断で、末尾呼び出しは保証されている．
+
+その後、引数を素通しするだけの補助関数（`delimited_elements(close, element)` など）は、ローカル fn（`[fn.local]`）にして呼び出し元の中に置いた．ローカル fn は外側の変数を捕捉し、自分への末尾呼び出しも保証されるので、素通しの引数が消える．ただし捕捉した関数引数を呼ぶと L7 に当たる．補助関数どうしが呼び合う lexer は、ローカル fn が相互再帰できないので移せない．
 
 ### L7. 引数の関数型が、書いていない fails と uses について多相になる
 
@@ -149,7 +151,9 @@ pub fn column(f: fn(Int) -> Doc fails {} uses {}) -> Doc {
 
 型のフィールドに書いた `fn(Int) -> Doc` は純粋な関数の意味になり、引数に書いた同じ型は多相になる．同じ字面で意味が違うので、E0321 を見ても原因に気づきにくい．
 
-本来の形: E0321 と E0403 の help で `fails {} uses {}` を書くよう示す．
+ローカル fn でも同じことが起きる．外側の関数の引数 `element: fn() -> () uses { State[Parser] }` を、シグネチャを書いたローカル fn の中で呼ぶと E0318（`unhandled error E(element)`）になる．引数の型に `fails {}` と書いて直した．
+
+本来の形: E0321、E0403、E0318 の help で `fails {} uses {}` を書くよう示す．
 
 行き先: 本体 issue（診断の help）を検討．
 
@@ -171,9 +175,9 @@ import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
 
 起きたこと: E0334（`function children has the same name as a field of Node`）になった．フィールドを `trees` と `outer` に、printer の関数を `trailing_of`、`target_width`、`is_pending` に改名した．
 
-本来の形: `node.children` はフィールド、`children(node)` は関数と書き分けられるので、両方を許す．衝突の理由（メソッド呼び出しの解決）が仕様にあるなら、診断の help で示す．
+仕様を読み直したら、5.3 に明記されていた．型を定義したモジュールの関数は `user.f(...)` とメソッドのように呼べる（`[type.rules]`）ので、フィールドと同じ名前の関数は書けない．
 
-行き先: 本体 issue か proposal．仕様の該当箇所を確かめてから決める．
+行き先: 我慢（仕様どおり）．
 
 ## std
 
@@ -253,6 +257,14 @@ error: internal error: cannot format this file: the output has a syntax error: e
 
 行き先: 本体 issue（未提出）．Graft は reference に合わせて同じ出力を作り、同じく internal error にしている．
 
+### T4. native で `String.chars` と `String.length` が使えない
+
+起きたこと: 行末の `\r` を落とすのに `String.concat(s.chars().take(s.length() - 1))` と書いたら、native だけ「`String.chars` needs the Unicode grapheme cluster tables, which target `native` does not support yet」でビルドが止まった．js と wasm は通る．
+
+対応: コードポイント単位（`s.code_points()...`）に戻した．ビルド時に止まるので T1 より気づきやすい．
+
+行き先: 我慢（native の対応待ち）．
+
 ## Brix
 
 ### B1. 文字列の生成器と「候補から選ぶ」生成器がない
@@ -303,3 +315,13 @@ lexer にも `<-` を1トークンにする処理が残っていた．corpus に
 対応: Graft の作業では `~/.emela/versions/v0.28.2` を PATH の先頭に置いた．CI は `setup-emela` が Pome.toml の版を入れるので影響しない．
 
 行き先: 我慢．手元でも Pome.toml の `emela` と違う版で動いていることに気づける仕組み（W0203 に近い警告）があるとよいが、Graft の側で `scripts/` が版を確かめる方が早い．
+
+### P3. メソッド呼び出しを知らずに、`List.f(List.g(xs, ...))` と書き続けていた
+
+起きたこと: M2 まで、標準ライブラリの関数をすべて `List.length(List.filter(items, f))` や `Option.or(Map.get(m, k), [])` の形で書いていた．仕様 4.6 と 5.3 によれば、型を定義したモジュールの関数は `items.filter(f).length()` や `m.get(k).or([])` と書ける．std も `xys.reverse().fold(...)` と書いている．`cst.emel` の `same` を `impl Node: Eq` にできると指摘されて仕様を読み直し、気づいた．
+
+対応: 受け手の型のモジュールの関数呼び出しを、約 300 か所メソッド呼び出しに書き換えた．あわせて、自前の `max` と行末の空白を削る関数を `Int.max` と `String.trim` に置き換え、同じ補助関数が2つずつあったもの（`spaces`、`newlines_from`）を1つにまとめた．書き換えの前後で、テスト、reference との比較 3 種、fuzz の結果は変わらない．
+
+本体への材料: 仕様 6 章の冒頭は「呼び出しの形は `name(arguments)` の1つだけ」と書いている．メソッド呼び出しは 4.6 と 5.3 の箇条書きと `[type.rules]` にしか出てこない．6 章（関数と式）の冒頭に `x.f(...)` の形も書いてあれば、最初に読む章で気づけた．
+
+行き先: 本体 issue（仕様の記述）を検討．

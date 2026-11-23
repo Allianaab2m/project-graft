@@ -33,9 +33,9 @@ pub fn format(text: String) -> Formatted {
 ## `width` is a target for the display width of a line. Tokens that cannot fit (such as long
 ## strings) exceed it.
 pub fn format_with_width(text: String, width: Int) -> Formatted {
-  src = Array.from_list(String.code_points(text))
+  src = Array.from_list(text.code_points())
   built = parse(src)
-  if !List.is_empty(built.diagnostics) {
+  if !built.diagnostics.is_empty() {
     SyntaxErrors
   } else {
     root = Cst.root(built.tree)
@@ -64,7 +64,7 @@ fn parse(src: Array[Int]) -> Sink.Built {
 ## The reference also compares the tokens, minus what formatting may change
 ## (`normalized_tokens`). Graft does not yet.
 fn verify(src: Array[Int], before: Cst.Node, out: String) -> Option[String] {
-  out_src = Array.from_list(String.code_points(out))
+  out_src = Array.from_list(out.code_points())
   after = parse(out_src)
   after.diagnostics match {
     [d, ..] -> Some("the output has a syntax error: #{d.message} at #{d.start}..#{d.end}")
@@ -88,11 +88,11 @@ fn comment_texts(src: Array[Int], root: Cst.Node) -> List[String] {
 ## Strips trailing whitespace and ends the output with exactly one newline. Whitespace before a
 ## newline inside a multiline string `"""` is part of the value, so it is kept.
 fn finish(rendered: String) -> String {
-  cs = Array.from_list(String.code_points(rendered))
+  cs = Array.from_list(rendered.code_points())
   in_string = List.fold(Lexer.tokens(cs), Map.empty(), |m, t| {
     if t.kind == StringText || t.kind == TripleQuote {
       List.fold(List.range(t.start, t.end), m, |acc, i| {
-        if Array.get(cs, i) == Some(0x0A) { Map.insert(acc, i, True) } else { acc }
+        if cs.get(i) == Some(0x0A) { acc.insert(i, True) } else { acc }
       })
     } else {
       m
@@ -100,10 +100,10 @@ fn finish(rendered: String) -> String {
   })
   lines = split_lines(cs, in_string, 0, 0, [])
   body = drop_blank_tail(lines)
-  if List.is_empty(body) {
+  if body.is_empty() {
     ""
   } else {
-    String.concat(List.map(List.reverse(body), |l| "#{l}\n"))
+    String.concat(body.reverse().map(|l| "#{l}\n"))
   }
 }
 
@@ -116,14 +116,14 @@ fn split_lines(
   i: Int,
   acc: List[String],
 ) -> List[String] {
-  Array.get(cs, i) match {
-    None -> if start < i || List.is_empty(acc) {
+  cs.get(i) match {
+    None -> if start < i || acc.is_empty() {
       [trimmed(cs, start, i, False), ..acc]
     } else {
       acc
     }
     Some(0x0A) -> {
-      keep = Map.contains(in_string, i)
+      keep = in_string.contains(i)
       split_lines(cs, in_string, i + 1, i + 1, [trimmed(cs, start, i, keep), ..acc])
     }
     Some(_) -> split_lines(cs, in_string, start, i + 1, acc)
@@ -132,13 +132,13 @@ fn split_lines(
 
 fn trimmed(cs: Array[Int], start: Int, end: Int, keep: Bool) -> String {
   # A `\r` before the newline goes in either case.
-  e = if end > start && Array.get(cs, end - 1) == Some(0x0D) { end - 1 } else { end }
+  e = if end > start && cs.get(end - 1) == Some(0x0D) { end - 1 } else { end }
   stop = if keep { e } else { trim_end_at(cs, start, e) }
   Source.slice(cs, start, stop)
 }
 
 fn trim_end_at(cs: Array[Int], start: Int, end: Int) -> Int {
-  if end > start && is_space(Array.get(cs, end - 1)) {
+  if end > start && is_space(cs.get(end - 1)) {
     trim_end_at(cs, start, end - 1)
   } else {
     end

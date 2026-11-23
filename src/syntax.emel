@@ -155,7 +155,7 @@ pub type Diagnostic(code: String, start: Int, end: Int, message: String)
 ## The tree as `Kind@start..end` lines, nested elements indented by two spaces, in the format of
 ## `tools/oracle`.
 pub fn dump(tree: Tree) -> List[String] {
-  List.reverse(dump_onto(tree, "", []))
+  dump_onto(tree, "", []).reverse()
 }
 
 fn dump_onto(tree: Tree, indent: String, acc: List[String]) -> List[String] {
@@ -164,7 +164,7 @@ fn dump_onto(tree: Tree, indent: String, acc: List[String]) -> List[String] {
     Branch(kind, start, end, children) -> {
       line = "#{indent}#{kind}@#{start}..#{end}\n"
       inner = "#{indent}  "
-      List.fold(children, [line, ..acc], |lines, child| dump_onto(child, inner, lines))
+      children.fold([line, ..acc], |lines, child| dump_onto(child, inner, lines))
     }
   }
 }

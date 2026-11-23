@@ -25,6 +25,7 @@ import Parser.{
   finish,
   line_indent,
   literal,
+  newlines_from,
   nth,
   nth_at_contextual_kw,
   position,
@@ -186,10 +187,6 @@ import Types.{
 
 # ---------------------------------------------------------------------------------------------
 # Shared helpers
-
-fn newlines_from(n: Int) -> Int uses { State[Parser] } {
-  if nth(n) == Newline { newlines_from(n + 1) } else { n }
-}
 
 ## At a newline, `}` or the end of the input.
 fn at_line_end() -> Bool uses { State[Parser] } {
@@ -365,27 +362,26 @@ fn stmt() -> () uses { State[Parser] } {
 fn block() -> Completed uses { State[Parser] } {
   m = start()
   indent = line_indent()
+  fn items() -> () uses { State[Parser] } {
+    doc = newlines_with_doc()
+    local_fn = at_local_fn_start() && (braces_balanced() || line_indent() > indent)
+    if local_fn || !(at(RBrace) || at_eof() || at_decl_start()) {
+      before = position()
+      if local_fn { local_fn_decl(marker_or_start(doc)) } else { stmt() }
+      if position() == before {
+        # A diagnostic was reported but no token was consumed (e.g. `=` at line start).
+        bump_error()
+      } else if !at_stmt_end() {
+        report("E0122", "expected newline or `}` after statement")
+        skip_to_line_end()
+      }
+      items()
+    }
+  }
   bump()
-  block_items(indent)
+  items()
   expect(RBrace)
   complete(m, BlockExpr)
-}
-
-fn block_items(indent: Int) -> () uses { State[Parser] } {
-  doc = newlines_with_doc()
-  local_fn = at_local_fn_start() && (braces_balanced() || line_indent() > indent)
-  if local_fn || !(at(RBrace) || at_eof() || at_decl_start()) {
-    before = position()
-    if local_fn { local_fn_decl(marker_or_start(doc)) } else { stmt() }
-    if position() == before {
-      # A diagnostic was reported but no token was consumed (e.g. `=` at line start).
-      bump_error()
-    } else if !at_stmt_end() {
-      report("E0122", "expected newline or `}` after statement")
-      skip_to_line_end()
-    }
-    block_items(indent)
-  }
 }
 
 ## Inside an unclosed `(` newlines are continuations, so a line start also ends a statement.
@@ -1574,35 +1570,33 @@ fn impl_type() -> () uses { State[Parser] } {
 ## A declaration body `"{" { item NL } "}"`. With `handlers`, `handler` at the start of a line is
 ## an item of the body (a handler member of an effect, or an inner handler of a handler), not a
 ## new declaration.
-fn item_list_in(handlers: Bool, item: fn(Marker) -> () uses { State[Parser] }) -> ()
+fn item_list_in(handlers: Bool, item: fn(Marker) -> () fails {} uses { State[Parser] }) -> ()
   uses { State[Parser] } {
+  fn items() -> () uses { State[Parser] } {
+    doc = newlines_with_doc()
+    stop = at(RBrace) || at_eof() || (at_top_decl_start() && !(handlers && at(HandlerKw)))
+    if !stop {
+      m = marker_or_start(doc)
+      before = position()
+      item(m)
+      if position() == before {
+        bump_error()
+      } else if !at_line_end() && !at_line_start() {
+        report("E0122", "expected newline or `}` after item")
+        e = start()
+        skip_item_rest()
+        finish(e, Error)
+      }
+      items()
+    }
+  }
   list = start()
   if expect(LBrace) {
-    items(handlers, item)
+    items()
     expect(RBrace)
     ()
   }
   finish(list, ItemList)
-}
-
-fn items(handlers: Bool, item: fn(Marker) -> () uses { State[Parser] }) -> ()
-  uses { State[Parser] } {
-  doc = newlines_with_doc()
-  stop = at(RBrace) || at_eof() || (at_top_decl_start() && !(handlers && at(HandlerKw)))
-  if !stop {
-    m = marker_or_start(doc)
-    before = position()
-    item(m)
-    if position() == before {
-      bump_error()
-    } else if !at_line_end() && !at_line_start() {
-      report("E0122", "expected newline or `}` after item")
-      e = start()
-      skip_item_rest()
-      finish(e, Error)
-    }
-    items(handlers, item)
-  }
 }
 
 ## Reads up to a newline or the matching outer `}`. Inner `{ }` are read whole.

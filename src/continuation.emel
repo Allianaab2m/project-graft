@@ -53,7 +53,7 @@ enum ErrorSet {
 } derive Eq
 
 pub fn mark(src: Array[Int], tokens: Array[Token]) -> List[Token] {
-  List.reverse(run(src, tokens, 0, [], Outside, []))
+  run(src, tokens, 0, [], Outside, []).reverse()
 }
 
 fn run(
@@ -64,7 +64,7 @@ fn run(
   error_set: ErrorSet,
   acc: List[Token],
 ) -> List[Token] {
-  Array.get(tokens, i) match {
+  tokens.get(i) match {
     None -> acc
     Some(token) -> {
       kind = token.kind
@@ -76,7 +76,7 @@ fn run(
       if opens(kind) {
         run(src, tokens, i + 1, [kind, ..stack], set, [token, ..acc])
       } else if closes(kind) {
-        run(src, tokens, i + 1, List.tail(stack), set, [token, ..acc])
+        run(src, tokens, i + 1, stack.tail(), set, [token, ..acc])
       } else if kind == Newline {
         inside = stack match {
           [LParen, ..]      -> True
@@ -87,10 +87,10 @@ fn run(
         next = next_significant(tokens, i)
         continues = (
           inside
-            || Option.map(next, |t| starts_continuation(t.kind)) == Some(True)
+            || next.map(|t| starts_continuation(t.kind)) == Some(True)
             || postfix_match_follows(tokens, i)
             || starts_clause(src, tokens, i)
-            || (set == AfterItem && Option.map(next, |t| t.kind) == Some(Pipe))
+            || (set == AfterItem && next.map(|t| t.kind) == Some(Pipe))
         )
         if continues {
           cont = Token(NewlineCont, token.start, token.end)
@@ -132,7 +132,7 @@ fn next_error_set(set: ErrorSet, src: Array[Int], token: Token) -> ErrorSet {
 
 ## The position of the first token after `i` that is neither trivia nor a newline.
 fn next_significant_index(tokens: Array[Token], i: Int) -> Option[Int] {
-  Array.get(tokens, i + 1) match {
+  tokens.get(i + 1) match {
     None                                              -> None
     Some(t) if is_trivia(t.kind) || t.kind == Newline -> next_significant_index(tokens, i + 1)
     Some(_)                                           -> Some(i + 1)
@@ -142,7 +142,7 @@ fn next_significant_index(tokens: Array[Token], i: Int) -> Option[Int] {
 fn next_significant(tokens: Array[Token], i: Int) -> Option[Token] {
   next_significant_index(tokens, i) match {
     None    -> None
-    Some(j) -> Array.get(tokens, j)
+    Some(j) -> tokens.get(j)
   }
 }
 
@@ -152,8 +152,8 @@ fn postfix_match_follows(tokens: Array[Token], i: Int) -> Bool {
   next_significant_index(tokens, i) match {
     None -> False
     Some(j) -> {
-      is_match = Option.map(Array.get(tokens, j), |t| t.kind) == Some(MatchKw)
-      is_match && Option.map(next_significant(tokens, j), |t| t.kind) == Some(LBrace)
+      is_match = tokens.get(j).map(|t| t.kind) == Some(MatchKw)
+      is_match && next_significant(tokens, j).map(|t| t.kind) == Some(LBrace)
     }
   }
 }
@@ -164,7 +164,7 @@ fn starts_clause(src: Array[Int], tokens: Array[Token], i: Int) -> Bool {
   next_significant_index(tokens, i) match {
     None -> False
     Some(j) -> {
-      first = Array.get(tokens, j)
+      first = tokens.get(j)
       word = Option.map(
         first,
         |t| if t.kind == LowerName { slice(src, t.start, t.end) } else { "" },
@@ -181,7 +181,7 @@ fn starts_clause(src: Array[Int], tokens: Array[Token], i: Int) -> Bool {
 
 ## The kind of the first token from `i` that is not trivia. A Newline counts, as it ends the line.
 fn next_on_line(tokens: Array[Token], i: Int) -> Option[Kind] {
-  Array.get(tokens, i) match {
+  tokens.get(i) match {
     None                         -> None
     Some(t) if is_trivia(t.kind) -> next_on_line(tokens, i + 1)
     Some(t)                      -> Some(t.kind)

@@ -25,11 +25,10 @@ import Cst.{
   is_token,
   last_token,
   parent,
-  same,
   significant_children,
   tokens,
 }
-import Doc.{Doc, append, concat, flat_alt, group, hardline, nest, nil, render}
+import Doc.{Doc, append, concat, flat_alt, group, hardline, nest, nil, render, spaces}
 import Source.{slice}
 import Syntax.{
   NodeKind,
@@ -224,25 +223,22 @@ type Scan(
 pub fn new(src: Array[Int], root: Node, width: Int) -> Printer {
   all = tokens(root)
   initial = Scan(None, 0, [], Map.empty(), Map.empty())
-  scan = List.fold(all, initial, |s, token| {
+  scan = all.fold(initial, |s, token| {
     kind = token.kind
     if kind == Whitespace {
       s
     } else if kind == Newline || kind == NewlineCont {
       Scan(newlines: s.newlines + 1, ..s)
     } else if kind == Comment || kind == DocComment {
-      comment = trim_end(slice(src, token.start, token.end))
+      # A comment starts with `#`, so trimming both ends trims its end.
+      comment = slice(src, token.start, token.end).trim()
       (s.prev, s.items) match {
         (Some(p), []) if s.newlines == 0 -> {
-          earlier = Option.or(Map.get(s.trailing, p), [])
-          Scan(
-            newlines: 0,
-            trailing: Map.insert(s.trailing, p, List.append(earlier, [comment])),
-            ..s,
-          )
+          earlier = s.trailing.get(p).or([])
+          Scan(newlines: 0, trailing: s.trailing.insert(p, earlier.append([comment])), ..s)
         }
         _ -> {
-          blank = if s.newlines >= 2 && (Option.is_some(s.prev) || !List.is_empty(s.items)) {
+          blank = if s.newlines >= 2 && (s.prev.is_some() || !s.items.is_empty()) {
             [BlankLine, ..s.items]
           } else {
             s.items
@@ -257,7 +253,7 @@ pub fn new(src: Array[Int], root: Node, width: Int) -> Printer {
   })
   eof = root.end
   done = flush(scan, eof)
-  index = List.fold(List.enumerate(all), Map.empty(), |m, (i, t)| Map.insert(m, t.start, i))
+  index = all.enumerate().fold(Map.empty(), |m, (i, t)| m.insert(t.start, i))
   Printer(
     src:,
     all: Array.from_list(all),
@@ -273,40 +269,24 @@ pub fn new(src: Array[Int], root: Node, width: Int) -> Printer {
 }
 
 fn flush(s: Scan, at: Int) -> Scan {
-  items = if s.newlines >= 2 && (Option.is_some(s.prev) || !List.is_empty(s.items)) {
+  items = if s.newlines >= 2 && (s.prev.is_some() || !s.items.is_empty()) {
     [BlankLine, ..s.items]
   } else {
     s.items
   }
-  if List.is_empty(items) {
+  if items.is_empty() {
     Scan(items: [], ..s)
   } else {
-    Scan(items: [], leading: Map.insert(s.leading, at, List.reverse(items)), ..s)
-  }
-}
-
-fn trim_end(s: String) -> String {
-  String.code_points(s)
-    |> List.reverse
-    |> drop_spaces
-    |> List.reverse
-    |> List.filter_map(String.from_code_point)
-    |> String.concat
-}
-
-fn drop_spaces(cs: List[Int]) -> List[Int] {
-  cs match {
-    [c, ..rest] if c == 0x20 || c == 0x09 || c == 0x0D || c == 0x0A -> drop_spaces(rest)
-    _                                                               -> cs
+    Scan(items: [], leading: s.leading.insert(at, items.reverse()), ..s)
   }
 }
 
 ## Comments not printed yet. Checked to be zero after printing, so no comment is dropped.
 pub fn remaining(p: Printer) -> Int {
-  leading = Map.fold(p.leading, 0, |n, _, items| {
-    n + List.length(List.filter(items, |l| l != BlankLine))
+  leading = p.leading.fold(0, |n, _, items| {
+    n + items.filter(|l| l != BlankLine).length()
   })
-  Map.fold(p.trailing, leading, |n, _, items| n + List.length(items))
+  p.trailing.fold(leading, |n, _, items| n + items.length())
 }
 
 fn printer() -> Printer uses { State[Printer] } {
@@ -321,26 +301,26 @@ fn update(f: fn(Printer) -> Printer) -> () uses { State[Printer] } {
 ## Later calls for the same token return nothing.
 fn take_leading(token: Token) -> List[Leading] uses { State[Printer] } {
   p = printer()
-  update(|q| Printer(leading: Map.remove(q.leading, token.start), ..q))
-  Option.or(Map.get(p.leading, token.start), [])
+  update(|q| Printer(leading: q.leading.remove(token.start), ..q))
+  p.leading.get(token.start).or([])
 }
 
 ## Comments after the last declaration.
 fn take_leading_eof() -> List[Leading] uses { State[Printer] } {
   p = printer()
-  update(|q| Printer(leading: Map.remove(q.leading, p.eof), ..q))
-  Option.or(Map.get(p.leading, p.eof), [])
+  update(|q| Printer(leading: q.leading.remove(p.eof), ..q))
+  p.leading.get(p.eof).or([])
 }
 
 fn take_trailing(token: Token) -> List[String] uses { State[Printer] } {
   p = printer()
-  update(|q| Printer(trailing: Map.remove(q.trailing, token.start), ..q))
-  Option.or(Map.get(p.trailing, token.start), [])
+  update(|q| Printer(trailing: q.trailing.remove(token.start), ..q))
+  p.trailing.get(token.start).or([])
 }
 
 ## Does not claim them.
 fn has_leading_comment(token: Token) -> Bool uses { State[Printer] } {
-  Option.or(Map.get(printer().leading, token.start), []) |> List.any(|l| l != BlankLine)
+  printer().leading.get(token.start).or([]).any(|l| l != BlankLine)
 }
 
 fn is_comment(item: Leading) -> Bool {
@@ -355,7 +335,7 @@ fn has_comments_outside_blocks(node: Node) -> Bool {
 }
 
 fn comment_outside(trees: List[Tree]) -> Bool {
-  List.any(trees, |tree| {
+  trees.any(|tree| {
     tree match {
       Leaf(t) -> t.kind == Comment || t.kind == DocComment
       Branch(kind, _, _, inner) -> kind != BlockExpr
@@ -404,10 +384,10 @@ fn tok(token: Token) -> Doc uses { State[Printer] } {
 ## A piece of a multiline string `"""`. The text is printed as is, without adding indentation
 ## after its newlines, because the indentation is part of the value.
 fn raw_tok(token: Token) -> Doc uses { State[Printer] } {
-  lines = String.split(token_text(token), "\n") |> List.map(|l| text(strip_cr(l)))
+  lines = token_text(token).split("\n").map(|l| text(strip_cr(l)))
   doc = lines match {
     [] -> nil()
-    [first, ..rest] -> List.fold(rest, first, |doc, line| {
+    [first, ..rest] -> rest.fold(first, |doc, line| {
       # Cancel the current indentation and write from column 0. The newline takes the
       # indentation of the next piece, so the newline and the line are un-nested together. An
       # empty line still needs a piece right after the newline, hence the zero-width marker.
@@ -423,13 +403,10 @@ fn raw_tok(token: Token) -> Doc uses { State[Printer] } {
 }
 
 fn strip_cr(s: String) -> String {
-  if String.ends_with(s, "\r") {
-    String.code_points(s)
-      |> List.reverse
-      |> List.drop(1)
-      |> List.reverse
-      |> List.filter_map(String.from_code_point)
-      |> String.concat
+  if s.ends_with("\r") {
+    # By code points: `String.chars` and `String.length` need grapheme tables, which native does
+    # not have yet.
+    s.code_points().reverse().drop(1).reverse().filter_map(String.from_code_point) |> String.concat
   } else {
     s
   }
@@ -443,13 +420,13 @@ fn tok_as(token: Token, doc: Doc) -> Doc uses { State[Printer] } {
   } else {
     nil()
   }
-  comments = List.filter_map(take_leading(token), |l| {
+  comments = take_leading(token).filter_map(|l| {
     l match {
       LeadingComment(c) -> Some(c)
       BlankLine         -> None
     }
   })
-  lead = if List.is_empty(comments) {
+  lead = if comments.is_empty() {
     nil()
   } else {
     start = if printer().at_break { nil() } else { hardline() }
@@ -472,8 +449,8 @@ fn hold_trailing(token: Token) -> List[String] uses { State[Printer] } {
 }
 
 fn print_trailing(comments: List[String]) -> Doc uses { State[Printer] } {
-  if !List.is_empty(comments) { set_pending() }
-  concat(List.map(comments, |c| append(text(" "), text(c))))
+  if !comments.is_empty() { set_pending() }
+  concat(comments.map(|c| append(text(" "), text(c))))
 }
 
 fn line() -> Doc uses { State[Printer] } {
@@ -514,7 +491,7 @@ fn leading_lines(token: Token, first: Bool) -> Doc uses { State[Printer] } {
 }
 
 fn leading_items(items: List[Leading], first: Bool) -> Doc uses { State[Printer] } {
-  (docs, _) = List.fold(items, ([], !first), |(docs, emitted), item| {
+  (docs, _) = items.fold(([], !first), |(docs, emitted), item| {
     item match {
       BlankLine -> if emitted { ([hardline(), ..docs], emitted) } else { (docs, emitted) }
       LeadingComment(c) -> {
@@ -523,18 +500,18 @@ fn leading_items(items: List[Leading], first: Bool) -> Doc uses { State[Printer]
       }
     }
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## Leading comments of a list element. Blank lines are dropped.
 fn leading_in_list(token: Token) -> Doc uses { State[Printer] } {
-  leading_items(List.filter(take_leading(token), is_comment), True)
+  leading_items(take_leading(token).filter(is_comment), True)
 }
 
 ## Comments before a closing bracket (or the end of the input). Called at the end of the last
 ## element's line. `started` is false when nothing has been printed yet (an empty block).
 fn closing_comments(items: List[Leading], started: Bool) -> Doc uses { State[Printer] } {
-  (docs, _, _) = List.fold(items, ([], False, started), |(docs, blank, any), item| {
+  (docs, _, _) = items.fold(([], False, started), |(docs, blank, any), item| {
     item match {
       BlankLine -> (docs, any, any)
       LeadingComment(c) -> {
@@ -544,30 +521,35 @@ fn closing_comments(items: List[Leading], started: Bool) -> Doc uses { State[Pri
       }
     }
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## `None` if the document contains a forced newline.
 fn flat_width(doc: Doc) -> Option[Int] {
   s = render(doc, HUGE)
-  if String.contains(s, "\n") { None } else { Some(Doc.display_width(s)) }
+  if s.contains("\n") { None } else { Some(Doc.display_width(s)) }
 }
 
 ## Width of the first line when rendered as flat as possible.
 fn first_line_width(doc: Doc) -> Int {
-  Doc.display_width(Option.or(List.head(String.split(render(doc, HUGE), "\n")), ""))
+  Doc.display_width(render(doc, HUGE).split("\n").head().or(""))
 }
 
 ## Freezes the shape rendered with no width limit. Forced newlines remain, and following lines are
 ## indented relative to the current indentation.
 fn unbreakable(doc: Doc) -> Doc {
-  lines = String.split(render(doc, HUGE), "\n")
+  lines = render(doc, HUGE).split("\n")
   lines match {
     [] -> nil()
     [first, ..rest] -> {
-      List.fold(rest, text(first), |d, line| concat([d, hardline(), text(line)]))
+      rest.fold(text(first), |d, line| concat([d, hardline(), text(line)]))
     }
   }
+}
+
+## The child token of `kind`, printed, or nothing.
+fn child_tok(node: Node, kind: Kind) -> Doc uses { State[Printer] } {
+  child_token(node, kind).map(tok).or(nil())
 }
 
 fn element(e: Element) -> Doc uses { State[Printer] } {
@@ -615,13 +597,13 @@ fn list(node: Node, item: fn(Node) -> Doc uses { State[Printer] }) -> Doc uses {
 ## The second argument of `item` tells whether it is the last element.
 fn list_parts(node: Node, item: fn(Node, Bool) -> Doc uses { State[Printer] }) -> ListParts
   uses { State[Printer] } {
-  shape = List.fold(significant_children(node), ListShape([], None, None, []), |s, child| {
+  shape = significant_children(node).fold(ListShape([], None, None, []), |s, child| {
     child match {
       TokenElement(t) if t.kind == Comma -> s.elements match {
         [(e, _), ..rest] -> ListShape(elements: [(e, Some(t)), ..rest], ..s)
         []               -> s
       }
-      TokenElement(t) if Option.is_none(s.open)
+      TokenElement(t) if s.open.is_none()
         && (t.kind == LParen || t.kind == LBrack || t.kind == LBrace) -> {
         ListShape(open: Some(t), ..s)
       }
@@ -629,19 +611,19 @@ fn list_parts(node: Node, item: fn(Node, Bool) -> Doc uses { State[Printer] }) -
         ListShape(close: Some(t), ..s)
       }
       # Tokens before the opening bracket (the `.` of an import).
-      TokenElement(t) if Option.is_none(s.open) -> ListShape(prefix: [t, ..s.prefix], ..s)
-      _ -> ListShape(elements: [(child, None), ..s.elements], ..s)
+      TokenElement(t) if s.open.is_none() -> ListShape(prefix: [t, ..s.prefix], ..s)
+      _                                   -> ListShape(elements: [(child, None), ..s.elements], ..s)
     }
   })
   # Effect-set braces get inner spaces (`{ Io, Clock }`); an import's `.{a, b}` does not.
-  braces = Option.map(shape.open, |t| t.kind) == Some(LBrace) && node.kind != ImportList
-  prefix_docs = List.map(List.reverse(shape.prefix), tok)
-  open_doc = append(concat(prefix_docs), Option.map(shape.open, tok) |> Option.or(nil()))
-  elements = List.reverse(shape.elements)
-  n = List.length(elements)
+  braces = shape.open.map(|t| t.kind) == Some(LBrace) && node.kind != ImportList
+  prefix_docs = shape.prefix.reverse().map(tok)
+  open_doc = append(concat(prefix_docs), shape.open.map(tok).or(nil()))
+  elements = shape.elements.reverse()
+  n = elements.length()
   trailing_comma = flat_alt(text(","), nil())
   (breaks, docs, last_comma) = List.fold(
-    List.enumerate(elements),
+    elements.enumerate(),
     ([], [], nil()),
     |(breaks, docs, last_comma), (i, (elem, comma))| {
       b = if i == 0 && !braces { line_() } else { line() }
@@ -669,18 +651,18 @@ fn list_parts(node: Node, item: fn(Node, Bool) -> Doc uses { State[Printer] }) -
   closing = shape.close match {
     Some(t) -> {
       items = take_leading(t)
-      has = List.any(items, is_comment)
+      has = items.any(is_comment)
       start = if n == 0 && has { hard() } else { nil() }
       append(start, closing_comments(items, n > 0))
     }
     None -> nil()
   }
   end_break = if braces && n > 0 { line() } else { line_() }
-  close_doc = Option.map(shape.close, tok) |> Option.or(nil())
+  close_doc = shape.close.map(tok).or(nil())
   ListParts(
     open: open_doc,
-    breaks: List.reverse(breaks),
-    elements: List.reverse(docs),
+    breaks: breaks.reverse(),
+    elements: docs.reverse(),
     last_comma:,
     closing:,
     end_break:,
@@ -690,11 +672,11 @@ fn list_parts(node: Node, item: fn(Node, Bool) -> Doc uses { State[Printer] }) -
 
 ## One line if it fits; otherwise one element per line with a trailing comma.
 fn grouped(parts: ListParts) -> Doc {
-  inner = if List.is_empty(parts.elements) {
+  inner = if parts.elements.is_empty() {
     parts.closing
   } else {
-    pairs = List.zip(parts.breaks, parts.elements) |> List.map(|(b, e)| append(b, e))
-    concat(List.append(pairs, [parts.last_comma, parts.closing]))
+    pairs = parts.breaks.zip(parts.elements).map(|(b, e)| append(b, e))
+    concat(pairs.append([parts.last_comma, parts.closing]))
   }
   group(concat([parts.open, nest(inner, INDENT), parts.end_break, parts.close]))
 }
@@ -704,7 +686,7 @@ fn grouped(parts: ListParts) -> Doc {
 
 ## Keeps at most one blank line between declarations and ends with a newline.
 pub fn root(node: Node) -> Doc uses { State[Printer] } {
-  (docs, started) = List.fold(children(node), ([], False), |(docs, started), d| {
+  (docs, started) = children(node).fold(([], False), |(docs, started), d| {
     sep = if started { hard() } else { nil() }
     lead = first_significant_token(d) match {
       Some(first) -> leading_lines(first, !started)
@@ -714,7 +696,7 @@ pub fn root(node: Node) -> Doc uses { State[Printer] } {
     ([body, lead, sep, ..docs], True)
   })
   items = take_leading_eof()
-  any_comment = List.any(items, is_comment)
+  any_comment = items.any(is_comment)
   closing = closing_comments(items, started)
   end = if started || any_comment { hard() } else { nil() }
   concat(List.reverse([end, closing, ..docs]))
@@ -761,7 +743,7 @@ fn newline_before_first(n: Node) -> Bool uses { State[Printer] } {
 ## and stay there if the source had them there, like `derive`. Both clauses are one group, so they
 ## break together. Each clause itself never breaks.
 fn decl_seq(node: Node) -> Doc uses { State[Printer] } {
-  acc = List.fold(significant_children(node), DeclAcc([], None, True), |acc, child| {
+  acc = significant_children(node).fold(DeclAcc([], None, True), |acc, child| {
     child match {
       NodeElement(n) if n.kind == FailsClause || n.kind == UsesClause -> {
         b = brk(newline_before_first(n))
@@ -776,7 +758,7 @@ fn decl_seq(node: Node) -> Doc uses { State[Printer] } {
       _ -> decl_child(flush_clauses(acc), child)
     }
   })
-  concat(List.reverse(flush_clauses(acc).docs))
+  concat(flush_clauses(acc).docs.reverse())
 }
 
 fn decl_child(acc: DeclAcc, child: Element) -> DeclAcc uses { State[Printer] } {
@@ -833,19 +815,19 @@ type ItemAcc(body: List[Doc], count: Int, close: Option[Token])
 ## source stays as `{ Red, Green }` while it fits, and becomes multiline otherwise.
 fn item_list(node: Node) -> Doc uses { State[Printer] } {
   # A variant with attributes has them on lines of their own, so the list is multiline.
-  annotated = List.any(children(node), |c| {
-    c.kind == Variant && List.any(children(c), |a| a.kind == Annotation)
+  annotated = children(node).any(|c| {
+    c.kind == Variant && children(c).any(|a| a.kind == Annotation)
   })
   multi = has_newline_child(node) || annotated
-  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  open = child_tok(node, LBrace)
   forced = is_pending()
   first_break = brk(multi)
   kids = significant_children(node)
-  acc = List.fold(List.enumerate(kids), ItemAcc([], 0, None), |acc, (i, child)| {
+  acc = kids.enumerate().fold(ItemAcc([], 0, None), |acc, (i, child)| {
     child match {
       TokenElement(t) if t.kind == Comma -> {
         # The comma is printed only when the list stays flat on one line.
-        last = List.all(List.drop(kids, i + 1), |c| is_token(c, RBrace))
+        last = kids.drop(i + 1).all(|c| is_token(c, RBrace))
         doc = if multi || last { nil() } else { flat_alt(nil(), text(",")) }
         ItemAcc(body: [tok_as(t, doc), ..acc.body], ..acc)
       }
@@ -867,17 +849,17 @@ fn item_list(node: Node) -> Doc uses { State[Printer] } {
     Some(t) -> {
       items = take_leading(t)
       closing = closing_comments(items, acc.count > 0)
-      ([closing, ..acc.body], List.any(items, is_comment))
+      ([closing, ..acc.body], items.any(is_comment))
     }
     None -> (acc.body, False)
   }
   last_break = brk(multi)
-  close = acc.close |> Option.map(tok) |> Option.or(nil())
+  close = acc.close.map(tok).or(nil())
   if acc.count == 0 && !has_closing {
     inner = if forced { hardline() } else { nil() }
     concat([open, inner, close])
   } else {
-    inner = append(first_break, concat(List.reverse(body)))
+    inner = append(first_break, concat(body.reverse()))
     group(concat([open, nest(inner, INDENT), last_break, close]))
   }
 }
@@ -940,7 +922,7 @@ fn not_before_type_args(_prev: ElementKind, cur: ElementKind) -> Bool {
 }
 
 fn is_any(kind: NodeKind, kinds: List[NodeKind]) -> Bool {
-  List.any(kinds, |k| k == kind)
+  kinds.any(|k| k == kind)
 }
 
 const PLAIN_SEQ = [
@@ -995,7 +977,7 @@ const COLON_SEQ = [Param, TypeParam, NamedArg, FieldPat, Binding, AnnotArg]
 
 fn doc_of(node: Node) -> Doc uses { State[Printer] } {
   kind = node.kind
-  if kind == ParenExpr && Option.is_some(paren_or_chain_of(node)) {
+  if kind == ParenExpr && paren_or_chain_of(node).is_some() {
     paren_or_chain(node)
   } else if is_any(kind, PLAIN_SEQ) {
     seq(node, never)
@@ -1025,7 +1007,7 @@ fn doc_of(node: Node) -> Doc uses { State[Printer] } {
   } else if kind == ErrorSet {
     seq(node, |prev, cur| prev != TokenKind(LBrace) && cur != TokenKind(RBrace))
   } else if kind == EffectSet {
-    if Option.is_some(child_token(node, LBrace)) { list(node, doc_of) } else { seq(node, always) }
+    if child_token(node, LBrace).is_some() { list(node, doc_of) } else { seq(node, always) }
   } else if kind == String {
     string(node)
   } else if kind == Interp {
@@ -1058,7 +1040,7 @@ fn doc_of(node: Node) -> Doc uses { State[Printer] } {
 ## Puts a space between children when `space(prev, cur)` is true.
 fn seq(node: Node, space_between: fn(ElementKind, ElementKind) -> Bool fails {} uses {}) -> Doc
   uses { State[Printer] } {
-  (docs, _) = List.fold(significant_children(node), ([], None), |(docs, prev), child| {
+  (docs, _) = significant_children(node).fold(([], None), |(docs, prev), child| {
     kind = element_kind(child)
     sep = prev match {
       Some(p) if space_between(p, kind) -> space()
@@ -1067,7 +1049,7 @@ fn seq(node: Node, space_between: fn(ElementKind, ElementKind) -> Bool fails {} 
     doc = element(child)
     ([doc, sep, ..docs], Some(kind))
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## `expr match { ... }` and `expr escape { ... }`. When the left side is a pipe that breaks across
@@ -1081,7 +1063,7 @@ fn arms_expr(node: Node) -> Doc uses { State[Printer] } {
         TokenElement(_) -> False
       }
       lhs = element(first)
-      (gap, rest) = List.fold(others, (None, []), |(gap, rest), child| {
+      (gap, rest) = others.fold((None, []), |(gap, rest), child| {
         s = space()
         (g, r) = gap match {
           None    -> (Some(s), rest)
@@ -1089,12 +1071,12 @@ fn arms_expr(node: Node) -> Doc uses { State[Printer] } {
         }
         (g, [element(child), ..r])
       })
-      gap_doc = Option.or(gap, nil())
-      rest_doc = concat(List.reverse(rest))
+      gap_doc = gap.or(nil())
+      rest_doc = concat(rest.reverse())
       if !pipe {
         concat([lhs, gap_doc, rest_doc])
       } else {
-        keyword = List.get(others, 0) match {
+        keyword = others.get(0) match {
           Some(TokenElement(t)) -> token_text(t)
           _                     -> ""
         }
@@ -1107,9 +1089,9 @@ fn arms_expr(node: Node) -> Doc uses { State[Printer] } {
             # pipe breaks.
             probe = nest(concat([text(spaces(col)), lhs, text(" #{keyword} {")]), indent)
             link = "#{spaces(indent + INDENT)}|>"
-            broke = String.split(render(probe, w), "\n")
+            broke = render(probe, w).split("\n")
               |> List.drop(1)
-              |> List.any(|l| String.starts_with(l, link))
+              |> List.any(|l| l.starts_with(link))
             if broke { broken } else { inline }
           })
         })
@@ -1118,17 +1100,13 @@ fn arms_expr(node: Node) -> Doc uses { State[Printer] } {
   }
 }
 
-fn spaces(n: Int) -> String {
-  String.concat(List.map(List.range(0, n), |_| " "))
-}
-
 ## A variant. Each attribute goes on its own line above the name (`@tag("open")⏎Open`).
 fn variant(node: Node) -> Doc uses { State[Printer] } {
-  docs = List.fold(significant_children(node), [], |docs, child| {
+  docs = significant_children(node).fold([], |docs, child| {
     doc = element(child)
     if is_node(child, Annotation) { [hard(), doc, ..docs] } else { [doc, ..docs] }
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## For nodes the printer does not expect. Prints the source text as is and marks the comments
@@ -1138,7 +1116,7 @@ fn verbatim(node: Node) -> Doc uses { State[Printer] } {
     None -> nil()
     Some(first) -> {
       last = last_token(node)
-      List.each(tokens(node), |t| {
+      tokens(node).each(|t| {
         take_leading(t)
         # The trailing comment of the last token lies outside the node; it is printed below.
         if Some(t) != last {
@@ -1147,10 +1125,10 @@ fn verbatim(node: Node) -> Doc uses { State[Printer] } {
         }
       })
       source = slice(printer().src, first.start, node.end)
-      lines = String.split(source, "\n") |> List.map(|l| text(strip_cr(l)))
+      lines = source.split("\n").map(|l| text(strip_cr(l)))
       doc = lines match {
         []             -> nil()
-        [line, ..rest] -> List.fold(rest, line, |d, l| concat([d, hardline(), l]))
+        [line, ..rest] -> rest.fold(line, |d, l| concat([d, hardline(), l]))
       }
       set_at_break(False)
       last match {
@@ -1190,12 +1168,12 @@ fn assemble(b: BlockDoc, force: Bool) -> Doc {
 ## `{ stmt NL ... }`. A one-line source (at most one statement) stays on one line while it fits.
 fn block(node: Node) -> BlockDoc uses { State[Printer] } {
   multi = has_newline_child(node)
-  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  open = child_tok(node, LBrace)
   # A trailing comment after `{` forces a newline here.
   forced = is_pending()
   first_break = brk(multi)
   stmts = children(node)
-  body = List.fold(List.enumerate(stmts), [], |docs, (i, stmt)| {
+  body = stmts.enumerate().fold([], |docs, (i, stmt)| {
     sep = if i > 0 { hard() } else { nil() }
     lead = first_significant_token(stmt) match {
       Some(first) -> leading_lines(first, i == 0)
@@ -1207,20 +1185,20 @@ fn block(node: Node) -> BlockDoc uses { State[Printer] } {
   (closing, has_closing) = child_token(node, RBrace) match {
     Some(t) -> {
       items = take_leading(t)
-      (closing_comments(items, !List.is_empty(stmts)), List.any(items, is_comment))
+      (closing_comments(items, !stmts.is_empty()), items.any(is_comment))
     }
     None -> (nil(), False)
   }
   last_break = brk(multi)
-  close = child_token(node, RBrace) |> Option.map(tok) |> Option.or(nil())
+  close = child_tok(node, RBrace)
   BlockDoc(
     open:,
     first_break:,
     body: concat(List.reverse([closing, ..body])),
     last_break:,
     close:,
-    empty: List.is_empty(stmts) && !has_closing && !forced,
-    comment_only: List.is_empty(stmts) && !has_closing && forced,
+    empty: stmts.is_empty() && !has_closing && !forced,
+    comment_only: stmts.is_empty() && !has_closing && forced,
   )
 }
 
@@ -1241,11 +1219,11 @@ type ArmDoc(
 ## Arms of `match` and `escape`. One-line arms get their `->` aligned.
 fn arm_list(node: Node) -> Doc uses { State[Printer] } {
   multi = has_newline_child(node)
-  open = child_token(node, LBrace) |> Option.map(tok) |> Option.or(nil())
+  open = child_tok(node, LBrace)
   forced = is_pending()
   first_break = brk(multi)
   arms = children(node)
-  docs = List.fold(List.enumerate(arms), [], |docs, (i, a)| {
+  docs = arms.enumerate().fold([], |docs, (i, a)| {
     sep = if i > 0 { hard() } else { nil() }
     lead = first_significant_token(a) match {
       Some(first) -> leading_lines(first, i == 0)
@@ -1256,13 +1234,13 @@ fn arm_list(node: Node) -> Doc uses { State[Printer] } {
   (closing, has_closing) = child_token(node, RBrace) match {
     Some(t) -> {
       items = take_leading(t)
-      (closing_comments(items, !List.is_empty(arms)), List.any(items, is_comment))
+      (closing_comments(items, !arms.is_empty()), items.any(is_comment))
     }
     None -> (nil(), False)
   }
   last_break = brk(multi)
-  close = child_token(node, RBrace) |> Option.map(tok) |> Option.or(nil())
-  if List.is_empty(arms) && !has_closing {
+  close = child_tok(node, RBrace)
+  if arms.is_empty() && !has_closing {
     # Even when `{` has a trailing comment, print only one newline.
     inner = if forced { hardline() } else { nil() }
     concat([open, inner, close])
@@ -1279,7 +1257,7 @@ type ArmAcc(head: List[Doc], gap: Doc, arrow: Doc, after_arrow: Doc, body: Doc, 
 ## `pattern [ "if" expr ] "->" expr`
 fn arm(node: Node, pre: Doc) -> ArmDoc uses { State[Printer] } {
   initial = ArmAcc([], nil(), nil(), nil(), nil(), False)
-  acc = List.fold(significant_children(node), initial, |acc, child| {
+  acc = significant_children(node).fold(initial, |acc, child| {
     child match {
       TokenElement(t) if t.kind == ThinArrow -> {
         gap = space()
@@ -1299,7 +1277,7 @@ fn arm(node: Node, pre: Doc) -> ArmDoc uses { State[Printer] } {
       }
     }
   })
-  head = concat(List.reverse(acc.head))
+  head = concat(acc.head.reverse())
   widths = if has_comments(node) {
     None
   } else {
@@ -1316,9 +1294,9 @@ fn arm(node: Node, pre: Doc) -> ArmDoc uses { State[Printer] } {
 ## Only arms that fit on one line are aligned. If alignment pushes any arm past the width, the arm
 ## with the longest head is dropped from the alignment and it is retried.
 fn aligned_arms(arms: List[ArmDoc], indent: Int, width: Int) -> Doc {
-  aligned = List.map(arms, |a| Option.is_some(a.widths))
+  aligned = arms.map(|a| a.widths.is_some())
   (column, on) = align(arms, aligned, indent, width)
-  List.zip(arms, on)
+  arms.zip(on)
     |> List.map(|(a, is_on)| {
       gap = (is_on, a.widths) match {
         (True, Some((h, _))) -> text(spaces(column - h + 1))
@@ -1330,14 +1308,14 @@ fn aligned_arms(arms: List[ArmDoc], indent: Int, width: Int) -> Doc {
 }
 
 fn align(arms: List[ArmDoc], aligned: List[Bool], indent: Int, width: Int) -> (Int, List[Bool]) {
-  pairs = List.zip(arms, aligned)
-  column = List.fold(pairs, 0, |m, (a, on)| {
+  pairs = arms.zip(aligned)
+  column = pairs.fold(0, |m, (a, on)| {
     (on, a.widths) match {
-      (True, Some((h, _))) -> if h > m { h } else { m }
+      (True, Some((h, _))) -> Int.max(h, m)
       _                    -> m
     }
   })
-  overflow = List.any(pairs, |(a, on)| {
+  overflow = pairs.any(|(a, on)| {
     (on, a.widths) match {
       (True, Some((_, b))) -> indent + column + 4 + b > width
       _                    -> False
@@ -1347,7 +1325,7 @@ fn align(arms: List[ArmDoc], aligned: List[Bool], indent: Int, width: Int) -> (I
     (column, aligned)
   } else {
     # Drop the arm with the longest head (the later one on ties).
-    widest = List.fold(List.enumerate(pairs), None, |best, (i, (a, on))| {
+    widest = pairs.enumerate().fold(None, |best, (i, (a, on))| {
       h = a.widths match {
         Some((h, _)) -> h
         None         -> 0
@@ -1361,7 +1339,7 @@ fn align(arms: List[ArmDoc], aligned: List[Bool], indent: Int, width: Int) -> (I
     widest match {
       None -> (0, aligned)
       Some((i, _)) -> {
-        next = List.map(List.enumerate(aligned), |(j, on)| if j == i { False } else { on })
+        next = aligned.enumerate().map(|(j, on)| if j == i { False } else { on })
         align(arms, next, indent, width)
       }
     }
@@ -1371,7 +1349,7 @@ fn align(arms: List[ArmDoc], aligned: List[Bool], indent: Int, width: Int) -> (I
 ## `if c { a } else if d { b } else { c }`. All blocks share one group for their newlines, so if
 ## one breaks, all break.
 fn if_chain(node: Node) -> Doc uses { State[Printer] } {
-  (docs, _) = List.fold(significant_children(node), ([], 0), |(docs, nodes), child| {
+  (docs, _) = significant_children(node).fold(([], 0), |(docs, nodes), child| {
     child match {
       TokenElement(t) if t.kind == ElseKw -> {
         before = space()
@@ -1399,12 +1377,12 @@ fn if_chain(node: Node) -> Doc uses { State[Printer] } {
       }
     }
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## `with A, B { ... }`
 fn with_expr(node: Node) -> Doc uses { State[Printer] } {
-  (docs, _) = List.fold(significant_children(node), ([], None), |(docs, prev), child| {
+  (docs, _) = significant_children(node).fold(([], None), |(docs, prev), child| {
     kind = element_kind(child)
     sep = prev match {
       None                                                         -> nil()
@@ -1421,7 +1399,7 @@ fn with_expr(node: Node) -> Doc uses { State[Printer] } {
     }
     ([doc, sep, ..docs], Some(kind))
   })
-  concat(List.reverse(docs))
+  concat(docs.reverse())
 }
 
 ## The body of an anonymous function: a block, which an argument list may hug, or an expression.
@@ -1457,21 +1435,21 @@ fn lambda(node: Node) -> Doc uses { State[Printer] } {
 
 ## `(a || b)`, laid out as the parentheses the formatter adds around a chain of `||`.
 fn paren_or_chain(node: Node) -> Doc uses { State[Printer] } {
-  open = child_token(node, LParen) |> Option.map(tok) |> Option.or(nil())
+  open = child_tok(node, LParen)
   chain = paren_or_chain_of(node) match {
     Some(c) -> doc_of(c)
     None    -> nil()
   }
   # After a trailing comment, `)` already starts a line of its own.
   close_breaks = is_pending()
-  close = child_token(node, RParen) |> Option.map(tok) |> Option.or(nil())
+  close = child_tok(node, RParen)
   or_chain_in_parens(open, chain, close, close_breaks, 1, target_width())
 }
 
 ## The parameter list and the space after it, and the body. A body block written on one line with
 ## one expression loses its braces; any other block keeps them.
 fn lambda_parts(node: Node) -> (Doc, LambdaBody) uses { State[Printer] } {
-  (head, body) = List.fold(significant_children(node), (nil(), None), |(head, body), child| {
+  (head, body) = significant_children(node).fold((nil(), None), |(head, body), child| {
     child match {
       # The `fn` of the old form.
       TokenElement(t)                       -> (append(head, tok_as(t, nil())), body)
@@ -1485,27 +1463,27 @@ fn lambda_parts(node: Node) -> (Doc, LambdaBody) uses { State[Printer] } {
           # The braces removed: a comment before `{` is printed before the expression, and one
           # after `}` after it.
           removed = take_until(stripped.outer, node)
-          opens = List.reverse(removed)
+          opens = removed.reverse()
             |> List.filter_map(|b| child_token(b, LBrace))
             |> List.map(|t| tok_as(t, nil()))
           expr = doc_of(stripped)
           closes = removed
             |> List.filter_map(|b| child_token(b, RBrace))
             |> List.map(|t| tok_as(t, nil()))
-          ExprBody(concat(List.append(opens, [expr, ..closes])))
+          ExprBody(concat(opens.append([expr, ..closes])))
         }
         (append(head, s), Some(b))
       }
     }
   })
-  (head, Option.or(body, ExprBody(nil())))
+  (head, body.or(ExprBody(nil())))
 }
 
 fn take_until(nodes: List[Node], stop: Node) -> List[Node] {
   nodes match {
-    []                            -> []
-    [n, ..rest] if !same(n, stop) -> [n, ..take_until(rest, stop)]
-    _                             -> []
+    []                       -> []
+    [n, ..rest] if n != stop -> [n, ..take_until(rest, stop)]
+    _                        -> []
   }
 }
 
@@ -1514,14 +1492,10 @@ fn take_until(nodes: List[Node], stop: Node) -> List[Node] {
 ## parenthesized, since there `|` closes the list.
 fn closure_params(node: Node) -> Doc uses { State[Printer] } {
   kids = significant_children(node)
-  empty = !List.any(kids, |c| is_node(c, Param))
-  last_param = List.fold(
-    List.enumerate(kids),
-    -1,
-    |p, (i, c)| if is_node(c, Param) { i } else { p },
-  )
-  last = List.length(kids) - 1
-  docs = List.map(List.enumerate(kids), |(i, child)| {
+  empty = !kids.any(|c| is_node(c, Param))
+  last_param = kids.enumerate().fold(-1, |p, (i, c)| if is_node(c, Param) { i } else { p })
+  last = kids.length() - 1
+  docs = kids.enumerate().map(|(i, child)| {
     child match {
       TokenElement(t) -> {
         closing = i == last && i > 0 && (t.kind == RParen || t.kind == Pipe)
@@ -1547,7 +1521,7 @@ fn closure_params(node: Node) -> Doc uses { State[Printer] } {
 }
 
 fn closure_param(node: Node) -> Doc uses { State[Printer] } {
-  docs = List.map(significant_children(node), |child| {
+  docs = significant_children(node).map(|child| {
     child match {
       TokenElement(t) if t.kind == Colon         -> append(tok(t), text(" "))
       TokenElement(t)                            -> tok(t)
@@ -1559,7 +1533,7 @@ fn closure_param(node: Node) -> Doc uses { State[Printer] } {
 }
 
 fn call(node: Node) -> Doc uses { State[Printer] } {
-  docs = List.map(significant_children(node), |child| {
+  docs = significant_children(node).map(|child| {
     child match {
       TokenElement(t)                     -> tok(t)
       NodeElement(n) if n.kind == ArgList -> arg_list(n)
@@ -1573,8 +1547,7 @@ fn call(node: Node) -> Doc uses { State[Printer] } {
 ## parenthesis open around its body (`f(xs, |x| {` ... `})`).
 fn arg_list(node: Node) -> Doc uses { State[Printer] } {
   args = children(node)
-  huggable = !has_comments_outside_blocks(node)
-    && (List.last(args) |> Option.map(is_lambda_arg)) == Some(True)
+  huggable = !has_comments_outside_blocks(node) && args.last().map(is_lambda_arg) == Some(True)
   if !huggable {
     list(node, doc_of)
   } else {
@@ -1594,13 +1567,11 @@ fn arg_list(node: Node) -> Doc uses { State[Printer] } {
     hugged match {
       None -> normal
       Some(h) -> {
-        init = List.take(parts.elements, List.length(parts.elements) - 1)
-        if List.any(init, |e| Option.is_none(flat_width(e))) {
+        init = parts.elements.take(parts.elements.length() - 1)
+        if init.any(|e| flat_width(e).is_none()) {
           normal
         } else {
-          hug = concat(
-            [parts.open, concat(List.map(init, |e| append(e, text(" ")))), h, parts.close],
-          )
+          hug = concat([parts.open, concat(init.map(|e| append(e, text(" ")))), h, parts.close])
           flat = flat_width(normal)
           head = first_line_width(hug)
           w = target_width()
@@ -1620,7 +1591,7 @@ fn arg_list(node: Node) -> Doc uses { State[Printer] } {
 ## Returns (the plain form, the hugging form) of the trailing lambda argument.
 fn lambda_arg(node: Node) -> (Doc, Doc) uses { State[Printer] } {
   (prefix, lam) = if node.kind == NamedArg {
-    List.fold(significant_children(node), (nil(), node), |(prefix, lam), child| {
+    significant_children(node).fold((nil(), node), |(prefix, lam), child| {
       child match {
         TokenElement(t) -> (append(prefix, tok(t)), lam)
         NodeElement(n)  -> (append(prefix, space()), n)
@@ -1651,13 +1622,13 @@ fn interp(node: Node) -> Doc uses { State[Printer] } {
   doc = seq(node, never)
   update(|p| Printer(width: saved, ..p))
   # A multiline string inside must not be re-indented, so do not freeze the shape.
-  if List.any(tokens(node), |t| t.kind == TripleQuote) { doc } else { unbreakable(doc) }
+  if tokens(node).any(|t| t.kind == TripleQuote) { doc } else { unbreakable(doc) }
 }
 
 ## The pieces of a multiline string `"""` are printed verbatim.
 fn string(node: Node) -> Doc uses { State[Printer] } {
-  multiline = Option.is_some(child_token(node, TripleQuote))
-  docs = List.map(significant_children(node), |child| {
+  multiline = child_token(node, TripleQuote).is_some()
+  docs = significant_children(node).map(|child| {
     child match {
       TokenElement(t) -> if multiline { raw_tok(t) } else { tok(t) }
       NodeElement(n)  -> doc_of(n)
@@ -1676,8 +1647,7 @@ fn chain_links(
   (children(node), bin_op(node)) match {
     ([lhs, rhs, ..], Some(op)) -> {
       more = [(op, rhs), ..links]
-      same_class = lhs.kind == BinExpr
-        && (bin_op(lhs) |> Option.map(|t| op_class(t.kind))) == Some(class)
+      same_class = lhs.kind == BinExpr && bin_op(lhs).map(|t| op_class(t.kind)) == Some(class)
       if same_class { chain_links(lhs, class, more) } else { Some((lhs, more)) }
     }
     _ -> None
@@ -1692,14 +1662,14 @@ fn chain_links(
 ## its `|>`. A chain of `||` that breaks outside brackets is put in parentheses and broken inside
 ## them (`[fmt.wrap]`).
 fn bin_chain(node: Node) -> Doc uses { State[Printer] } {
-  class = bin_op(node) |> Option.map(|t| op_class(t.kind)) |> Option.or(0)
+  class = bin_op(node).map(|t| op_class(t.kind)).or(0)
   chain_links(node, class, []) match {
     None -> verbatim(node)
     Some((first, links)) -> {
       pipe = class == op_class(PipeGt)
-      source_broken = pipe && List.any(links, |(op, _)| newline_before(op))
+      source_broken = pipe && links.any(|(op, _)| newline_before(op))
       first_doc = doc_of(first)
-      (tail, ops) = List.fold(links, ([], []), |(tail, ops), (op, rhs)| {
+      (tail, ops) = links.fold(([], []), |(tail, ops), (op, rhs)| {
         # Breaking before `-` is only safe inside parentheses. A line comment before it keeps it
         # at the start of a line.
         b = if op.kind == Minus && has_leading_comment(op) {
@@ -1716,18 +1686,18 @@ fn bin_chain(node: Node) -> Doc uses { State[Printer] } {
         link = concat([op_doc, gap, rhs_doc])
         ([link, lead, b, ..tail], [link, ..ops])
       })
-      ops_in_order = List.reverse(ops)
-      normal = group(append(first_doc, nest(concat(List.reverse(tail)), INDENT)))
+      ops_in_order = ops.reverse()
+      normal = group(append(first_doc, nest(concat(tail.reverse()), INDENT)))
       if class == op_class(Pipe2) && !inside_brackets(node) {
         or_chain_in_parens(text("("), normal, text(")"), False, 0, target_width())
       } else if (pipe
         && !source_broken
-        && List.length(ops_in_order) == 1
+        && ops_in_order.length() == 1
         && !has_comments_outside_blocks(node)
-        && Option.is_none(flat_width(normal))) {
+        && flat_width(normal).is_none()) {
         # When a single pipe breaks only inside a hugged body (`xs |> List.map(|x| {`), do not
         # break the pipe if the first line fits.
-        only = Option.or(List.head(ops_in_order), nil())
+        only = ops_in_order.head().or(nil())
         spaced = concat([first_doc, text(" "), only])
         broken = append(first_doc, nest(append(hardline(), only), INDENT))
         head = first_line_width(spaced)
@@ -1758,9 +1728,9 @@ fn or_chain_in_parens(
   Doc.column(|col| {
     Doc.nesting(|indent| {
       probe = nest(append(text(spaces(col + shift)), chain), indent)
-      broke = String.split(render(probe, width), "\n")
+      broke = render(probe, width).split("\n")
         |> List.drop(1)
-        |> List.any(|l| String.starts_with(String.trim(l), "||"))
+        |> List.any(|l| l.trim().starts_with("||"))
       if broke { broken } else { inline }
     })
   })
@@ -1769,7 +1739,7 @@ fn or_chain_in_parens(
 ## The chain of `||` that is the only thing in a ParenExpr.
 fn paren_or_chain_of(node: Node) -> Option[Node] {
   children(node) match {
-    [only] if only.kind == BinExpr && (bin_op(only) |> Option.map(|t| t.kind)) == Some(Pipe2) -> {
+    [only] if only.kind == BinExpr && bin_op(only).map(|t| t.kind) == Some(Pipe2) -> {
       Some(only)
     }
     _ -> None
@@ -1777,18 +1747,18 @@ fn paren_or_chain_of(node: Node) -> Option[Node] {
 }
 
 fn bin_op(node: Node) -> Option[Token] {
-  List.find(children_tokens(node), |t| op_class(t.kind) != 0)
+  children_tokens(node).find(|t| op_class(t.kind) != 0)
 }
 
 ## A uses clause in its canonical form (`[fmt.signature]`): `uses` and the set in braces. The old
 ## keyword `use` (E0147) is printed as `uses`, and a bare element gets braces.
 fn uses_clause(node: Node) -> Doc uses { State[Printer] } {
-  docs = List.map(significant_children(node), |child| {
+  docs = significant_children(node).map(|child| {
     child match {
       TokenElement(t) if t.kind == UseKw || t.kind == LowerName -> tok_as(t, text("uses"))
       NodeElement(set) if set.kind == EffectSet -> {
         s = space()
-        doc = if Option.is_some(child_token(set, LBrace)) {
+        doc = if child_token(set, LBrace).is_some() {
           doc_of(set)
         } else {
           # The same document as the braced set `{ X }` gives, so that the output reads back
@@ -1819,14 +1789,14 @@ fn uses_clause(node: Node) -> Doc uses { State[Printer] } {
 ## Whether there is a newline in the trivia right before the token.
 fn newline_before(token: Token) -> Bool uses { State[Printer] } {
   p = printer()
-  Map.get(p.index, token.start) match {
+  p.index.get(token.start) match {
     None    -> False
     Some(i) -> newline_before_index(p.all, i - 1)
   }
 }
 
 fn newline_before_index(all: Array[Token], i: Int) -> Bool {
-  Array.get(all, i) match {
+  all.get(i) match {
     None -> False
     Some(t) -> {
       if t.kind == Newline || t.kind == NewlineCont {
@@ -1842,7 +1812,7 @@ fn newline_before_index(all: Array[Token], i: Int) -> Bool {
 
 ## A `|>` chain.
 fn is_pipe(node: Node) -> Bool {
-  node.kind == BinExpr && (bin_op(node) |> Option.map(|t| t.kind)) == Some(PipeGt)
+  node.kind == BinExpr && bin_op(node).map(|t| t.kind) == Some(PipeGt)
 }
 
 ## A lambda whose body is printed as a block, or a named argument whose value is one.
@@ -1850,13 +1820,13 @@ fn is_lambda_arg(node: Node) -> Bool {
   lam = if node.kind == LambdaExpr {
     Some(node)
   } else if node.kind == NamedArg {
-    List.find(children(node), |n| n.kind == LambdaExpr)
+    children(node).find(|n| n.kind == LambdaExpr)
   } else {
     None
   }
   lam match {
     None -> False
-    Some(l) -> List.find(children(l), |n| n.kind != ParamList) match {
+    Some(l) -> children(l).find(|n| n.kind != ParamList) match {
       None       -> False
       Some(body) -> strip_one_line_blocks(body).kind == BlockExpr
     }
@@ -1881,7 +1851,7 @@ fn strip_one_line_blocks(body: Node) -> Node {
 fn single_line_expression(block: Node) -> Option[Node] {
   children(block) match {
     [only] if only.kind != Binding && only.kind != Error -> {
-      broken = List.any(children_tokens(block), |t| {
+      broken = children_tokens(block).any(|t| {
         t.kind == Newline || t.kind == NewlineCont || t.kind == Comment || t.kind == DocComment
       })
       if broken { None } else { Some(only) }
@@ -1891,7 +1861,7 @@ fn single_line_expression(block: Node) -> Option[Node] {
 }
 
 fn children_tokens(node: Node) -> List[Token] {
-  List.filter_map(node.trees, |tree| {
+  node.trees.filter_map(|tree| {
     tree match {
       Leaf(t) -> Some(t)
       _       -> None
@@ -1904,7 +1874,7 @@ fn needs_parens(node: Node) -> Bool {
   parent(node) match {
     None -> False
     Some(p) -> {
-      first = (List.head(children(p)) |> Option.map(|c| same(c, node))) == Some(True)
+      first = children(p).head() == Some(node)
       if p.kind == BinExpr || p.kind == PrefixExpr {
         True
       } else if (
@@ -1944,7 +1914,7 @@ fn pipe_outside(ts: List[Token], depth: Int) -> Bool {
 ## Whether a line break here continues the line by rule 2 of `[lex.continuation]`: the innermost
 ## bracket around the node is `(`, `[` or an interpolation, not a block or arm list.
 fn inside_brackets(node: Node) -> Bool {
-  List.find(node.outer, |a| {
+  node.outer.find(|a| {
     is_any(a.kind, [ArgList, ParenExpr, TupleExpr, ListExpr, Interp, BlockExpr, MatchArmList, Root])
   }) match {
     Some(a) -> is_any(a.kind, [ArgList, ParenExpr, TupleExpr, ListExpr, Interp])

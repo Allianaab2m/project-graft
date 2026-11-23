@@ -55,7 +55,7 @@ pub fn append(left: Doc, right: Doc) -> Doc {
 
 ## `docs` appended in order.
 pub fn concat(docs: List[Doc]) -> Doc {
-  List.fold(docs, Nil, append)
+  docs.fold(Nil, append)
 }
 
 pub fn group(doc: Doc) -> Doc {
@@ -106,7 +106,7 @@ type Out(
 ## Lays `doc` out within `width` columns where it can.
 pub fn render(doc: Doc, width: Int) -> String {
   out = best([Cmd(0, Break, doc)], width, Out(0, []))
-  String.concat(List.reverse(out.pieces))
+  String.concat(out.pieces.reverse())
 }
 
 fn best(cmds: List[Cmd], width: Int, out: Out) -> Out {
@@ -129,7 +129,7 @@ fn step(indent: Int, mode: Mode, doc: Doc, rest: List[Cmd], width: Int, out: Out
       step(indent, if flat { Flat } else { mode }, inner, rest, width, out)
     }
     Nest(offset, inner) -> {
-      step(max(indent + offset, 0), mode, inner, rest, width, out)
+      step(Int.max(indent + offset, 0), mode, inner, rest, width, out)
     }
     # The next document may have a different indentation, so the newline takes it.
     Hardline -> rest match {
@@ -145,11 +145,8 @@ fn step(indent: Int, mode: Mode, doc: Doc, rest: List[Cmd], width: Int, out: Out
   }
 }
 
-fn max(a: Int, b: Int) -> Int {
-  if a > b { a } else { b }
-}
-
-fn spaces(n: Int) -> String {
+## `n` spaces.
+pub fn spaces(n: Int) -> String {
   String.concat(List.map(List.range(0, n), |_| " "))
 }
 
@@ -192,7 +189,7 @@ fn fits(docs: List[Doc], rest: List[Cmd], pos: Int, indent: Int, width: Int, mod
 ## The display width of `s` in a terminal: `pretty` counts ASCII text by its length and other
 ## text with `unicode-width`. Wide East Asian characters and emoji count 2, combining marks 0.
 pub fn display_width(s: String) -> Int {
-  List.fold(String.code_points(s), 0, |sum, c| sum + char_width(c))
+  s.code_points().fold(0, |sum, c| sum + char_width(c))
 }
 
 fn char_width(c: Int) -> Int {
@@ -208,7 +205,7 @@ fn char_width(c: Int) -> Int {
 }
 
 fn in_ranges(c: Int, ranges: List[(Int, Int)]) -> Bool {
-  List.any(ranges, |(lo, hi)| lo <= c && c <= hi)
+  ranges.any(|(lo, hi)| lo <= c && c <= hi)
 }
 
 const ZERO_WIDTH = [

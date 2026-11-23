@@ -33,37 +33,34 @@ pub type Built(tree: Tree, diagnostics: List[Diagnostic])
 ## `tokens` are all the tokens of `src`, trivia included; `p` is the parser after the grammar ran.
 pub fn build(src: Array[Int], tokens: Array[Token], p: Parser) -> Built {
   # Parents attached by `precede` are opened with their first child, not where they were started.
-  late = Map.fold(p.parents, Map.empty(), |acc, _, parent| Map.insert(acc, parent, True))
+  late = p.parents.fold(Map.empty(), |acc, _, parent| acc.insert(parent, True))
   initial = Sink(pos: 0, offset: 0, stack: [], diagnostics: [], root: None)
-  sink = List.fold(List.reverse(p.events), initial, |s, event| {
+  sink = p.events.reverse().fold(initial, |s, event| {
     event match {
-      Open(id) if Map.contains(late, id) -> s
-      Open(id) -> Map.get(p.kinds, id) match {
+      Open(id) if late.contains(id) -> s
+      Open(id) -> p.kinds.get(id) match {
         None       -> s
         Some(kind) -> open_nodes(tokens, s, chain(p, id, [kind]))
       }
-      Bump                               -> push_token(tokens, eat_trivia(tokens, s, False))
-      Close                              -> close_node(tokens, s)
+      Bump                          -> push_token(tokens, eat_trivia(tokens, s, False))
+      Close                         -> close_node(tokens, s)
       Report(code, message) -> {
         (start, end) = error_range(src, tokens, s.pos)
         Sink(diagnostics: [Diagnostic(code, start, end, message), ..s.diagnostics], ..s)
       }
     }
   })
-  tree = sink.root match {
-    Some(t) -> t
-    None    -> Branch(Root, 0, 0, [])
-  }
-  diagnostics = List.reverse(sink.diagnostics)
-    |> List.sort_by(|a, b| Ord.compare((a.start, a.end), (b.start, b.end)))
-  Built(tree, diagnostics)
+  diagnostics = sink.diagnostics.reverse().sort_by(
+    |a, b| Ord.compare((a.start, a.end), (b.start, b.end)),
+  )
+  Built(sink.root.or(Branch(Root, 0, 0, [])), diagnostics)
 }
 
 ## The kinds of the node `id` and of the parents `precede` attached to it, outermost first.
 fn chain(p: Parser, id: Int, acc: List[NodeKind]) -> List[NodeKind] {
-  Map.get(p.parents, id) match {
+  p.parents.get(id) match {
     None -> acc
-    Some(parent) -> Map.get(p.kinds, parent) match {
+    Some(parent) -> p.kinds.get(parent) match {
       None       -> acc
       Some(kind) -> chain(p, parent, [kind, ..acc])
     }
@@ -71,20 +68,20 @@ fn chain(p: Parser, id: Int, acc: List[NodeKind]) -> List[NodeKind] {
 }
 
 fn open_nodes(tokens: Array[Token], s: Sink, kinds: List[NodeKind]) -> Sink {
-  placed = if List.is_empty(s.stack) {
+  placed = if s.stack.is_empty() {
     s
   } else {
     # A doc comment goes inside the node that takes it.
-    eat_trivia(tokens, s, List.any(kinds, takes_doc))
+    eat_trivia(tokens, s, kinds.any(takes_doc))
   }
-  List.fold(kinds, placed, |acc, kind| {
+  kinds.fold(placed, |acc, kind| {
     Sink(stack: [Frame(kind, acc.offset, []), ..acc.stack], ..acc)
   })
 }
 
 ## Places the trivia before the next significant token, stopping at a doc comment if `before_doc`.
 fn eat_trivia(tokens: Array[Token], s: Sink, before_doc: Bool) -> Sink {
-  Array.get(tokens, s.pos) match {
+  tokens.get(s.pos) match {
     Some(t) if is_trivia(t.kind) && !(before_doc && t.kind == DocComment) -> {
       eat_trivia(tokens, push_token(tokens, s), before_doc)
     }
@@ -93,7 +90,7 @@ fn eat_trivia(tokens: Array[Token], s: Sink, before_doc: Bool) -> Sink {
 }
 
 fn push_token(tokens: Array[Token], s: Sink) -> Sink {
-  Array.get(tokens, s.pos) match {
+  tokens.get(s.pos) match {
     None -> s
     Some(t) -> s.stack match {
       [] -> s
@@ -106,15 +103,15 @@ fn push_token(tokens: Array[Token], s: Sink) -> Sink {
 }
 
 fn push_rest(tokens: Array[Token], s: Sink) -> Sink {
-  if s.pos < Array.size(tokens) { push_rest(tokens, push_token(tokens, s)) } else { s }
+  if s.pos < tokens.size() { push_rest(tokens, push_token(tokens, s)) } else { s }
 }
 
 fn close_node(tokens: Array[Token], s: Sink) -> Sink {
-  done = if List.length(s.stack) == 1 { push_rest(tokens, s) } else { s }
+  done = if s.stack.length() == 1 { push_rest(tokens, s) } else { s }
   done.stack match {
     [] -> done
     [frame, ..rest] -> {
-      node = Branch(frame.kind, frame.start, done.offset, List.reverse(frame.children))
+      node = Branch(frame.kind, frame.start, done.offset, frame.children.reverse())
       rest match {
         [] -> Sink(stack: [], root: Some(node), ..done)
         [parent, ..outer] -> {
@@ -128,8 +125,8 @@ fn close_node(tokens: Array[Token], s: Sink) -> Sink {
 
 ## The range of the first significant token from `pos`, or an empty range at the end.
 fn error_range(src: Array[Int], tokens: Array[Token], pos: Int) -> (Int, Int) {
-  Array.get(tokens, pos) match {
-    None                         -> (Array.size(src), Array.size(src))
+  tokens.get(pos) match {
+    None                         -> (src.size(), src.size())
     Some(t) if is_trivia(t.kind) -> error_range(src, tokens, pos + 1)
     Some(t)                      -> (t.start, t.end)
   }

@@ -145,7 +145,7 @@ fn significant_tokens(
   acc: List[ParserToken],
 ) -> List[ParserToken] {
   tokens match {
-    [] -> List.reverse(acc)
+    [] -> acc.reverse()
     [t, ..rest] -> {
       starts = line_start || t.kind == NewlineCont
       doc = doc_before || t.kind == DocComment
@@ -209,7 +209,7 @@ pub fn position() -> Int uses { State[Parser] } {
 
 fn token_at(n: Int) -> Option[ParserToken] uses { State[Parser] } {
   p = parser()
-  Array.get(p.tokens, p.pos + n)
+  p.tokens.get(p.pos + n)
 }
 
 pub fn nth(n: Int) -> Kind uses { State[Parser] } {
@@ -217,6 +217,11 @@ pub fn nth(n: Int) -> Kind uses { State[Parser] } {
     Some(t) -> t.kind
     None    -> Eof
   }
+}
+
+## The position of the first token from `n` ahead that is not a Newline.
+pub fn newlines_from(n: Int) -> Int uses { State[Parser] } {
+  if nth(n) == Newline { newlines_from(n + 1) } else { n }
 }
 
 pub fn current() -> Kind uses { State[Parser] } {
@@ -285,7 +290,7 @@ pub fn line_indent() -> Int uses { State[Parser] } {
 }
 
 fn line_start_before(src: Array[Int], offset: Int) -> Int {
-  if offset == 0 || Array.get(src, offset - 1) == Some(LF) {
+  if offset == 0 || src.get(offset - 1) == Some(LF) {
     offset
   } else {
     line_start_before(src, offset - 1)
@@ -293,7 +298,7 @@ fn line_start_before(src: Array[Int], offset: Int) -> Int {
 }
 
 fn indent_from(src: Array[Int], start: Int) -> Int {
-  Array.get(src, start) match {
+  src.get(start) match {
     Some(c) if c == SPACE || c == TAB -> indent_from(src, start + 1) + 1
     _                                 -> 0
   }
@@ -335,7 +340,7 @@ pub fn err_recover(code: String, message: String, recovery: List[Kind]) -> ()
   uses { State[Parser] } {
   report(code, message)
   kind = current()
-  if !(kind == Eof || List.any(recovery, |k| k == kind) || at_decl_start()) {
+  if !(kind == Eof || recovery.any(|k| k == kind) || at_decl_start()) {
     m = start()
     bump()
     finish(m, Error)
@@ -349,7 +354,7 @@ pub fn start() -> Marker uses { State[Parser] } {
 }
 
 pub fn complete(m: Marker, kind: NodeKind) -> Completed uses { State[Parser] } {
-  update(|p| Parser(kinds: Map.insert(p.kinds, m.id, kind), events: [Close, ..p.events], ..p))
+  update(|p| Parser(kinds: p.kinds.insert(m.id, kind), events: [Close, ..p.events], ..p))
   Completed(m.id)
 }
 
@@ -363,7 +368,7 @@ pub fn finish(m: Marker, kind: NodeKind) -> () uses { State[Parser] } {
 ## operators.
 pub fn precede(c: Completed) -> Marker uses { State[Parser] } {
   parent = start()
-  update(|p| Parser(parents: Map.insert(p.parents, c.id, parent.id), ..p))
+  update(|p| Parser(parents: p.parents.insert(c.id, parent.id), ..p))
   parent
 }
 
@@ -377,26 +382,24 @@ pub fn skip_newlines() -> () uses { State[Parser] } {
 ## `element` must only report a diagnostic when it cannot read an element, without consuming a
 ## separator or the closing bracket. A missing closing bracket is reported and parsing stops
 ## before it.
-pub fn delimited(open: Kind, close: Kind, element: fn() -> () uses { State[Parser] }) -> ()
+pub fn delimited(open: Kind, close: Kind, element: fn() -> () fails {} uses { State[Parser] }) -> ()
   uses { State[Parser] } {
+  fn elements() -> () uses { State[Parser] } {
+    if !at(close) && !at_eof() {
+      # A `|` inside brackets is not the end of a closure's parameter list.
+      with_closure_params(False, element)
+      skip_newlines()
+      if eat(Comma) {
+        skip_newlines()
+        elements()
+      }
+    }
+  }
   if eat(open) {
     skip_newlines()
-    delimited_elements(close, element)
+    elements()
     expect(close)
     ()
-  }
-}
-
-fn delimited_elements(close: Kind, element: fn() -> () uses { State[Parser] }) -> ()
-  uses { State[Parser] } {
-  if !at(close) && !at_eof() {
-    # A `|` inside brackets is not the end of a closure's parameter list.
-    with_closure_params(False, element)
-    skip_newlines()
-    if eat(Comma) {
-      skip_newlines()
-      delimited_elements(close, element)
-    }
   }
 }
 

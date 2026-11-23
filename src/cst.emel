@@ -26,17 +26,20 @@ pub fn root(tree: Tree) -> Node {
   }
 }
 
-## Whether `a` and `b` are the same node. Nested nodes of the same kind never span the same range
-## at the same depth.
-pub fn same(a: Node, b: Node) -> Bool {
-  a.kind == b.kind
-    && a.start == b.start
-    && a.end == b.end
-    && List.length(a.outer) == List.length(b.outer)
+## Two nodes are equal when they are the same node of a tree, as rowan's nodes are: the contents
+## are not compared. Nested nodes of the same kind never span the same range at the same depth.
+## Nodes of different trees are not meant to be compared.
+impl Node: Eq {
+  fn eq(self, other) {
+    self.kind == other.kind
+      && self.start == other.start
+      && self.end == other.end
+      && self.outer.length() == other.outer.length()
+  }
 }
 
 pub fn parent(node: Node) -> Option[Node] {
-  List.head(node.outer)
+  node.outer.head()
 }
 
 fn child_of(parent: Node, tree: Tree) -> Element {
@@ -49,12 +52,12 @@ fn child_of(parent: Node, tree: Tree) -> Element {
 }
 
 pub fn children_with_tokens(node: Node) -> List[Element] {
-  List.map(node.trees, |c| child_of(node, c))
+  node.trees.map(|c| child_of(node, c))
 }
 
 ## The child nodes, without tokens.
 pub fn children(node: Node) -> List[Node] {
-  List.filter_map(node.trees, |c| {
+  node.trees.filter_map(|c| {
     child_of(node, c) match {
       NodeElement(n)  -> Some(n)
       TokenElement(_) -> None
@@ -90,7 +93,7 @@ pub fn is_significant(kind: Kind) -> Bool {
 
 ## Children other than trivia and Newline.
 pub fn significant_children(node: Node) -> List[Element] {
-  List.filter(children_with_tokens(node), |e| {
+  children_with_tokens(node).filter(|e| {
     e match {
       TokenElement(t) -> is_significant(t.kind)
       NodeElement(_)  -> True
@@ -100,11 +103,11 @@ pub fn significant_children(node: Node) -> List[Element] {
 
 ## All the tokens under `node`, in order.
 pub fn tokens(node: Node) -> List[Token] {
-  List.reverse(tokens_onto(node.trees, []))
+  tokens_onto(node.trees, []).reverse()
 }
 
 fn tokens_onto(trees: List[Tree], acc: List[Token]) -> List[Token] {
-  List.fold(trees, acc, |a, tree| {
+  trees.fold(acc, |a, tree| {
     tree match {
       Leaf(t)                   -> [t, ..a]
       Branch(_, _, _, children) -> tokens_onto(children, a)
@@ -115,15 +118,15 @@ fn tokens_onto(trees: List[Tree], acc: List[Token]) -> List[Token] {
 ## Declaration nodes contain the preceding `##` and newline, so leading items are looked up by
 ## this token rather than by the first token.
 pub fn first_significant_token(node: Node) -> Option[Token] {
-  List.find(tokens(node), |t| is_significant(t.kind))
+  tokens(node).find(|t| is_significant(t.kind))
 }
 
 pub fn last_token(node: Node) -> Option[Token] {
-  List.last(tokens(node))
+  tokens(node).last()
 }
 
 pub fn child_token(node: Node, kind: Kind) -> Option[Token] {
-  List.find(node.trees, |c| {
+  node.trees.find(|c| {
     c match {
       Leaf(t) -> t.kind == kind
       _       -> False
@@ -135,11 +138,11 @@ pub fn child_token(node: Node, kind: Kind) -> Option[Token] {
 }
 
 pub fn has_newline_child(node: Node) -> Bool {
-  Option.is_some(child_token(node, Newline))
+  child_token(node, Newline).is_some()
 }
 
 pub fn has_comments(node: Node) -> Bool {
-  List.any(tokens(node), |t| t.kind == Comment || t.kind == DocComment)
+  tokens(node).any(|t| t.kind == Comment || t.kind == DocComment)
 }
 
 ## The ancestors of `node`, itself first.
@@ -149,9 +152,9 @@ pub fn ancestors(node: Node) -> List[Node] {
 
 ## The descendant nodes of `node`, itself first, in preorder.
 pub fn descendants(node: Node) -> List[Node] {
-  List.reverse(descendants_onto(node, []))
+  descendants_onto(node, []).reverse()
 }
 
 fn descendants_onto(node: Node, acc: List[Node]) -> List[Node] {
-  List.fold(children(node), [node, ..acc], |a, child| descendants_onto(child, a))
+  children(node).fold([node, ..acc], |a, child| descendants_onto(child, a))
 }
