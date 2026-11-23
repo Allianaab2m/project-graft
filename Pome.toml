@@ -3,5 +3,13 @@ name = "github.com/Allianaab2m/project-graft"
 version = "0.1.0"
 emela = "0.28.2"
 
-[dev-dependencies]
-"github.com/emela-lang/brix" = "v0.4.0"
+[dependencies]
+"github.com/Allianaab2m/project-graft/syntax" = "v0.1.0"
+"github.com/Allianaab2m/project-graft/fmt" = "v0.1.0"
+"github.com/Allianaab2m/project-graft/check" = "v0.1.0"
+
+# The Pomes of this repository are used from their directories.
+[replace]
+"github.com/Allianaab2m/project-graft/syntax" = { path = "syntax" }
+"github.com/Allianaab2m/project-graft/fmt" = { path = "fmt" }
+"github.com/Allianaab2m/project-graft/check" = { path = "check" }

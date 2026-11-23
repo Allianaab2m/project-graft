@@ -36,7 +36,7 @@ import Parser.{
   with_closure_params,
 }
 import Patterns.{at_pattern_start, pattern}
-import Syntax.{
+import Tree.{
   NodeKind,
   Root,
   Import,

@@ -6,7 +6,7 @@
 import Std.Array.{Array}
 import Continuation
 import Source.{slice}
-import Syntax.{Diagnostic}
+import Tree.{Diagnostic}
 import Token.{
   Kind,
   Token,

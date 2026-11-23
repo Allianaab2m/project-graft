@@ -1,0 +1,8 @@
+[pome]
+name = "github.com/Allianaab2m/project-graft/syntax"
+version = "0.1.0"
+emela = "0.28.2"
+module = "Syntax"
+
+[dev-dependencies]
+"github.com/emela-lang/brix" = "v0.4.0"

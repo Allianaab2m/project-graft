@@ -8,7 +8,7 @@ import Std.Array.{Array}
 import Std.FileSystem.{FileSystem}
 import Std.Map.{Map}
 import Std.Path
-import Cst.{
+import Syntax.Cst.{
   Node,
   children,
   child_token,
@@ -19,12 +19,12 @@ import Cst.{
   NodeElement,
 }
 import Modules.{CORE, ModuleMap, ModuleData, FileDiagnostic, display, get, lookup, is_core}
-import Parse
+import Syntax.Parse
 import Resolve
-import Sink
-import Source.{slice}
-import Syntax.{Diagnostic, Import, ImportList, Error}
-import Token.{TypeName, RBrace}
+import Syntax.Sink
+import Syntax.Source.{slice}
+import Syntax.Tree.{Diagnostic, Import, ImportList, Error}
+import Syntax.Token.{TypeName, RBrace}
 
 ## A diagnostic of check: `range` is None for one about a whole file or directory.
 pub type Checked(severity: String, code: String, file: String, range: Option[(Int, Int)])
@@ -238,7 +238,7 @@ fn imports_of(src: Array[Int], parsed: Sink.Built) -> List[ImportOf] {
   elements.enumerate().filter_map(|(i, e)| {
     e match {
       NodeElement(n) if n.kind == Import && !broken(n, elements.drop(i + 1)) -> {
-        children(n).find(|c| c.kind == Syntax.Path).map(|p| {
+        children(n).find(|c| c.kind == Tree.Path).map(|p| {
           segments = tokens(p).filter(|t| t.kind == TypeName).map(|t| slice(src, t.start, t.end))
           ImportOf(segments, p.start, p.end)
         })

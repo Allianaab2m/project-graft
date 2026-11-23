@@ -8,7 +8,7 @@
 import Std.Array.{Array}
 import Std.Map.{Map}
 import Parser.{Parser, Event, Open, Bump, Close, Report}
-import Syntax.{NodeKind, Tree, Branch, Leaf, Diagnostic, Root, takes_doc}
+import Tree.{NodeKind, Tree, Branch, Leaf, Diagnostic, Root, takes_doc}
 import Token.{Token, is_trivia, DocComment}
 
 ## A node being built. `children` are newest first.

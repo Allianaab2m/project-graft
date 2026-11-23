@@ -4,7 +4,7 @@ import Std.Array
 import Lexer
 import Parse
 import Sink
-import Syntax.{Tree, Branch, Leaf, dump}
+import Tree.{Tree, Branch, Leaf, dump}
 import Token.{Token}
 
 ## The tree and the diagnostics of `src` as `graft tree` prints them, one line per element.

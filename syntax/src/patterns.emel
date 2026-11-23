@@ -15,7 +15,7 @@ import Parser.{
   nth,
   start,
 }
-import Syntax.{
+import Tree.{
   NodeKind,
   Error,
   WildcardPat,

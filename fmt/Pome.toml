@@ -1,0 +1,11 @@
+[pome]
+name = "github.com/Allianaab2m/project-graft/fmt"
+version = "0.1.0"
+emela = "0.28.2"
+module = "Fmt"
+
+[dependencies]
+"github.com/Allianaab2m/project-graft/syntax" = "v0.1.0"
+
+[replace]
+"github.com/Allianaab2m/project-graft/syntax" = { path = "../syntax" }

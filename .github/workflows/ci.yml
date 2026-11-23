@@ -28,22 +28,24 @@ jobs:
       - uses: bytecodealliance/actions/wasmtime/setup@v1
         with:
           version: 49.0.3
-      - name: Install
-        run: emela pome install
-      - name: Format
-        run: emela fmt --check
-      - name: Check
-        run: emela check
-      - name: Test on js, native and wasm
+      # The Pomes of this repository: syntax, fmt and check, and the root with the command line.
+      - name: Install, format and check each Pome
         run: |
-          for target in js native wasm; do
-            out="$(emela test --target "$target")"
-            echo "$out"
-            # A compiler that does not read `test/` would pass with no tests.
-            if echo "$out" | grep -q '^running 0 tests'; then
-              echo "::error::no tests ran on $target"
-              exit 1
-            fi
+          for pome in syntax fmt check .; do
+            (cd "$pome" && emela pome install && emela fmt --check && emela check)
+          done
+      - name: Test each Pome on js, native and wasm
+        run: |
+          for pome in syntax fmt check; do
+            for target in js native wasm; do
+              out="$(cd "$pome" && emela test --target "$target")"
+              echo "$out"
+              # A compiler that does not read `test/` would pass with no tests.
+              if echo "$out" | grep -q '^running 0 tests'; then
+                echo "::error::no tests ran in $pome on $target"
+                exit 1
+              fi
+            done
           done
 
   # Every .emel of emela-lang/emela, at the tag of the release Graft is built with:

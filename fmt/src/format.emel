@@ -7,13 +7,13 @@
 import Std.Array.{Array}
 import Std.Map.{Map}
 import Std.State.{State}
-import Cst
+import Syntax.Cst
 import Doc
-import Lexer
-import Parse
+import Syntax.Lexer
+import Syntax.Parse
 import Printer
-import Source
-import Token.{Comment, DocComment, StringText, TripleQuote}
+import Syntax.Source
+import Syntax.Token.{Comment, DocComment, StringText, TripleQuote}
 
 pub const DEFAULT_WIDTH = 100
 

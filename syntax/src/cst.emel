@@ -1,6 +1,6 @@
 ## Navigating the syntax tree as the reference formatter does with rowan's red tree: a node knows
 ## its ancestors, so the printer can look up (`parent`, `ancestors`) as well as down.
-import Syntax.{NodeKind, Tree, Branch, Leaf}
+import Tree.{NodeKind, Tree, Branch, Leaf}
 import Token.{Kind, Token, is_trivia, Newline, Comment, DocComment}
 
 ## A node with its ancestors, innermost first.
@@ -22,7 +22,7 @@ pub enum ElementKind {
 pub fn root(tree: Tree) -> Node {
   tree match {
     Branch(kind, start, end, children) -> Node(kind, start, end, children, [])
-    Leaf(t)                            -> Node(Syntax.Root, t.start, t.end, [tree], [])
+    Leaf(t)                            -> Node(Tree.Root, t.start, t.end, [tree], [])
   }
 }
 

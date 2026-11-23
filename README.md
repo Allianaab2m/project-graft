@@ -39,10 +39,24 @@ Each milestone is done when Graft's output matches the reference implementation 
 
 The corpus is every `.emel` file in the `emela-lang/emela` repository at the release tag.
 
+## Layout
+
+The repository holds four Pomes. Each is used from its directory (`[replace]` in `Pome.toml`).
+
+| Pome | Root name | Contents |
+|---|---|---|
+| `syntax/` | `Syntax` | Lexer, parser, syntax tree (`Tree`), validation and navigation (`Cst`) |
+| `fmt/` | `Fmt` | The formatter: documents (`Doc`), the printer and `Format` |
+| `check/` | `Check` | Modules, HIR, name resolution and types (`Pipeline` runs them) |
+| `.` | | The command line, `src/main.emel` |
+
+`fmt` and `check` depend on `syntax`; the root depends on all three. Tests live in the Pome they
+test.
+
 ## Usage
 
 ```console
-$ emela test                                         # unit and property tests (Brix)
+$ (cd syntax && emela test)                          # unit and property tests (Brix), per Pome
 $ scripts/roundtrip.sh <emela-lang/emela checkout>   # M1 on the corpus, on js and native
 $ scripts/compare.sh tokens <emela-lang/emela checkout>  # tokens against the reference
 $ scripts/compare.sh tree <emela-lang/emela checkout>    # syntax trees against the reference

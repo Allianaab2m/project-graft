@@ -7,7 +7,7 @@
 import Std.Array.{Array}
 import Std.Map.{Map}
 import Std.State.{State}
-import Cst.{
+import Syntax.Cst.{
   Node,
   Element,
   NodeElement,
@@ -29,8 +29,8 @@ import Cst.{
   tokens,
 }
 import Doc.{Doc, append, concat, flat_alt, group, hardline, nest, nil, render, spaces}
-import Source.{slice}
-import Syntax.{
+import Syntax.Source.{slice}
+import Syntax.Tree.{
   NodeKind,
   Import,
   ImportList,
@@ -135,7 +135,7 @@ import Syntax.{
   Branch,
   Leaf,
 }
-import Token.{
+import Syntax.Token.{
   Kind,
   Token,
   is_trivia,

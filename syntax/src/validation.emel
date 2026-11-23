@@ -16,7 +16,7 @@ import Cst.{
   parent,
 }
 import Source.{slice}
-import Syntax.{
+import Tree.{
   NodeKind,
   Diagnostic,
   Annotation,

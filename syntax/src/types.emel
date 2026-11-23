@@ -23,7 +23,7 @@ import Parser.{
   start,
   with_closure_params,
 }
-import Syntax.{
+import Tree.{
   Path,
   PathType,
   TypeArgList,

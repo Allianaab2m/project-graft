@@ -17,12 +17,12 @@ import Std.Array.{Array}
 import Std.Console.{Console}
 import Std.FileSystem.{FileSystem}
 import Std.Process.{Process, Args, Stdout, ExitCode, EXIT_SUCCESS, EXIT_FAILURE}
-import Check
-import Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
-import Lexer
-import Parse
-import Sink
-import Syntax
+import Check.Pipeline
+import Fmt.Format.{DEFAULT_WIDTH, Done, SyntaxErrors, Internal}
+import Syntax.Lexer
+import Syntax.Parse
+import Syntax.Sink
+import Syntax.Tree
 
 fn main() -> ExitCode {
   with Process {
@@ -120,7 +120,7 @@ fn tree(path: String) -> ExitCode uses { Console, FileSystem, Stdout } {
     Some(text) -> {
       built = build(text)
       errors = built.diagnostics.map(|d| "error[#{d.code}]@#{d.start}..#{d.end}\n")
-      (use Stdout).print(String.concat(List.append(Syntax.dump(built.tree), errors)))
+      (use Stdout).print(String.concat(List.append(Tree.dump(built.tree), errors)))
       EXIT_SUCCESS
     }
   }
@@ -147,7 +147,7 @@ fn fmt(path: String, width: Int) -> ExitCode uses { Console, FileSystem, Stdout 
 }
 
 fn check(path: String, core: String) -> ExitCode uses { FileSystem, Stdout } {
-  lines = Check.check(path, core).map(|d| {
+  lines = Pipeline.check(path, core).map(|d| {
     place = d.range match {
       Some((start, end)) -> "#{d.file}:#{start}..#{end}"
       None               -> d.file

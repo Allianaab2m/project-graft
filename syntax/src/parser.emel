@@ -14,7 +14,7 @@ import Std.Array.{Array}
 import Std.Map.{Map}
 import Std.State.{State}
 import Source.{slice}
-import Syntax.{NodeKind, Error, Literal, String, Interp}
+import Tree.{NodeKind, Error, Literal, String, Interp}
 import Token.{
   Kind,
   Token,
